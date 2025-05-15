@@ -1,0 +1,34 @@
+services:
+  # neo4j:
+  #   image: neo4j:latest
+  #   container_name: neo4j_container
+  #   volumes:
+  #     - ./database/neo4j/neo4j_data:/data
+  #     - ./database/neo4j/neo4j_logs:/logs
+  #     - ./database/neo4j/neo4j_import:/import
+  #     - ./database/neo4j/neo4j_plugins:/plugins
+  #   environment:
+  #     - NEO4J_AUTH=neo4j/password
+  #     - NEO4J_PLUGINS=["apoc"]
+  #     - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
+  #     - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+  #     - NEO4J_dbms_security_procedures_allowlist=apoc.*
+  #   ports:
+  #     - "7474:7474"
+  #     - "7687:7687"
+  #   restart: always
+
+  mongo:
+    image: mongo:latest
+    container_name: esg-llm-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./database/mongo_data:/data/db
+
+volumes:
+  # neo4j_data:
+  # neo4j_logs:
+  # neo4j_import:
+  # neo4j_plugins:
+  mongo_data:

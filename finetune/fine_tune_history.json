@@ -1,0 +1,62 @@
+[
+    {
+        "id": "ftjob-YXOm6rv6BJ0vP2gl7IXfQBXo",
+        "created_at": 1731667157,
+        "error": {
+            "code": null,
+            "message": null,
+            "param": null
+        },
+        "fine_tuned_model": "ft:gpt-4o-mini-2024-07-18:personal::ATod7C1w",
+        "finished_at": 1731669495,
+        "hyperparameters": {
+            "n_epochs": 3,
+            "batch_size": 12,
+            "learning_rate_multiplier": 1.8
+        },
+        "model": "gpt-4o-mini-2024-07-18",
+        "object": "fine_tuning.job",
+        "organization_id": "org-TgEkk7rHk1dGM8bRiOEVXhy8",
+        "result_files": [
+            "file-T9fIOypE6c6jpYWtQsoVgBM7"
+        ],
+        "seed": 974599560,
+        "status": "succeeded",
+        "trained_tokens": 1606371,
+        "training_file": "file-OIFG9BbLroy85SbiFEzw9Iod",
+        "validation_file": null,
+        "estimated_finish": null,
+        "integrations": [],
+        "user_provided_suffix": null
+    },
+    {
+        "id": "ftjob-sMt0WnlUTQVVmSEHnGSim7nA",
+        "created_at": 1731755882,
+        "error": {
+            "code": null,
+            "message": null,
+            "param": null
+        },
+        "fine_tuned_model": "ft:gpt-4o-mini-2024-07-18:personal:show-case:AUBEAFvA",
+        "finished_at": 1731756360,
+        "hyperparameters": {
+            "n_epochs": 5,
+            "batch_size": 1,
+            "learning_rate_multiplier": 1.8
+        },
+        "model": "gpt-4o-mini-2024-07-18",
+        "object": "fine_tuning.job",
+        "organization_id": "org-TgEkk7rHk1dGM8bRiOEVXhy8",
+        "result_files": [
+            "file-ke6CT8626ETAnJ09YRLpMHR1"
+        ],
+        "seed": 1880447030,
+        "status": "succeeded",
+        "trained_tokens": 6495,
+        "training_file": "file-8Js66iO1sRwp4P96tQJsfcMl",
+        "validation_file": null,
+        "estimated_finish": null,
+        "integrations": [],
+        "user_provided_suffix": "show-case"
+    }
+]
