@@ -75,3 +75,5 @@ python -m app.main
 
 - It is recommended to use Neo4j Cloud for this application.
 - MongoDB can be used locally.
+
+.\.myvenv_py312\Scripts\activate
