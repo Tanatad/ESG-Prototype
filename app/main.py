@@ -9,7 +9,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-
+from app.models.esg_question_model import ESGQuestion # Import Model ใหม่
 # Load environment variables
 load_dotenv()
 
@@ -26,7 +26,7 @@ origins = [
 async def init():
     client = AsyncIOMotorClient(MONGODB_URL)
     database = client[MONGO_DB_NAME]
-    await init_beanie(database, document_models=[Cluster])
+    await init_beanie(database, document_models=[Cluster, ESGQuestion]) # เพิ่ม ESGQuestion เข้าไป
     
 @asynccontextmanager
 async def lifespan(app: FastAPI):

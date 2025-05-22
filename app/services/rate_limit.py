@@ -5,7 +5,7 @@ max_tokens_per_request = 5000
 # test file: รายงานนโยบายและเอกสารด้าน ESG.pdf
 # Free tier: test file ~ 2 mins
 max_tpm = 1000000  
-max_rpm = 15
+max_rpm = 1000
 
 # Paid tier 1: test file ~ 35 secs
 # max_tpm = 4000000

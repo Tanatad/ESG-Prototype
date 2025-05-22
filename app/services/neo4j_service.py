@@ -48,7 +48,7 @@ class Neo4jService:
             rate_limiter=llm_rate_limiter
         )
         self.llm_embbedding = CohereEmbeddings(
-            model='embed-multilingual-v3.0',
+            model='embed-v4.0',
             cohere_api_key=os.getenv("COHERE_API_KEY"),
             max_retries=10
         )
@@ -135,7 +135,7 @@ class Neo4jService:
             
         return docs
     
-    async def split_documents_into_chunks(self, documents: List[Document], chunk_size: int = 4096, chunk_overlap: int = 1024):
+    async def split_documents_into_chunks(self, documents: List[Document], chunk_size: int = 2048, chunk_overlap: int = 1024):
         splitter = RecursiveCharacterTextSplitter(
                             chunk_size=chunk_size, 
                             chunk_overlap=chunk_overlap
@@ -222,7 +222,6 @@ class Neo4jService:
             llm=llm,
             node_properties=["description"],
             relationship_properties=["description"],
-            allowed_relationships=esg_relationships,
             strict_mode=True
         )
                 
@@ -314,38 +313,3 @@ class Neo4jService:
         # Store vector embeddings
         await self.store_vector_embeddings(translated_split_doc)
            
-esg_relationships = [
-    # Environmental (E) Relationships
-    "IMPACTS",         # (Company) -> (Environment)
-    "COMPLIES_WITH",   # (Company) -> (Standard)
-    "CONSUMES",        # (Factory) -> (Water)
-    "EMITS",           # (Company) -> (CO2)
-    "PROTECTS",        # (NGO) -> (Biodiversity)
-    "VIOLATES",        # (Company) -> (Regulation)
-    "PARTICIPATES_IN", # (Company) -> (GreenEnergyProject)
-
-    # Social (S) Relationships
-    "SUPPORTS",        # (Company) -> (CommunityProgram)
-    "EMPLOYS",         # (Company) -> (Employee)
-    "VIOLATES",        # (Company) -> (LaborLaw)
-    "PROVIDES",        # (Company) -> (Benefit)
-    "AFFECTS",         # (Policy) -> (Community)
-    "ENGAGES_WITH",    # (NGO) -> (Community)
-    "DISCRIMINATES",   # (Company) -> (Group)
-
-    # Governance (G) Relationships
-    "MANAGES",         # (BoardOfDirectors) -> (Company)
-    "OWNS",            # (Investor) -> (Company)
-    "REGULATES",       # (Government) -> (Sector)
-    "COMPLIES_WITH",   # (Company) -> (GovernancePolicy)
-    "REPORTS_TO",      # (Company) -> (Auditor)
-    "PARTICIPATES_IN", # (Company) -> (GovernanceInitiative)
-    "VIOLATES",        # (BoardMember) -> (EthicsCode)
-
-    # Cross-Domain Relationships
-    "CONTRIBUTES_TO",  # (Company) -> (SustainableDevelopmentGoal)
-    "RISKS",           # (Project) -> (EnvironmentalHazard)
-    "BENEFITS",        # (Company) -> (Reputation)
-    "AFFECTED_BY",     # (Community) -> (EnvironmentalPolicy)
-    "INVESTS_IN"       # (Investor) -> (GreenTechnology)
-]

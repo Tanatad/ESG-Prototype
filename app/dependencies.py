@@ -5,7 +5,21 @@ import os
 from fastapi import Depends
 from dotenv import load_dotenv
 import asyncio
+from fastapi import Depends # เพิ่ม Depends ถ้ายังไม่มี
+from functools import lru_cache
+from app.services.neo4j_service import Neo4jService
+from app.services.question_generation_service import QuestionGenerationService
 load_dotenv()
+
+@lru_cache() # ใช้ lru_cache เพื่อให้ได้ instance เดียวกัน (Singleton-like)
+def get_neo4j_service_dependency() -> Neo4jService:
+    return Neo4jService() # หรือวิธีการสร้าง instance ที่คุณใช้อยู่
+
+@lru_cache()
+def get_question_generation_service(
+    neo4j_service: Neo4jService = Depends(get_neo4j_service_dependency)
+) -> QuestionGenerationService:
+    return QuestionGenerationService(neo4j_service=neo4j_service)
 
 def get_Neo4jService() ->  Neo4jService:
     return Neo4jService()
