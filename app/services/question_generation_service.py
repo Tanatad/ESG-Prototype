@@ -304,21 +304,21 @@ class QuestionGenerationService:
             print(f"[QG_SERVICE LOG] Storing {len(all_bilingual_questions)} questions to MongoDB (simulation)...")
             for q_idx, q_obj in enumerate(all_bilingual_questions):
                 # Simulate storing by printing
-                # print(f"  Storing Q{q_idx+1}: EN='{q_obj.question_text_en[:50]}...', TH='{str(q_obj.question_text_th)[:50] if q_obj.question_text_th else 'N/A'}' Cat='{q_obj.category}', Theme='{q_obj.theme}'")
+                print(f"  Storing Q{q_idx+1}: EN='{q_obj.question_text_en[:50]}...', TH='{str(q_obj.question_text_th)[:50] if q_obj.question_text_th else 'N/A'}' Cat='{q_obj.category}', Theme='{q_obj.theme}'")
                 # Actual MongoDB storage logic using Beanie:
-                # try:
-                #     esg_q_doc = ESGQuestion(
-                #         question_text_en=q_obj.question_text_en,
-                #         question_text_th=q_obj.question_text_th,
-                #         category=q_obj.category,
-                #         theme=q_obj.theme,
-                #         # generated_at=datetime.utcnow() # Add a timestamp if ESGQuestion model has it
-                #     )
-                #     await esg_q_doc.insert()
-                # except Exception as e:
-                #     print(f"[QG_SERVICE ERROR] Failed to store question {q_idx+1} in MongoDB: {e}")
-                pass # Placeholder for actual storage
-            print("[QG_SERVICE LOG] Questions stored successfully (simulation).")
+                try:
+                    esg_q_doc = ESGQuestion(
+                        question_text_en=q_obj.question_text_en,
+                        question_text_th=q_obj.question_text_th,
+                        category=q_obj.category,
+                        theme=q_obj.theme,
+                        # generated_at=datetime.utcnow() # Add a timestamp if ESGQuestion model has it
+                    )
+                    await esg_q_doc.insert()
+                except Exception as e:
+                    print(f"[QG_SERVICE ERROR] Failed to store question {q_idx+1} in MongoDB: {e}")
+                # pass # Placeholder for actual storage
+            print("[QG_SERVICE LOG] Questions stored successfully.")
         else:
             print("[QG_SERVICE WARNING] No questions were generated to store.")
 
