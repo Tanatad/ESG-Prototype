@@ -1,6 +1,8 @@
 import re
 import os
 import asyncio 
+import inspect
+import traceback
 from typing import IO, List
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
@@ -235,8 +237,10 @@ class Neo4jService:
                 baseEntityLabel=True,
                 include_source=True,
             )
-        except:
-            pass
+        except Exception as e_db:
+                print(f"ERROR during Neo4j operation in {self.__class__.__name__}.{inspect.currentframe().f_code.co_name}: {e_db}")
+                traceback.print_exc()
+                
         
     def init_cypher(self):
         graph_chain = GraphCypherQAChain.from_llm(
@@ -251,8 +255,10 @@ class Neo4jService:
     async def store_vector_embeddings(self, documents: List[Document]):
         try:
             await self.store.aadd_documents(documents)
-        except:
-            pass
+        except Exception as e_db:
+            print(f"ERROR during Neo4j operation in {self.__class__.__name__}.{inspect.currentframe().f_code.co_name}: {e_db}")
+            traceback.print_exc()
+        
             
     async def get_relate(self, query, k):                    
         # if error occurs, return empty list
@@ -300,16 +306,65 @@ class Neo4jService:
             cypher_answer=cypher_answer,
             relate_documents=relate_documents
             )
+    
+    async def is_graph_substantially_empty(self, threshold: int = 10) -> bool:
+        """
+        Checks if the Neo4j graph has a very low number of nodes.
+        Relies on self.graph (Neo4jGraph instance) being initialized.
+        """
+        if not self.graph: # self.graph คือ instance ของ Neo4jGraph จาก Langchain
+            print("[NEO4J_SERVICE ERROR] Neo4jGraph (self.graph) is not initialized. Cannot check if empty.")
+            # ตัดสินใจว่าจะ return True (ถือว่าว่าง) หรือ False (ถือว่าไม่ว่าง) ในกรณีนี้
+            # การ return True อาจจะปลอดภัยกว่าถ้า logic การสร้างคำถามครั้งแรกขึ้นกับสิ่งนี้
+            return True 
+
+        query = "MATCH (n) RETURN count(n) AS node_count"
+        
+        try:
+            # Neo4jGraph.query() ของ Langchain เป็น synchronous call
+            # เมื่อเรียกจาก async method เราต้องใช้ run_in_executor
+            loop = asyncio.get_running_loop() # หรือ asyncio.get_event_loop() ใน Python < 3.7
+            result_data = await loop.run_in_executor(None, self.graph.query, query)
+            # self.graph.query(query) จะ return list of dictionaries, เช่น [{'node_count': 123}]
+            
+            if result_data and len(result_data) > 0 and "node_count" in result_data[0]:
+                node_count = result_data[0]["node_count"]
+                print(f"[NEO4J_SERVICE LOG] Current node count in graph: {node_count}")
+                return node_count < threshold
+            else:
+                # กรณีที่ query สำเร็จแต่ไม่ได้ผลลัพธ์ตามที่คาดหวัง
+                print(f"[NEO4J_SERVICE WARNING] Could not retrieve valid node count. Query result: {result_data}. Assuming graph is not empty for safety.")
+                return False 
+        except Exception as e:
+            print(f"[NEO4J_SERVICE ERROR] Error checking if graph is empty: {e}")
+            # ในกรณีที่เกิด error ขณะ query, การตัดสินใจว่าจะ return True หรือ False ขึ้นอยู่กับว่า
+            # การ trigger Full Regeneration โดยไม่ได้ตั้งใจนั้นเสียหายกว่าการไม่ trigger หรือไม่
+            # การ return False (ถือว่าไม่ว่าง) อาจจะปลอดภัยกว่าในแง่ของการป้องกันการล้างข้อมูลคำถามโดยไม่จำเป็น
+            print("[NEO4J_SERVICE WARNING] Assuming graph is NOT empty due to error, to avoid accidental full question regeneration.")
+            return False
         
     async def flow(self, files: List[IO[bytes]], file_names: List[str]):
+        loop = asyncio.get_running_loop()
+
         # Load PDFs and create translate chunk-documents
-        documents = self.read_PDFs_and_create_documents(files, file_names)
-        split_docs = await self.split_documents_into_chunks(documents)
-        translated_split_doc = await self.translate_documents_with_openai(split_docs)
+        # documents = self.read_PDFs_and_create_documents(files, file_names) # Original
+        documents = await loop.run_in_executor(None, self.read_PDFs_and_create_documents, files, file_names)
+
+        split_docs = await self.split_documents_into_chunks(documents) # This is already async friendly if splitter.split_documents is designed so
+        translated_split_doc = await self.translate_documents_with_openai(split_docs) # This is already async
+
         # Convert documents to graph and store in Neo4j
-        graph_doc = await self.convert_documents_to_graph(translated_split_doc)
-        self.add_graph_documents_to_neo4j(graph_doc)
-        self.add_description_embeddings_to_nodes()
+        graph_doc = await self.convert_documents_to_graph(translated_split_doc) # This is already async
+
+        # await loop.run_in_executor(None, self.add_graph_documents_to_neo4j, graph_doc) # Wrap blocking call
+        # Corrected based on your code structure: add_graph_documents_to_neo4j is synchronous
+        await loop.run_in_executor(None, self.add_graph_documents_to_neo4j, graph_doc)
+
+
+        # await loop.run_in_executor(None, self.add_description_embeddings_to_nodes) # Wrap blocking call
+        # Corrected based on your code structure: add_description_embeddings_to_nodes is synchronous
+        await loop.run_in_executor(None, self.add_description_embeddings_to_nodes)
+
         # Store vector embeddings
-        await self.store_vector_embeddings(translated_split_doc)
+        await self.store_vector_embeddings(translated_split_doc) # This is already async
            

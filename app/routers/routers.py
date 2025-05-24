@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.controllers import chat_controller, graph_controller, question_ai_controller # เพิ่ม question_ai_controller
+from app.controllers import chat_controller, graph_controller, question_ai_controller
 from fastapi.responses import JSONResponse
+
 router = APIRouter()
 
 @router.get("/health", tags=["Health Check"])
