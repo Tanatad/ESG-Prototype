@@ -5,7 +5,7 @@ from typing import List, Optional
 from app.models.esg_question_model import ESGQuestion
 from app.services.question_generation_service import QuestionGenerationService, GeneratedQuestion
 from app.services.neo4j_service import Neo4jService # จำเป็นสำหรับการสร้าง QGService
-
+from app.dependencies import get_neo4j_service, get_question_generation_service
 # --- ส่วน Dependency Injection (ปรับตามการตั้งค่าของคุณ) ---
 # ตัวอย่างนี้จะสมมติว่าคุณมีวิธี get service instances
 # ใน app/main.py หรือ app/dependencies.py คุณควรจะสร้าง instance เหล่านี้
@@ -69,44 +69,58 @@ async def get_all_active_esg_questions(
 
 @router.post("/trigger-generation/full-regeneration", response_model=List[GeneratedQuestion])
 async def trigger_full_question_regeneration(
-    qg_service: QuestionGenerationService = Depends(get_temp_qg_service) # ใช้ Dependency Injection
+    qg_service: QuestionGenerationService = Depends(get_question_generation_service) # Corrected DI
 ):
     """
     Manually triggers a full regeneration of all ESG questions.
-    This will deactivate all existing questions and create a new set based on the current graph schema.
+    This will typically re-identify themes from the KG and evolve questions.
     """
     try:
         print("[CONTROLLER INFO /trigger-generation/full-regeneration] Full regeneration requested.")
-        # เรียก service โดยไม่ส่ง uploaded_file_content_bytes (หรือจะส่ง force_full_regeneration=True ก็ได้ถ้า service มี parameter นั้น)
-        generated_questions = await qg_service.generate_and_store_questions(uploaded_file_content_bytes=None)
+        # เปลี่ยนชื่อเมธอดที่เรียก
+        generated_questions = await qg_service.evolve_and_store_questions(uploaded_file_content_bytes=None)
         return generated_questions
     except Exception as e:
         print(f"[CONTROLLER ERROR /trigger-generation/full-regeneration] Error: {e}")
+        traceback.print_exc() # เพิ่ม traceback print
         raise HTTPException(status_code=500, detail=f"Failed to trigger full question regeneration: {str(e)}")
 
 
 @router.post("/trigger-generation/from-pdf", response_model=List[GeneratedQuestion])
 async def trigger_question_update_from_pdf(
     file: UploadFile = File(..., description="PDF file to analyze for impacting question themes."),
-    qg_service: QuestionGenerationService = Depends(get_temp_qg_service) # ใช้ Dependency Injection
+    qg_service: QuestionGenerationService = Depends(get_question_generation_service) # Corrected DI
 ):
     """
-    Triggers an update (or regeneration if needed) of ESG questions based on the content
-    of the uploaded PDF file. The PDF is analyzed for its impact on existing themes.
+    Triggers an update/evolution of ESG questions based on the current KG state,
+    considering that a new PDF has been (or is being) processed into the KG.
+    Note: This endpoint itself doesn't process the PDF into the KG; that should be done
+    via the /graph/uploadfile endpoint first or concurrently. This endpoint signals
+    that question evolution should consider a recent KG update potentially driven by a PDF.
+    For a more integrated flow, the /graph/uploadfile endpoint already triggers this.
     """
     try:
-        print(f"[CONTROLLER INFO /trigger-generation/from-pdf] PDF upload received: {file.filename}")
-        pdf_bytes = await file.read()
+        print(f"[CONTROLLER INFO /trigger-generation/from-pdf] PDF-driven question evolution requested with file: {file.filename}")
+        pdf_bytes = await file.read() # อ่าน bytes ถ้า QG service จะใช้
+        await file.close() # อย่าลืม close file
         if not pdf_bytes:
             raise HTTPException(status_code=400, detail="Uploaded PDF file is empty.")
 
-        # เรียก service โดยส่งเนื้อหาไฟล์ PDF เข้าไป
-        generated_questions = await qg_service.generate_and_store_questions(uploaded_file_content_bytes=pdf_bytes)
+        # เปลี่ยนชื่อเมธอดที่เรียก
+        # การส่ง pdf_bytes ไปที่ evolve_and_store_questions หมายความว่า QG Service จะใช้มัน
+        # ใน logic ใหม่ของเรา เราตั้งใจให้ flow ของ graph_controller เรียก neo4j_service.flow ก่อน
+        # แล้วค่อย trigger qg_service.evolve_and_store_questions(uploaded_file_content_bytes=None)
+        # ดังนั้น endpoint นี้อาจจะไม่จำเป็นแล้ว หรือถ้าจะให้มันทำงานแยกต่างหากจริงๆ
+        # QG Service จะต้องมี logic ที่รับ pdf_bytes แล้วไปสั่ง neo4j_service ให้อัปเดต KG ก่อน แล้วค่อย evolve Qs
+        # เพื่อความง่าย ผมจะสมมติว่า PDF นี้ "เพิ่งถูกอัปโหลด" และ KG อัปเดตแล้ว
+        # ดังนั้นการเรียก evolve_and_store_questions(uploaded_file_content_bytes=pdf_bytes) จะเข้า scope KG_UPDATED_FULL_SCAN_FROM_CONTENT
+        generated_questions = await qg_service.evolve_and_store_questions(uploaded_file_content_bytes=pdf_bytes) # ถ้าส่ง bytes จะเข้าเงื่อนไข uploaded_file_content_bytes ใน QGService
         return generated_questions
-    except HTTPException as http_exc: # Re-raise HTTP exceptions
+    except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
         print(f"[CONTROLLER ERROR /trigger-generation/from-pdf] Error processing PDF for question update: {e}")
+        traceback.print_exc() # เพิ่ม traceback print
         raise HTTPException(status_code=500, detail=f"Failed to process PDF for question update: {str(e)}")
 
 # --- อาจจะมี Endpoints อื่นๆ ตาม Use Case ของคุณ ---

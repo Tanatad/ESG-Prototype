@@ -10,29 +10,40 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field as PydanticField
 import json
+import functools # <--- เพิ่มบรรทัดนี้
 from datetime import datetime, timezone
-
-from functools import partial
-from unstructured.partition.auto import partition as unstructured_partition
-
+from functools import partial # For unstructured_partition callable
+# from unstructured.partition.auto import partition as unstructured_partition # Keep this for analyze_pdf_impact
+import traceback
+from sklearn.metrics.pairwise import cosine_similarity # For similarity checks
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import HDBSCAN # หรือ KMeans if you prefer
+# Make sure HDBSCAN is installed: pip install hdbscan scikit-learn
+# For KMeans: from sklearn.cluster import KMeans
 
 from app.models.esg_question_model import ESGQuestion
-from app.services.neo4j_service import Neo4jService
+from app.services.neo4j_service import Neo4jService # Neo4jService is imported
 
 load_dotenv()
 
-PROCESS_SCOPE_PDF_SPECIFIC_IMPACT = "pdf_specific_impact"
-PROCESS_SCOPE_KG_FULL_SCAN_GENERAL_PDF = "kg_full_scan_general_pdf"
-PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG = "kg_full_scan_scheduled_initial_or_empty_kg"
-PROCESS_SCOPE_NO_OP_ANALYSIS_FAILED_OR_NO_TARGETS = "no_op_analysis_failed_or_no_targets"
+# PROCESS_SCOPE constants remain the same
+PROCESS_SCOPE_PDF_SPECIFIC_IMPACT = "pdf_specific_impact" # Not directly used by new theme logic, but analyze_pdf_impact might still be
+PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT = "KG_INITIAL_FULL_SCAN_FROM_CONTENT"
+PROCESS_SCOPE_KG_UPDATED_FULL_SCAN_FROM_CONTENT = "KG_UPDATED_FULL_SCAN_FROM_CONTENT"
+PROCESS_SCOPE_KG_FULL_SCAN_DB_EMPTY_FROM_CONTENT = "KG_FULL_SCAN_DB_EMPTY_FROM_CONTENT"
+PROCESS_SCOPE_KG_SCHEDULED_REFRESH_FROM_CONTENT = "KG_SCHEDULED_REFRESH_FROM_CONTENT"
+PROCESS_SCOPE_NO_ACTION_DEFAULT = "NO_ACTION_DEFAULT"
+PROCESS_SCOPE_NO_ACTION_UNEXPECTED_STATE = "NO_ACTION_UNEXPECTED_STATE"
+PROCESS_SCOPE_NO_ACTION_KG_AND_DB_EMPTY_ON_SCHEDULED_RUN = "NO_ACTION_KG_AND_DB_EMPTY_ON_SCHEDULED_RUN"
 
+# GeneratedQuestion Pydantic model (ใช้ภายใน service) อาจจะยังคงเดิม หรือเพิ่ม model_extra
 class GeneratedQuestion(BaseModel):
     question_text_en: str = PydanticField(..., description="The text of the generated ESG question.")
     question_text_th: Optional[str] = PydanticField(None, description="The Thai text of the generated ESG question.")
-    category: str = PydanticField(..., description="The ESG category (E, S, or G).")
-    theme: str = PydanticField(..., description="The ESG theme or area of inquiry this question relates to.")
+    category: str = PydanticField(..., description="The ESG category (E, S, or G).") # Category for the question/theme
+    theme: str = PydanticField(..., description="The ESG theme or area of inquiry this question relates to.") # Consolidated theme name
+    additional_info: Optional[Dict[str, Any]] = PydanticField(None, description="Additional non-standard information carried with the question.")
+
 
 class QuestionGenerationService:
     def __init__(self,
@@ -40,41 +51,29 @@ class QuestionGenerationService:
                  similarity_embedding_model: Embeddings
                 ):
         self.neo4j_service = neo4j_service
-        self.similarity_llm_embedding = similarity_embedding_model
-        self.qg_llm = ChatGoogleGenerativeAI(
-            model=os.getenv("QUESTION_GENERATION_MODEL", "gemini-1.5-flash-preview-0514"),
-            temperature=0.7,
+        self.similarity_llm_embedding = similarity_embedding_model # Used for are_questions_substantially_similar
+        self.qg_llm = ChatGoogleGenerativeAI( # LLM for theme naming, question generation
+            model=os.getenv("QUESTION_GENERATION_MODEL", "gemini-2.5-flash-preview-05-20"), # Updated model name
+            temperature=0.8, # Slightly lower for more deterministic theme naming/question gen
             max_retries=3,
         )
         self.translation_llm = ChatGoogleGenerativeAI(
-            model=os.getenv("TRANSLATION_MODEL", "gemini-1.5-flash-preview-0514"),
-            temperature=0.0,
+            model=os.getenv("TRANSLATION_MODEL", "gemini-2.0-flash"), # Updated model name
+            temperature=0.8,
             max_retries=3,
         )
-        self.graph_schema_content: Optional[str] = None
-        self._load_graph_schema()
+        # self.graph_schema_content is NO LONGER USED for theme identification
+        # self._load_graph_schema() # Remove this call or its usage for themes
+
         if self.similarity_llm_embedding:
             print("[QG_SERVICE LOG] Similarity embedding model received and configured.")
         else:
             print("[QG_SERVICE WARNING] Similarity embedding model was NOT provided. Similarity checks might fallback or be less accurate.")
 
-    def _load_graph_schema(self):
-        try:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(os.path.dirname(current_dir))
-            schema_file_path = os.path.join(project_root, "neo4j_graph_schema.txt")
-            if os.path.exists(schema_file_path):
-                with open(schema_file_path, 'r', encoding='utf-8') as f:
-                    self.graph_schema_content = f.read()
-                print(f"[QG_SERVICE LOG] Successfully loaded Neo4j graph schema from: {schema_file_path}")
-            else:
-                self.graph_schema_content = "Graph schema is not available."
-                print(f"[QG_SERVICE ERROR] Graph schema file not found at: {schema_file_path}")
-        except Exception as e:
-            self.graph_schema_content = "Error loading graph schema."
-            print(f"[QG_SERVICE ERROR] Error loading graph schema: {e}")
+    # _load_graph_schema method can be removed if no longer used elsewhere.
 
     async def translate_text_to_thai(self, text_to_translate: str) -> Optional[str]:
+        # ... (existing implementation is fine) ...
         if not text_to_translate: return None
         prompt_template = PromptTemplate.from_template(
             "Translate the following English text to Thai. Provide only the Thai translation.\n\nEnglish Text: \"{english_text}\"\n\nThai Translation:"
@@ -87,81 +86,180 @@ class QuestionGenerationService:
             print(f"[QG_SERVICE ERROR] Error during translation to Thai for text '{text_to_translate[:30]}...': {e}")
             return None
 
-    async def analyze_pdf_impact(self, file_content_bytes: bytes, existing_theme_details_input: List[Dict[str, str]]) -> Dict[str, Any]:
-        default_error_response = {"impacted_theme_names": [], "new_topic_description": None, "is_general_update": True, "brief_summary": "Error in analysis process."}
-        if not file_content_bytes:
-            return {"impacted_theme_names": [], "new_topic_description": None, "is_general_update": False, "brief_summary": "No content to analyze."}
+    # analyze_pdf_impact might still be useful as a preliminary check, but not for primary theme ID.
+    # The current implementation of analyze_pdf_impact expects existing theme names as input.
+    # For now, we'll bypass its direct use in evolve_and_store_questions' main theme generation path.
+    # async def analyze_pdf_impact(self, ...):
+    # ... (existing implementation can remain for now if used elsewhere or for light impact assessment)
 
-        # For the prompt, we only need theme names from the input details
-        simple_existing_theme_names = [item['theme_name'] for item in existing_theme_details_input]
-        existing_themes_str_for_prompt = "\n".join([f"- {th_name}" for th_name in simple_existing_theme_names]) if simple_existing_theme_names else "No existing themes provided."
+
+    async def identify_consolidated_themes_from_kg(
+        self,
+        existing_active_theme_names: Optional[List[str]] = None, # Can be used to guide LLM or for diffing
+        min_cluster_size_hdbscan: int = 7, # Parameter for HDBSCAN
+        min_samples_hdbscan: Optional[int] = None # Parameter for HDBSCAN
+    ) -> List[Dict[str, Any]]:
+        print("[QG_SERVICE LOG] Starting Consolidated Theme Identification from KG content...")
         
-        pdf_text_content = ""
-        temp_file_path = None
+        all_chunks_data = await self.neo4j_service.get_all_standard_chunks_for_theme_generation()
+        if not all_chunks_data or len(all_chunks_data) < min_cluster_size_hdbscan : # Need enough chunks
+            print(f"[QG_SERVICE WARNING] Not enough StandardChunks ({len(all_chunks_data)}) available from Neo4j to identify themes (min required: {min_cluster_size_hdbscan}).")
+            return []
+
+        print(f"[QG_SERVICE INFO] Retrieved {len(all_chunks_data)} chunks for theme identification.")
+
+        embeddings_array = np.array([chunk['embedding'] for chunk in all_chunks_data if chunk.get('embedding')])
+        if embeddings_array.ndim == 1: # Handle case where only one embedding might be returned (though unlikely with check above)
+            if len(all_chunks_data) >=1 : # If only one chunk, it's its own theme
+                 print("[QG_SERVICE WARNING] Only one chunk with embedding found. Treating as a single theme cluster.")
+                 # Simulate a single cluster for this one chunk
+                 cluster_labels = np.array([0])
+                 # Ensure embeddings_array is 2D for hdbscan if it proceeds (though it won't with 1 sample)
+                 if embeddings_array.size > 0 and embeddings_array.ndim == 1:
+                     embeddings_array = embeddings_array.reshape(1, -1)
+
+            else: # No embeddings
+                print("[QG_SERVICE WARNING] No embeddings found in retrieved chunks.")
+                return []
+        elif embeddings_array.shape[0] < min_cluster_size_hdbscan:
+             print(f"[QG_SERVICE WARNING] Number of chunks with embeddings ({embeddings_array.shape[0]}) is less than min_cluster_size_hdbscan ({min_cluster_size_hdbscan}). Cannot perform robust clustering. Treating each as a potential small theme or skipping.")
+             # For now, let's skip if too few for clustering. Or handle as individual items if desired.
+             # Option: Process them individually by LLM without clustering.
+             # For simplicity in this example, returning empty. This needs refinement.
+             return []
+
+
+        print(f"[QG_SERVICE INFO] Performing HDBSCAN clustering on {embeddings_array.shape[0]} chunk embeddings...")
+        loop = asyncio.get_running_loop()
         try:
-            print(f"[QG_SERVICE LOG /analyze_pdf_impact] Starting PDF content extraction with unstructured...")
-            loop = asyncio.get_running_loop()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpfile:
-                tmpfile.write(file_content_bytes)
-                temp_file_path = tmpfile.name
+            clusterer = HDBSCAN(
+                min_cluster_size=min_cluster_size_hdbscan, 
+                min_samples=min_samples_hdbscan, # If None, defaults to min_cluster_size
+                metric='cosine', # Cosine distance is often good for text embeddings
+                # allow_single_cluster=True # Add if you want to allow a single large cluster
+            )
+            # HDBSCAN fit_predict is synchronous
+            cluster_labels = await loop.run_in_executor(None, clusterer.fit_predict, embeddings_array)
+            num_identified_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+            num_outliers = np.sum(cluster_labels == -1)
+            print(f"[QG_SERVICE INFO] HDBSCAN found {num_identified_clusters} clusters and {num_outliers} outliers.")
+
+        except Exception as e_cluster:
+            print(f"[QG_SERVICE ERROR] Clustering error: {e_cluster}")
+            traceback.print_exc()
+            return []
+
+        identified_themes_from_kg: List[Dict[str, Any]] = []
+        
+        # Group chunks by cluster label
+        clustered_chunks: Dict[int, List[Dict[str, Any]]] = {}
+        for i, label in enumerate(cluster_labels):
+            if label != -1: # Exclude outliers for now
+                clustered_chunks.setdefault(label, []).append(all_chunks_data[i])
+        
+        # Process each cluster with LLM
+        llm_tasks = []
+        for cluster_id, chunks_in_this_cluster in clustered_chunks.items():
+            if not chunks_in_this_cluster: continue
+
+            # Create context for LLM from chunks in this cluster
+            context_for_llm = ""
+            char_count = 0
+            max_chars_for_context = 1000000 # Adjust based on LLM context window and token limits
+            num_chunks_for_context = 0
+            MAX_CHUNKS_SAMPLE = 7 # Take up to 7 chunks for context
+
+            temp_context_parts = []
+            for chunk_data in chunks_in_this_cluster:
+                if num_chunks_for_context < MAX_CHUNKS_SAMPLE:
+                    chunk_text_sample = chunk_data['text'][:int(max_chars_for_context / MAX_CHUNKS_SAMPLE)] # Distribute char limit
+                    if char_count + len(chunk_text_sample) <= max_chars_for_context:
+                        source_info = f"(From Doc: {chunk_data.get('source_document_doc_id', 'Unknown')}, Page: {chunk_data.get('page_number', 'N/A')}, Orig.Section: {chunk_data.get('original_section_id', 'N/A')})"
+                        temp_context_parts.append(f"SAMPLE CHUNK {source_info}:\n{chunk_text_sample}\n---\n")
+                        char_count += len(chunk_text_sample) + len(source_info) + 20 # Approx
+                        num_chunks_for_context +=1
+                    else:
+                        break # Stop if adding next chunk exceeds max_chars
+                else:
+                    break # Stop if max_chunks_sample reached
+            context_for_llm = "".join(temp_context_parts)
             
-            unstructured_partition_callable = partial(unstructured_partition, filename=temp_file_path, strategy="auto")
-            elements = await loop.run_in_executor(None, unstructured_partition_callable)
-            pdf_text_content = "\n\n".join([el.text for el in elements if hasattr(el, 'text') and el.text])
+            if not context_for_llm and chunks_in_this_cluster: # Fallback if all chunks were too long / yielded empty
+                 first_chunk_text = chunks_in_this_cluster[0]['text']
+                 context_for_llm = first_chunk_text[:max_chars_for_context]
 
-            if not pdf_text_content.strip():
-                print(f"[QG_SERVICE WARNING /analyze_pdf_impact] PDF content seems empty after unstructured processing.")
-                return {"impacted_theme_names": [], "new_topic_description": None, "is_general_update": True, "brief_summary": "Processed PDF content is empty."}
-            print(f"[QG_SERVICE LOG /analyze_pdf_impact] Extracted PDF content length: {len(pdf_text_content)} characters.")
-            pdf_text_for_llm = pdf_text_content
-        except Exception as e:
-            print(f"[QG_SERVICE ERROR /analyze_pdf_impact] Error during PDF content extraction: {e}")
-            return {**default_error_response, "brief_summary": "Error processing PDF content."}
-        finally:
-            if temp_file_path and os.path.exists(temp_file_path):
-                try: os.remove(temp_file_path)
-                except Exception as e_remove: print(f"[QG_SERVICE WARNING /analyze_pdf_impact] Could not remove temp file: {e_remove}")
 
-        prompt_template_str = """
-        You are an ESG analyst reviewing an uploaded document.
-        The full content of the document is:
-        ---DOCUMENT CONTENT START---
-        {pdf_content_full}
-        ---DOCUMENT CONTENT END---
+            source_doc_names_in_cluster = sorted(list(set(c['source_document_doc_id'] for c in chunks_in_this_cluster if c.get('source_document_doc_id'))))
 
-        Here is a list of existing ESG Question Themes:
-        ---EXISTING THEMES START---
-        {existing_themes_list_str} 
-        ---EXISTING THEMES END---
+            prompt_template_str = """
+            You are an expert ESG analyst. A group of semantically similar text chunks has been extracted from various ESG standard documents. Your task is to define a consolidated ESG reporting theme based on these chunks, tailored for the **industrial packaging sector**.
 
-        Task:
-        1. Analyze the document content.
-        2. Identify which of the "EXISTING THEMES" are most directly impacted or updated. List their exact names.
-        3. If the document introduces a significant new ESG topic not covered by existing themes, describe it.
-        4. Determine if this document is a general ESG update (e.g., a full sustainability report).
+            Representative text chunks from this group:
+            ---REPRESENTATIVE CHUNKS START---
+            {representative_chunk_content}
+            ---REPRESENTATIVE CHUNKS END---
 
-        Output your analysis in STRICT JSON format with ONLY these keys:
-        - "impacted_theme_names": List of exact theme names from EXISTING THEMES affected. Empty if none.
-        - "new_topic_description": String describing new topic areas, or null.
-        - "is_general_update": Boolean (true if a broad update, false if specific).
-        - "brief_summary": One-sentence summary of the document's main ESG relevance.
-        Do not add explanations outside the JSON object.
+            These chunks originate from standards like: {source_standards_list_str}
 
-        Example Output 1 (Specific Update):
-        {{"impacted_theme_names": ["Greenhouse Gas Emissions Reporting", "Energy Management and Efficiency"], "new_topic_description": null, "is_general_update": false, "brief_summary": "The document details updated CO2 emission factors and new energy saving targets."}}
-        Example Output 2 (New Topic):
-        {{"impacted_theme_names": [], "new_topic_description": "The document introduces regulations about 'Circular Economy in Packaging Materials', which is not fully covered.", "is_general_update": false, "brief_summary": "The document outlines new specific regulations for packaging recycling."}}
-        Example Output 3 (General Update):
-        {{"impacted_theme_names": ["Greenhouse Gas Emissions Reporting", "Waste Management and Circular Economy", "Occupational Health and Safety Performance"], "new_topic_description": null, "is_general_update": true, "brief_summary": "The document is a comprehensive annual sustainability report covering multiple ESG aspects."}}
-        """
-        prompt = PromptTemplate.from_template(prompt_template_str)
-        formatted_prompt = prompt.format(pdf_content_full=pdf_text_for_llm, existing_themes_list_str=existing_themes_str_for_prompt)
+            Based on this information:
+            1.  Propose a concise and descriptive **Theme Name** (in English) for this group.
+            2.  Provide a brief **Theme Description** (in English, 1-2 sentences).
+            3.  Determine the most relevant **ESG Dimension** ('E', 'S', or 'G').
+            4.  Suggest 3-5 relevant **Keywords** (in English, comma-separated).
 
+            Output ONLY a single, valid JSON object with keys: "theme_name_en", "description_en", "dimension", "keywords_en".
+            Example:
+            {{"theme_name_en": "Sustainable Water Management", "description_en": "Covers responsible water use, treatment, and risk mitigation in packaging facilities.", "dimension": "E", "keywords_en": "water consumption, wastewater, water recycling, water stewardship"}}
+            """ # Simplified JSON output request for easier parsing
+            
+            prompt = PromptTemplate.from_template(prompt_template_str)
+            formatted_prompt = prompt.format(
+                representative_chunk_content=context_for_llm if context_for_llm else "Generic ESG context.",
+                source_standards_list_str=", ".join(source_doc_names_in_cluster[:3]) if source_doc_names_in_cluster else "various ESG standards"
+            )
+            
+            # Add task to call LLM for this cluster
+            # We also pass along constituent_chunk_ids and source_standards for this cluster
+            # to be added to the final theme dict after LLM response.
+            llm_tasks.append(
+                self._process_single_cluster_with_llm(
+                    formatted_prompt,
+                    [c['chunk_id'] for c in chunks_in_this_cluster],
+                    source_doc_names_in_cluster,
+                    cluster_id # For logging
+                )
+            )
+
+        # Execute all LLM calls concurrently
+        if llm_tasks:
+            llm_results_with_exceptions = await asyncio.gather(*llm_tasks, return_exceptions=True)
+            for result_item in llm_results_with_exceptions:
+                if isinstance(result_item, dict) and result_item.get("theme_name_en"): # Check if it's a valid theme dict
+                    identified_themes_from_kg.append(result_item)
+                elif isinstance(result_item, Exception):
+                    print(f"[QG_SERVICE ERROR] LLM processing for a cluster failed: {result_item}")
+                    traceback.print_exc()
+        
+        # TODO: Handle outliers (chunks with label -1) if desired.
+        # For now, they are ignored. Could try to assign to nearest cluster or process separately.
+
+        print(f"[QG_SERVICE LOG] Identified {len(identified_themes_from_kg)} consolidated themes from KG content after LLM processing.")
+        return identified_themes_from_kg
+
+    async def _process_single_cluster_with_llm(
+        self, 
+        formatted_prompt: str, 
+        chunk_ids_in_cluster: List[str], 
+        source_docs_in_cluster: List[str],
+        cluster_id_for_log: int
+    ) -> Optional[Dict[str, Any]]:
+        """Helper to process one cluster with LLM and structure the output."""
         try:
-            print(f"[QG_SERVICE LOG /analyze_pdf_impact] Sending PDF content (length: {len(pdf_text_for_llm)}) to LLM for impact analysis.")
+            # print(f"[QG_SERVICE DEBUG / Cluster {cluster_id_for_log}] Sending prompt to LLM (first 200 chars): {formatted_prompt[:200]}...")
             response = await self.qg_llm.ainvoke(formatted_prompt)
             llm_output = response.content.strip()
-            print(f"[QG_SERVICE DEBUG /analyze_pdf_impact] LLM Raw Output: {llm_output}")
+            
+            # print(f"[QG_SERVICE DEBUG / Cluster {cluster_id_for_log}] LLM Raw Output: {llm_output}")
             json_str = ""
             match = re.search(r"```json\s*(\{.*?\})\s*```", llm_output, re.DOTALL)
             if match: json_str = match.group(1)
@@ -169,238 +267,229 @@ class QuestionGenerationService:
                 first_brace = llm_output.find('{'); last_brace = llm_output.rfind('}')
                 if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
                     json_str = llm_output[first_brace : last_brace+1]
-                else:
-                    if llm_output.strip().startswith("{") and llm_output.strip().endswith("}"): json_str = llm_output.strip()
+                else: # If it's already a valid JSON string without ```json
+                    if llm_output.strip().startswith("{") and llm_output.strip().endswith("}"):
+                        json_str = llm_output.strip()
                     else:
-                        print(f"[QG_SERVICE ERROR /analyze_pdf_impact] LLM output not valid JSON: {llm_output}")
-                        return {**default_error_response, "brief_summary": "LLM output format error."}
+                        print(f"[QG_SERVICE ERROR / Cluster {cluster_id_for_log}] LLM output not valid JSON: {llm_output}")
+                        return None
             
-            analysis_result = json.loads(json_str)
+            llm_theme_data = json.loads(json_str)
+            
+            theme_name_en = llm_theme_data.get("theme_name_en")
+            if not theme_name_en: 
+                print(f"[QG_SERVICE WARNING / Cluster {cluster_id_for_log}] LLM did not provide 'theme_name_en'. Skipping this cluster.")
+                return None
+
+            theme_name_th = await self.translate_text_to_thai(theme_name_en)
+            description_en = llm_theme_data.get("description_en", "")
+            # description_th = await self.translate_text_to_thai(description_en) # Optional to translate desc
+
+            dimension = llm_theme_data.get("dimension", "G").upper()
+            if dimension not in ['E', 'S', 'G']: dimension = "G" # Default to G
+
             return {
-                "impacted_theme_names": analysis_result.get("impacted_theme_names", []),
-                "new_topic_description": analysis_result.get("new_topic_description"),
-                "is_general_update": analysis_result.get("is_general_update", False),
-                "brief_summary": analysis_result.get("brief_summary", "Summary not provided.")
+                "theme_name": theme_name_en, # Use EN as primary key for now
+                "theme_name_en": theme_name_en,
+                "theme_name_th": theme_name_th,
+                "description_en": description_en,
+                # "description_th": description_th,
+                "dimension": dimension,
+                "keywords": llm_theme_data.get("keywords_en", ""), # String of comma-separated keywords
+                "constituent_chunk_ids": chunk_ids_in_cluster,
+                "source_standards": source_docs_in_cluster
             }
-        except json.JSONDecodeError as e:
-            print(f"[QG_SERVICE ERROR /analyze_pdf_impact] Failed to parse JSON: {e}. Cleaned: {json_str}. Original: {llm_output}")
-            return {**default_error_response, "brief_summary": "Error in LLM output parsing."}
-        except Exception as e:
-            print(f"[QG_SERVICE ERROR /analyze_pdf_impact] LLM call error: {e}")
-            return {**default_error_response, "brief_summary": "Error during LLM analysis."}
+        except json.JSONDecodeError as e_json:
+            print(f"[QG_SERVICE ERROR / Cluster {cluster_id_for_log}] Failed to parse JSON from LLM: {e_json}. Cleaned: {json_str}. Original: {llm_output}")
+            return None
+        except Exception as e_llm:
+            print(f"[QG_SERVICE ERROR / Cluster {cluster_id_for_log}] LLM call or processing error: {e_llm}")
+            traceback.print_exc()
+            return None
 
-    async def identify_esg_themes_from_graph(self,
-                                            num_themes: int = 20,
-                                            target_themes_input: Optional[List[Union[str, Dict[str, str]]]] = None,
-                                            exclude_existing_theme_names: Optional[List[str]] = None # New parameter
-                                            ) -> List[Dict[str, str]]:
-        if not self.graph_schema_content or "not available" in self.graph_schema_content or "Error loading" in self.graph_schema_content:
-            return []
+    # generate_question_for_theme is renamed to generate_question_for_consolidated_theme
+    async def generate_question_for_consolidated_theme(
+        self, 
+        theme_info: Dict[str, Any] # Consolidated Theme object
+    ) -> Optional[GeneratedQuestion]:
+        # ... (Implementation from previous message, ensure it uses theme_info correctly for context)
+        theme_name = theme_info.get("theme_name") # This is theme_name_en
+        theme_description = theme_info.get("description_en", "")
+        theme_keywords = theme_info.get("keywords", "") 
+        constituent_chunk_ids = theme_info.get("constituent_chunk_ids", [])
+        source_standards_involved = theme_info.get("source_standards", [])
+        chunk_texts_list = []
+        retrieved_chunks_count = 0
+        valuable_chunks_count = 0
+        MIN_VALUABLE_CHUNK_LENGTH = 30
+        LOW_VALUE_SECTION_TYPES = ["header", "footer", "title", "page_number_text_unstructured"] # Add more if needed from Unstructured output
+        if not theme_name or not constituent_chunk_ids:
+            print(f"[QG_SERVICE ERROR /gen_q_consolidated] Insufficient theme_info for theme: '{theme_name}'. Missing name or chunk_ids.")
+            return None
 
-        final_themes_to_return: List[Dict[str, str]] = []
-        themes_needing_keywords_from_llm: List[str] = []
-
-        if target_themes_input:
-            # ... (existing logic for target_themes_input remains the same) ...
-            print(f"[QG_SERVICE LOG] Processing target_themes_input ({len(target_themes_input)} items) for keyword generation.")
-            for item in target_themes_input:
-                if isinstance(item, str):
-                    themes_needing_keywords_from_llm.append(item)
-                elif isinstance(item, dict):
-                    theme_name = item.get("theme_name")
-                    keywords = item.get("keywords")
-                    if theme_name and keywords:
-                        final_themes_to_return.append({"theme_name": theme_name, "keywords": keywords})
-                    elif theme_name:
-                        themes_needing_keywords_from_llm.append(theme_name)
-            if not themes_needing_keywords_from_llm and final_themes_to_return: # All targets had keywords
-                return final_themes_to_return
-            if not themes_needing_keywords_from_llm and not final_themes_to_return: # No valid targets
-                 return []
-
-
-            prompt_template_str = """
-            You are an expert ESG analyst. For each of the following ESG themes, provide 3-5 relevant keywords or concepts
-            (comma-separated in English) that might be found or represented in the ESG Knowledge Graph
-            whose schema is provided below. These keywords will be used to retrieve context for generating questions.
-
-            ESG Knowledge Graph Schema:
-            ---SCHEMA START---
-            {graph_schema}
-            ---SCHEMA END---
-
-            Generate keywords for these specific themes:
-            {target_themes_list_str}
-
-            Output Format for EACH theme:
-            Theme Name: [The Exact Theme Name Provided]
-            Keywords: keyword1, keyword2, keyword3
+        if constituent_chunk_ids:
+            query = """
+            UNWIND $chunk_ids AS target_chunk_id
+            MATCH (sc:StandardChunk {chunk_id: target_chunk_id})
+            // ใช้ COALESCE เพื่อความปลอดภัยในการ ORDER BY แม้ว่า sc.doc_id ควรจะมีค่าเสมอ
+            WITH sc, 
+                 COALESCE(sc.doc_id, "zz_unknown_source_for_ordering") AS source_doc_for_ordering, 
+                 COALESCE(sc.sequence_in_document, 99999) AS seq_for_ordering
+            RETURN sc.text as text, 
+                   sc.original_section_id as original_section, 
+                   sc.doc_id as source_doc, 
+                   sc.page_number as page_number,
+                   sc.sequence_in_document as seq
+            ORDER BY source_doc_for_ordering, seq_for_ordering
             """
-            target_themes_names_for_prompt = "\n".join([f"- {name}" for name in themes_needing_keywords_from_llm])
-            formatted_prompt = PromptTemplate.from_template(prompt_template_str).format(
-                graph_schema=self.graph_schema_content,
-                target_themes_list_str=target_themes_names_for_prompt
-            )
-            mode_description = f"keywords for {len(themes_needing_keywords_from_llm)} target themes"
-            process_llm_output_for_targeted_keywords = True
-        else: # Full theme generation (discover new themes, potentially excluding existing ones)
-            exclude_instruction = ""
-            if exclude_existing_theme_names:
-                exclude_instruction = (
-                    "Identify key reporting themes that are DISTINCT and DIFFERENT from the following existing themes:\n"
-                    + "\n".join([f"- {name}" for name in exclude_existing_theme_names])
-                    + "\nFocus on identifying themes not well covered by the list above.\n"
+            loop = asyncio.get_running_loop()
+            try:
+                # แก้ไขการเรียก run_in_executor ตามที่เคยทำไปแล้ว
+                query_callable = functools.partial(
+                    self.neo4j_service.graph.query, 
+                    query, 
+                    params={'chunk_ids': constituent_chunk_ids} # <--- *** แก้ไขตรงนี้เป็น 'params' ***
                 )
-            
-            prompt_template_str = """
-            You are an expert ESG (Environmental, Social, and Governance) analyst identifying key reporting themes
-            for industrial packaging factories based on their knowledge graph structure.
+                chunk_results = await loop.run_in_executor(None, query_callable)
 
-            ESG Knowledge Graph Schema:
-            ---SCHEMA START---
-            {graph_schema}
-            ---SCHEMA END---
+                if chunk_results:
+                    retrieved_chunks_count = len(chunk_results)
+                    for res_idx, res in enumerate(chunk_results):
+                        source_doc_val = res.get('source_doc', 'Unknown Document')
+                        original_section_val = res.get('original_section', 'N/A') # This is often the element type from Unstructured
+                        page_number_val = str(res.get('page_number', 'N/A'))
+                        text_val = res.get('text', '').strip() # .strip() to remove leading/trailing whitespace
 
-            {exclude_instruction}
-            Strictly using ONLY the provided knowledge graph schema, identify {num_themes} key reporting themes.
-            For each, provide: a. A concise theme name (English). b. 3-5 relevant keywords (comma-separated English).
+                        # --- Filtering Logic ---
+                        if not text_val or len(text_val) < MIN_VALUABLE_CHUNK_LENGTH:
+                            # print(f"[QG_SERVICE DEBUG] Skipping chunk for context (too short): '{text_val[:50]}...' from {source_doc_val}")
+                            continue
 
-            Output Format: List of themes, each with "Theme Name:" and "Keywords:" on separate lines. Example:
-            Theme Name: Carbon Emission Reduction Strategies
-            Keywords: carbon footprint, emission targets, renewable energy
+                        # Optional: More advanced filtering based on original_section_val (element type)
+                        # For example, if 'original_section_val' is 'Header' and text_val is very short or common.
+                        # This requires knowing what UnstructuredLoader typically puts in 'original_section_id'.
+                        # Let's assume original_section_val might be something like "Header", "Footer", "NarrativeText"
+                        current_section_type_lower = str(original_section_val).lower()
+                        if any(low_val_type in current_section_type_lower for low_val_type in LOW_VALUE_SECTION_TYPES):
+                            # If it's a low-value type, check if the content is generic or very short
+                            # This is a heuristic and might need tuning
+                            if len(text_val.split()) < 5 or text_val.lower() == "chain": # Example: less than 5 words or just "chain"
+                                # print(f"[QG_SERVICE DEBUG] Skipping chunk for context (low value type and content): '{text_val[:50]}...' from {source_doc_val}")
+                                continue
+                        # --- End Filtering Logic ---
 
-            List {num_themes} such themes.
-            """
-            formatted_prompt = PromptTemplate.from_template(prompt_template_str).format(
-                graph_schema=self.graph_schema_content,
-                num_themes=num_themes,
-                exclude_instruction=exclude_instruction
-            )
-            mode_description = f"{num_themes} ESG themes from schema (exclude known: {bool(exclude_existing_theme_names)})"
-            process_llm_output_for_targeted_keywords = False
-        # ... (rest of the parsing logic for identify_esg_themes_from_graph - should be fine) ...
-        print(f"[QG_SERVICE LOG] Identifying {mode_description} using LLM...")
-        llm_output = "" 
-        try:
-            response = await self.qg_llm.ainvoke(formatted_prompt)
-            llm_output = response.content.strip()
-            generated_items_from_llm: List[Dict[str, str]] = []
-            current_item_dict = {}
-            for line in llm_output.splitlines():
-                line_stripped = line.strip()
-                if line_stripped.startswith("Theme Name:"):
-                    if current_item_dict.get("theme_name") and current_item_dict.get("keywords"):
-                        generated_items_from_llm.append(current_item_dict)
-                    current_item_dict = {"theme_name": line_stripped.replace("Theme Name:", "").strip()}
-                elif line_stripped.startswith("Keywords:") and "theme_name" in current_item_dict:
-                    current_item_dict["keywords"] = line_stripped.replace("Keywords:", "").strip()
-            if current_item_dict.get("theme_name") and current_item_dict.get("keywords"):
-                generated_items_from_llm.append(current_item_dict)
+                        source_str = f"Doc='{source_doc_val}', Sec/Page='{original_section_val}/{page_number_val}'"
+                        chunk_texts_list.append(f"CONTEXT_CHUNK {valuable_chunks_count+1} (Source: {source_str}):\n{text_val}\n---\n")
+                        valuable_chunks_count += 1
+                    
+                    print(f"[QG_SERVICE INFO] Retrieved {retrieved_chunks_count} raw chunks, selected {valuable_chunks_count} valuable chunks for theme '{theme_name}' context.")
+                else:
+                     print(f"[QG_SERVICE WARNING] No chunks retrieved from DB for ids: {constituent_chunk_ids} for theme '{theme_name}'")
+            except Exception as e_ctx:
+                print(f"[QG_SERVICE ERROR] Error retrieving or filtering chunk context for theme '{theme_name}': {e_ctx}")
+                traceback.print_exc() # Good to have traceback here
+        
+        MAX_CONTEXT_LENGTH = 1000000 # Gemini 1.5 Flash has large context, but keep it reasonable for performance and cost. Adjust.
+        context_from_chunks = "".join(chunk_texts_list) # Already has newlines and "---"
+        if len(context_from_chunks) > MAX_CONTEXT_LENGTH:
+            print(f"[QG_SERVICE WARNING] Context for theme '{theme_name}' is too long ({len(context_from_chunks)} chars). Truncating to {MAX_CONTEXT_LENGTH}.")
+            context_from_chunks = context_from_chunks[:MAX_CONTEXT_LENGTH] + "\n... [CONTEXT TRUNCATED]"
+        
+        if not context_from_chunks.strip(): # Check if it became empty after potential processing
+            context_from_chunks = "No specific content chunks available for this theme. Focus on the theme name and description."
 
-            if process_llm_output_for_targeted_keywords:
-                generated_keywords_map = {item["theme_name"].strip(): item["keywords"].strip() for item in generated_items_from_llm if item.get("theme_name") and item.get("keywords")}
-                for theme_name_requested in themes_needing_keywords_from_llm:
-                    matched_theme_name = next((k for k in generated_keywords_map.keys() if k.lower() == theme_name_requested.lower()), None)
-                    if matched_theme_name: 
-                        final_themes_to_return.append({
-                            "theme_name": theme_name_requested, 
-                            "keywords": generated_keywords_map[matched_theme_name]
-                        })
-                    else:
-                        print(f"[QG_SERVICE WARNING] LLM did not generate keywords for targeted theme: {theme_name_requested}. LLM generated themes: {list(generated_keywords_map.keys())}")
-                valid_themes = final_themes_to_return
-            else: 
-                valid_themes = [t for t in generated_items_from_llm if t.get("theme_name") and t.get("keywords")]
-                if exclude_existing_theme_names: # Filter out themes that are too similar to excluded ones
-                    valid_themes = [
-                        vt for vt in valid_themes 
-                        if not any(exc_name.lower() == vt['theme_name'].lower() for exc_name in exclude_existing_theme_names)
-                    ]
-
-
-            print(f"[QG_SERVICE LOG] Successfully processed {len(valid_themes)} themes with keywords for {mode_description}.")
-            return valid_themes
-        except Exception as e:
-            print(f"[QG_SERVICE ERROR] Error during LLM call or parsing for {mode_description}: {e}. LLM output snippet: {llm_output[:500]}")
-            if process_llm_output_for_targeted_keywords:
-                return final_themes_to_return 
-            return []
-
-
-    async def generate_question_for_theme(self, theme_name: str, keywords: str) -> Optional[GeneratedQuestion]:
-        # ... (context retrieval ... )
-        cypher_context_str = "No specific graph structure snippets retrieved."
-        vector_context_str = "No specific textual information retrieved."
-        try:
-            retrieved_data = await self.neo4j_service.get_output(query=f"{theme_name} {keywords}", k=3)
-            if hasattr(retrieved_data, 'cypher_answer') and retrieved_data.cypher_answer:
-                cypher_context_str = retrieved_data.cypher_answer
-            if hasattr(retrieved_data, 'relate_documents') and retrieved_data.relate_documents:
-                vector_context_str = "\n".join([doc.page_content for doc in retrieved_data.relate_documents if doc.page_content])
-        except Exception as e:
-            print(f"[QG_SERVICE ERROR] Error retrieving context for theme '{theme_name}': {e}.")
-
-        # MODIFIED PROMPT FOR SUB-QUESTIONS
         prompt_template_str = """
-        You are an expert ESG consultant for industrial packaging factories. For the theme "{theme_name}" with keywords "{keywords}" and context:
-        Context (Graph): {cypher_context}
-        Context (Vector): {vector_context}
+        You are an expert ESG consultant assisting an **industrial packaging factory** in preparing its **Sustainability Report**.
+        Your task is to formulate a set of 2-5 specific, actionable, and data-driven sub-questions for the given consolidated ESG theme. These sub-questions are crucial for gathering the precise information needed for comprehensive sustainability reporting.
+        
+        For EACH sub-question:
+        - It should be a direct question that elicits factual data, policies, processes, or performance metrics.
+        - If evident from the provided context chunks (each prefixed with its source), specify its most direct source standard and clause/section using the format (Source: DocumentName - SectionInfo). If the source is not clear for a sub-question, omit this source annotation.
 
-        Task: 
-        1. Formulate ONE primary, overarching question for the theme "{theme_name}".
-        2. Formulate 2-4 specific sub-questions that delve into key aspects or components of this primary question. These sub-questions should guide a user to provide comprehensive information related to the theme.
-        3. Indicate the overall ESG category (E, S, or G) for this theme.
+        Consolidated ESG Theme: "{theme_name}"
+        Theme Description: {theme_description}
+        Keywords for this theme: {theme_keywords}
+        Relevant Source Standards involved: {source_standards_list_str}
 
-        Output ONLY a single JSON object with the following structure:
-        {{
-          "question_text_en": "Primary Question Text...\\n\\nSub-questions:\\n1. Sub-question 1 text...\\n2. Sub-question 2 text...\\n3. Sub-question 3 text... (and so on if more)",
-          "category": "E",
-          "theme": "{theme_name}"
-        }}
-        Ensure the sub-questions are clearly enumerated within the "question_text_en" field, separated by newlines.
-        "category" MUST be 'E', 'S', or 'G'. "theme" MUST be "{theme_name}".
-        If context is minimal, formulate broader questions based on theme and keywords.
+        Context from Standard Documents (each prefixed with its source):
+        ---CONTEXT START---
+        {context_from_chunks}
+        ---CONTEXT END---
+
+        Instructions for Output:
+        Return ONLY a single, valid JSON object with these exact keys:
+        - "question_text_en": A string containing ONLY the sub-questions, each numbered and on a new line (e.g., "1. Sub-question 1 text... (Source: DocName - SectionX)\\n2. Sub-question 2 text..."). DO NOT include a primary question.
+        - "category": The overall ESG category for this theme ('E', 'S', or 'G').
+        - "theme": Must be exactly "{theme_name}".
+        - "detailed_source_info_for_subquestions": A brief textual summary of the source standards and clauses explicitly identified for the sub-questions (e.g., "Sub-Q1 based on GRI X.Y, Sub-Q2 on ISO Z:A.B"). This is for internal documentation.
+
+        Example for "question_text_en" (containing only sub-questions):
+        "1. What were the total direct (Scope 1) greenhouse gas (GHG) emissions in the reporting period, in metric tons of CO2 equivalent? (Source: GRI 305-1 - Direct GHG Emissions)\\n2. What methodology was used to calculate these Scope 1 GHG emissions? (Source: GRI 305-1 - Calculation Methodology)\\n3. What were the total indirect (Scope 2) GHG emissions from purchased electricity, heat, or steam in the reporting period? (Source: GRI 305-2 - Indirect GHG Emissions)"
+        
+        If context is sparse, formulate broader sub-questions suitable for initial data gathering for sustainability reporting based on the theme name, description, and keywords.
+        Focus on questions that help disclose performance and management approaches.
         """
         prompt = PromptTemplate.from_template(prompt_template_str)
+        
         formatted_prompt = prompt.format(
-            theme_name=theme_name, keywords=keywords,
-            cypher_context=cypher_context_str, vector_context=vector_context_str
+            theme_name=theme_name,
+            theme_description=theme_description if theme_description else "Not specified.",
+            theme_keywords=theme_keywords if theme_keywords else "Not specified.",
+            source_standards_list_str=", ".join(source_standards_involved) if source_standards_involved else "Various ESG standards.",
+            context_from_chunks=context_from_chunks
         )
-        # ... (LLM call and JSON parsing - existing logic should be fine, but ensure it handles potentially longer question_text_en)
+        
         llm_output = "" 
         json_str = "" 
         try:
+            print(f"[QG_SERVICE LOG] Generating question for consolidated theme: {theme_name} (using new prompt)")
             response = await self.qg_llm.ainvoke(formatted_prompt)
             llm_output = response.content.strip()
             
-            match = re.search(r"```json\s*(\{.*?\})\s*```", llm_output, re.DOTALL)
+            match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", llm_output, re.DOTALL) # Allow multiline JSON
             if match: json_str = match.group(1)
             else:
                 first_brace = llm_output.find('{'); last_brace = llm_output.rfind('}')
                 if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
                     json_str = llm_output[first_brace : last_brace+1]
                 else:
-                    print(f"[QG_SERVICE ERROR /gen_q_theme] LLM output not JSON for '{theme_name}': {llm_output}")
+                    print(f"[QG_SERVICE ERROR /gen_q_consolidated] LLM output not valid JSON for '{theme_name}': {llm_output}")
                     return None
             
             question_data = json.loads(json_str)
-            if question_data.get("theme", theme_name) != theme_name:
-                question_data["theme"] = theme_name
+            
+            # Validate required fields from LLM output
+            if not all(k in question_data for k in ["question_text_en", "category", "theme"]):
+                print(f"[QG_SERVICE ERROR /gen_q_consolidated] LLM JSON output missing required keys for theme '{theme_name}'. Got: {question_data.keys()}")
+                return None
 
-            generated_q = GeneratedQuestion(**question_data)
-            if generated_q.category.upper() not in ['E', 'S', 'G']:
-                generated_q.category = "G"
-            return generated_q
+            # Ensure the theme name from input is used, not whatever LLM might hallucinate
+            final_theme_name = theme_name 
+            final_category = question_data.get("category", "G").upper()
+            if final_category not in ['E', 'S', 'G']: final_category = "G"
+            
+            detailed_source_info = question_data.get("detailed_source_info_for_subquestions")
+
+            generated_q_obj = GeneratedQuestion(
+                 question_text_en=question_data.get("question_text_en", "Error: Question text missing from LLM"),
+                 category=final_category, # final_category ถูก define ไว้แล้ว
+                 theme=final_theme_name,  # final_theme_name ถูก define ไว้แล้ว
+                 additional_info={"detailed_source_info_for_subquestions": detailed_source_info} if detailed_source_info else None
+            )
+            # Store detailed_source_info_for_subquestions in model_extra for later use in evolve_and_store_questions
+            return generated_q_obj
+
         except json.JSONDecodeError as e:
-            print(f"[QG_SERVICE ERROR /gen_q_theme] JSON parse error for '{theme_name}': {e}. Str: {json_str}. Original: {llm_output}")
+            print(f"[QG_SERVICE ERROR /gen_q_consolidated] JSON parse error for '{theme_name}': {e}. Cleaned Str: {json_str}. Original LLM Output: {llm_output}")
             return None
         except Exception as e:
-            print(f"[QG_SERVICE ERROR /gen_q_theme] Question formulation error for '{theme_name}': {e}")
+            print(f"[QG_SERVICE ERROR /gen_q_consolidated] Question formulation error for '{theme_name}': {e}")
+            traceback.print_exc()
             return None
 
 
-    async def are_questions_substantially_similar(self, text1: str, text2: str, threshold: float = 0.85) -> bool:
-        # ... (existing implementation is good) ...
+    async def are_questions_substantially_similar(self, text1: str, text2: str, threshold: float = 0.90) -> bool: # Increased threshold slightly
+        # ... (existing implementation is good, ensure self.similarity_llm_embedding is used) ...
         if not text1 or not text2: return False
         text1_lower = text1.strip().lower()
         text2_lower = text2.strip().lower()
@@ -412,272 +501,275 @@ class QuestionGenerationService:
         
         try:
             loop = asyncio.get_running_loop()
+            # embed_documents is synchronous
             embeddings = await loop.run_in_executor(None, self.similarity_llm_embedding.embed_documents, [text1_lower, text2_lower])
             if len(embeddings) < 2 or not embeddings[0] or not embeddings[1]:
                 print("[QG_SERVICE ERROR] Failed to generate embeddings for similarity check.")
-                return False
+                return False # Or raise error
             
             embedding1 = np.array(embeddings[0]).reshape(1, -1)
             embedding2 = np.array(embeddings[1]).reshape(1, -1)
             sim_score = cosine_similarity(embedding1, embedding2)[0][0]
             is_similar = sim_score >= threshold
-            print(f"[QG_SERVICE SIMILARITY] Score for '{text1[:30]}...' vs '{text2[:30]}...': {sim_score:.4f} (Th: {threshold}, Similar: {is_similar})")
+            # print(f"[QG_SERVICE SIMILARITY DEBUG] Score for '{text1[:30]}...' vs '{text2[:30]}...': {sim_score:.4f} (Th: {threshold}, Similar: {is_similar})")
             return is_similar
         except Exception as e:
             print(f"[QG_SERVICE ERROR] Similarity check error: {e}. Defaulting to False (not similar).")
+            traceback.print_exc()
             return False
-
-
+    
+    # evolve_and_store_questions: The full version provided in the previous message.
+    # Ensure it uses the updated `identify_consolidated_themes_from_kg` and
+    # `generate_question_for_consolidated_theme`.
+    # Also ensure it correctly maps data from the theme_info dict (returned by 
+    # identify_consolidated_themes_from_kg) to the new fields in the ESGQuestion MongoDB model.
     async def evolve_and_store_questions(self, uploaded_file_content_bytes: Optional[bytes] = None) -> List[GeneratedQuestion]:
-        print(f"[QG_SERVICE LOG] Orchestrating Question AI Evolution. File uploaded: {'Yes' if uploaded_file_content_bytes else 'No'}")
+        print(f"[QG_SERVICE LOG] Orchestrating Question AI Evolution (Consolidated Themes). File uploaded: {'Yes' if uploaded_file_content_bytes else 'No'}")
         current_time_utc = datetime.now(timezone.utc)
         
         initial_neo4j_empty_check_result = await self.neo4j_service.is_graph_substantially_empty()
         print(f"[QG_SERVICE INFO] Neo4j graph substantially empty check (initial): {initial_neo4j_empty_check_result}")
 
-        process_scope: str = ""
-        target_themes_for_theme_id_phase: Optional[List[Union[str, Dict[str, str]]]] = None # For PDF_SPECIFIC_IMPACT
-        impact_analysis_result_holder: Optional[Dict[str, Any]] = None # To store result if PDF is analyzed
-
         active_questions_in_db: List[ESGQuestion] = await ESGQuestion.find(ESGQuestion.is_active == True).to_list()
-        active_themes_map: Dict[str, ESGQuestion] = {q.theme: q for q in active_questions_in_db}
+        active_themes_map: Dict[str, ESGQuestion] = {q.theme: q for q in active_questions_in_db} # Keyed by consolidated theme name (EN)
         print(f"[QG_SERVICE INFO] Found {len(active_questions_in_db)} active questions in DB, covering {len(active_themes_map)} unique themes.")
 
-        if not uploaded_file_content_bytes:
-            process_scope = PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG
-        elif not active_questions_in_db:
-            process_scope = PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG
-        elif initial_neo4j_empty_check_result:
-            process_scope = PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG
-            if active_questions_in_db:
-                print(f"[QG_SERVICE INFO] Deactivating ALL {len(active_questions_in_db)} existing questions from MongoDB as KG was initially empty.")
+        process_scope: str = PROCESS_SCOPE_NO_ACTION_DEFAULT
+        # This list will hold dicts from `identify_consolidated_themes_from_kg`
+        themes_info_for_question_generation: List[Dict[str, Any]] = [] 
+
+        # --- Determine Process Scope and Identify Themes from KG Content ---
+        if initial_neo4j_empty_check_result:
+            process_scope = PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT
+            print(f"[QG_SERVICE INFO] KG is empty/near empty. Scope: {process_scope}. Identifying all themes from KG content.")
+            if active_questions_in_db: # Should ideally be empty if KG is empty, but as a safeguard
+                print(f"[QG_SERVICE INFO] Deactivating ALL {len(active_questions_in_db)} existing questions as KG is considered empty for new generation.")
                 for q_to_deactivate in active_questions_in_db:
-                     await ESGQuestion.find_one(ESGQuestion.id == q_to_deactivate.id).update(
-                        {"$set": {"is_active": False, "updated_at": current_time_utc}})
-                active_questions_in_db = []
+                    await ESGQuestion.find_one(ESGQuestion.id == q_to_deactivate.id).update(
+                        {"$set": {"is_active": False, "updated_at": current_time_utc}}
+                    )
+                active_questions_in_db = [] # Clear local cache
                 active_themes_map.clear()
-        else: # PDF uploaded, active questions exist, KG was NOT initially empty
-            print("[QG_SERVICE INFO] PDF uploaded, active questions exist, KG not initially empty. Analyzing PDF impact...")
-            existing_theme_details_for_analysis: List[Dict[str, str]] = [
-                {"theme_name": q.theme, "keywords": q.keywords if hasattr(q, 'keywords') and q.keywords else "", "current_question_en": q.question_text_en}
-                for q in active_questions_in_db
-            ]
-            impact_analysis_result = await self.analyze_pdf_impact(uploaded_file_content_bytes, existing_theme_details_for_analysis)
-            impact_analysis_result_holder = impact_analysis_result # Store for later use
-            print(f"[QG_SERVICE INFO] PDF Impact Analysis Result: {impact_analysis_result}")
+            themes_info_for_question_generation = await self.identify_consolidated_themes_from_kg()
 
-            if impact_analysis_result.get("is_general_update") or \
-               (not impact_analysis_result.get("impacted_theme_names") and not impact_analysis_result.get("new_topic_description")):
-                process_scope = PROCESS_SCOPE_KG_FULL_SCAN_GENERAL_PDF
-            else:
-                target_themes_for_theme_id_phase = []
-                impacted_theme_names_from_pdf = list(set(impact_analysis_result.get("impacted_theme_names", [])))
-                for theme_name in impacted_theme_names_from_pdf:
-                    active_q_for_theme = active_themes_map.get(theme_name)
-                    if active_q_for_theme and hasattr(active_q_for_theme, 'keywords') and active_q_for_theme.keywords:
-                        target_themes_for_theme_id_phase.append({"theme_name": theme_name, "keywords": active_q_for_theme.keywords})
-                    else:
-                        target_themes_for_theme_id_phase.append(theme_name)
-                
-                if impact_analysis_result.get("new_topic_description"):
-                    new_topic_theme_name = f"New Topic: {impact_analysis_result['new_topic_description'][:100]}"
-                    target_themes_for_theme_id_phase.append(new_topic_theme_name)
-                
-                if target_themes_for_theme_id_phase:
-                    process_scope = PROCESS_SCOPE_PDF_SPECIFIC_IMPACT
-                else: 
-                    process_scope = PROCESS_SCOPE_NO_OP_ANALYSIS_FAILED_OR_NO_TARGETS
-                    return [GeneratedQuestion(**q.model_dump(exclude_none=True, exclude={'id','_id', 'revision_id'})) for q in active_questions_in_db]
-        
-        print(f"[QG_SERVICE INFO] Determined process_scope: {process_scope}")
-
-        themes_to_process_info_with_keywords: List[Dict[str, str]] = []
-        if process_scope == PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG:
-            default_num_themes = 20 # Initial set, or full refresh from empty
-            print(f"[QG_SERVICE INFO] Identifying up to {default_num_themes} themes from KG (Initial/Empty KG Scan).")
-            themes_to_process_info_with_keywords = await self.identify_esg_themes_from_graph(
-                num_themes=default_num_themes, target_themes_input=None)
-        
-        elif process_scope == PROCESS_SCOPE_KG_FULL_SCAN_GENERAL_PDF:
-            print(f"[QG_SERVICE INFO] Scope '{process_scope}'. Refreshing existing themes and discovering truly new ones.")
-            combined_targets_for_general_pdf_scan: List[Union[str, Dict[str,str]]] = []
-            if active_themes_map:
-                print(f"[QG_SERVICE INFO] Preparing {len(active_themes_map)} existing active themes for keyword refresh.")
-                for theme_name, q_doc in active_themes_map.items():
-                    combined_targets_for_general_pdf_scan.append({
-                        "theme_name": theme_name, 
-                        "keywords": q_doc.keywords if hasattr(q_doc, 'keywords') and q_doc.keywords else ""
-                    })
-            
-            # Add new topic from PDF impact analysis, if any, to be processed for keywords
-            if impact_analysis_result_holder and impact_analysis_result_holder.get("new_topic_description"):
-                new_topic_theme_name = f"New Topic: {impact_analysis_result_holder['new_topic_description'][:100]}"
-                # Avoid duplicate if it somehow got named like an existing theme
-                if not any(isinstance(t, str) and t.lower() == new_topic_theme_name.lower() for t in combined_targets_for_general_pdf_scan) and \
-                   not any(isinstance(t, dict) and t.get("theme_name", "").lower() == new_topic_theme_name.lower() for t in combined_targets_for_general_pdf_scan):
-                    print(f"[QG_SERVICE INFO] Adding potential new topic '{new_topic_theme_name}' from PDF to general scan targets.")
-                    combined_targets_for_general_pdf_scan.append(new_topic_theme_name)
-
-            if combined_targets_for_general_pdf_scan:
-                themes_to_process_info_with_keywords = await self.identify_esg_themes_from_graph(
-                    target_themes_input=combined_targets_for_general_pdf_scan
+        elif uploaded_file_content_bytes: # PDF new upload, KG not initially empty
+            process_scope = PROCESS_SCOPE_KG_UPDATED_FULL_SCAN_FROM_CONTENT
+            print(f"[QG_SERVICE INFO] PDF uploaded, KG not initially empty. Scope: {process_scope}. Re-identifying all themes from current KG content.")
+            themes_info_for_question_generation = await self.identify_consolidated_themes_from_kg(
+                existing_active_theme_names=list(active_themes_map.keys())
+            )
+        elif not uploaded_file_content_bytes: # Scheduled run (no new PDF)
+            if not active_questions_in_db and not initial_neo4j_empty_check_result:
+                process_scope = PROCESS_SCOPE_KG_FULL_SCAN_DB_EMPTY_FROM_CONTENT
+                print(f"[QG_SERVICE INFO] Scheduled run. KG has content, but Question DB is empty. Scope: {process_scope}.")
+                themes_info_for_question_generation = await self.identify_consolidated_themes_from_kg()
+            elif active_questions_in_db: # Regular scheduled refresh
+                process_scope = PROCESS_SCOPE_KG_SCHEDULED_REFRESH_FROM_CONTENT
+                print(f"[QG_SERVICE INFO] Scheduled run, active questions exist. Scope: {process_scope}. Re-identifying themes.")
+                themes_info_for_question_generation = await self.identify_consolidated_themes_from_kg(
+                    existing_active_theme_names=list(active_themes_map.keys())
                 )
-            else: # No active themes and no new topic from PDF, but KG is not empty.
-                  # Fallback to identifying a default set of themes like an initial scan.
-                default_num_themes = 5 # Discover a smaller number of themes if all else fails.
-                print(f"[QG_SERVICE WARNING] General PDF scan with no active themes and no new PDF topic. Discovering {default_num_themes} themes from KG.")
-                themes_to_process_info_with_keywords = await self.identify_esg_themes_from_graph(
-                    num_themes=default_num_themes, 
-                    target_themes_input=None,
-                    exclude_existing_theme_names=list(active_themes_map.keys()) # Try to get genuinely new ones
-                )
+            else: # Scheduled, KG empty, DB empty - already covered by initial_neo4j_empty_check_result
+                 process_scope = PROCESS_SCOPE_NO_ACTION_KG_AND_DB_EMPTY_ON_SCHEDULED_RUN
+                 print(f"[QG_SERVICE INFO] Scheduled run. KG and Question DB are both empty. Scope: {process_scope}")
+        else:
+            process_scope = PROCESS_SCOPE_NO_ACTION_UNEXPECTED_STATE
+            print(f"[QG_SERVICE WARNING] Reached unexpected state for process scope determination. No action taken.")
+
+        print(f"[QG_SERVICE INFO] Final Determined process_scope: {process_scope}")
         
-        elif process_scope == PROCESS_SCOPE_PDF_SPECIFIC_IMPACT:
-            print(f"[QG_SERVICE INFO] Scope '{process_scope}'. Identifying/enriching targeted themes: {target_themes_for_theme_id_phase}")
-            themes_to_process_info_with_keywords = await self.identify_esg_themes_from_graph(
-                target_themes_input=target_themes_for_theme_id_phase)
-        
-        if not themes_to_process_info_with_keywords:
-            print(f"[QG_SERVICE WARNING] No themes identified to process for scope '{process_scope}'.")
-            if process_scope != PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG or \
-               (process_scope == PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG and not initial_neo4j_empty_check_result and active_questions_in_db):
-                 print("[QG_SERVICE WARNING] Scan on non-empty graph or specific PDF impact yielded no themes. Returning existing active questions as fallback.")
-                 return [GeneratedQuestion(**q.model_dump(exclude_none=True, exclude={'id','_id', 'revision_id'})) for q in active_questions_in_db]
+        if not themes_info_for_question_generation:
+            print(f"[QG_SERVICE WARNING] No themes were identified from KG content for scope '{process_scope}'.")
+            # If not an initial scan of an empty KG, and active questions exist, return them as fallback.
+            if process_scope != PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT and active_questions_in_db :
+                 print("[QG_SERVICE WARNING] Returning existing active questions as fallback.")
+                 return [GeneratedQuestion(**q.model_dump(exclude_none=True, exclude={'id','_id', 'revision_id', 'created_at', 'generated_at'})) for q in active_questions_in_db]
             return []
 
-        # --- Generate Candidate Questions & DB Ops (largely same as before) ---
-        # ... (The rest of your code for generating questions, translating, and DB operations)
-        # ... The crucial change was in how themes_to_process_info_with_keywords is populated for PROCESS_SCOPE_KG_FULL_SCAN_GENERAL_PDF
-        # ... The final loop "Handle previously active themes that were NOT processed in this run" remains important
-        #     and its logic to PRESERVE themes for PROCESS_SCOPE_KG_FULL_SCAN_GENERAL_PDF is correct.
-
-        print(f"[QG_SERVICE INFO] Generating English questions for {len(themes_to_process_info_with_keywords)} themes identified for scope '{process_scope}'...")
+        # --- Generate Candidate Questions for identified themes ---
+        print(f"[QG_SERVICE INFO] Generating English questions for {len(themes_info_for_question_generation)} consolidated themes.")
         english_question_tasks = [
-            self.generate_question_for_theme(theme_info["theme_name"], theme_info["keywords"])
-            for theme_info in themes_to_process_info_with_keywords if theme_info.get("theme_name") and theme_info.get("keywords")
+            self.generate_question_for_consolidated_theme(theme_info)
+            for theme_info in themes_info_for_question_generation
         ]
-        newly_generated_english_results = await asyncio.gather(*english_question_tasks, return_exceptions=True)
+        generated_english_q_results_with_exc = await asyncio.gather(*english_question_tasks, return_exceptions=True)
 
-        successful_new_english_questions: List[GeneratedQuestion] = []
-        successful_indices_for_keywords: List[int] = [] 
-        for result_idx, result_item in enumerate(newly_generated_english_results):
-            if isinstance(result_item, GeneratedQuestion):
-                successful_new_english_questions.append(result_item)
-                successful_indices_for_keywords.append(result_idx) 
+        # Link successful GeneratedQuestion objects back to their original full theme_info dict
+        # This map uses the object ID of the GeneratedQuestion as a key.
+        successful_english_q_objs_map_to_theme_info: Dict[int, Dict[str, Any]] = {}
+        
+        candidate_bilingual_pydantic_questions: List[GeneratedQuestion] = [] # Holds GeneratedQuestion for API response
+
+        # Filter successful English questions and prepare for translation
+        temp_english_questions_for_translation: List[GeneratedQuestion] = []
+        for i, result_item in enumerate(generated_english_q_results_with_exc):
+            original_theme_info = themes_info_for_question_generation[i]
+            if isinstance(result_item, GeneratedQuestion): # Successfully generated English question object
+                temp_english_questions_for_translation.append(result_item)
+                successful_english_q_objs_map_to_theme_info[id(result_item)] = original_theme_info
             elif isinstance(result_item, Exception):
-                if result_idx < len(themes_to_process_info_with_keywords): # Bounds check
-                    theme_name_for_error = themes_to_process_info_with_keywords[result_idx].get("theme_name", "Unknown Theme")
-                    print(f"[QG_SERVICE ERROR] English question generation task failed for theme '{theme_name_for_error}': {result_item}")
-                else:
-                    print(f"[QG_SERVICE ERROR] English question generation task failed for an out-of-bounds index: {result_item}")
+                theme_name_for_err = original_theme_info.get("theme_name", "Unknown Theme")
+                print(f"[QG_SERVICE ERROR] English question generation task failed for theme '{theme_name_for_err}': {result_item}")
+                traceback.print_exc()
+        
+        if temp_english_questions_for_translation:
+            print(f"[QG_SERVICE INFO] Translating {len(temp_english_questions_for_translation)} English questions to Thai...")
+            translation_tasks = [self.translate_text_to_thai(q.question_text_en) for q in temp_english_questions_for_translation]
+            translated_th_texts_with_exc = await asyncio.gather(*translation_tasks, return_exceptions=True)
 
-        candidate_bilingual_questions_pydantic: List[GeneratedQuestion] = []
-        candidate_question_keywords_map: Dict[str, str] = {} 
-
-        if successful_new_english_questions:
-            print(f"[QG_SERVICE INFO] Translating {len(successful_new_english_questions)} English questions to Thai...")
-            translation_tasks = [self.translate_text_to_thai(q.question_text_en) for q in successful_new_english_questions]
-            translated_th_results = await asyncio.gather(*translation_tasks, return_exceptions=True)
-
-            for i, en_question_obj in enumerate(successful_new_english_questions):
-                th_text_result = translated_th_results[i]
+            for i, en_question_obj in enumerate(temp_english_questions_for_translation):
+                th_text_result = translated_th_texts_with_exc[i]
                 question_text_th = th_text_result if isinstance(th_text_result, str) else None
                 if isinstance(th_text_result, Exception):
-                    print(f"[QG_SERVICE ERROR] Translation failed for EN q '{en_question_obj.question_text_en[:30]}...': {th_text_result}")
+                    print(f"[QG_SERVICE ERROR] Translation failed for EN q '{en_question_obj.question_text_en[:50]}...': {th_text_result}")
                 
+                # Create the final Pydantic GeneratedQuestion object for this iteration
                 pydantic_q = GeneratedQuestion(
                     question_text_en=en_question_obj.question_text_en,
                     question_text_th=question_text_th,
                     category=en_question_obj.category,
-                    theme=en_question_obj.theme 
+                    theme=en_question_obj.theme
                 )
-                candidate_bilingual_questions_pydantic.append(pydantic_q)
-                
-                original_theme_index = successful_indices_for_keywords[i]
-                if original_theme_index < len(themes_to_process_info_with_keywords): # Bounds check
-                    original_theme_info = themes_to_process_info_with_keywords[original_theme_index]
-                    candidate_question_keywords_map[pydantic_q.theme] = original_theme_info.get('keywords', '')
-                else:
-                    print(f"[QG_SERVICE WARNING] Could not map keywords for theme '{pydantic_q.theme}' due to index out of bounds.")
-        print(f"[QG_SERVICE INFO] Prepared {len(candidate_bilingual_questions_pydantic)} candidate bilingual questions for DB evolution.")
-
-        all_final_questions_to_return_for_ui: List[GeneratedQuestion] = []
+                # Carry over model_extra (e.g., detailed_source_info_for_subquestions)
+                if hasattr(en_question_obj, 'model_extra') and en_question_obj.model_extra:
+                    pydantic_q.model_extra = en_question_obj.model_extra
+                candidate_bilingual_pydantic_questions.append(pydantic_q)
         
-        all_db_questions_docs = await ESGQuestion.find_all().to_list()
+        print(f"[QG_SERVICE INFO] Prepared {len(candidate_bilingual_pydantic_questions)} candidate bilingual questions for DB evolution.")
+
+        # --- DB Operations: Evolve questions in MongoDB ---
+        # `all_historical_questions_by_theme` should be fetched once (already done above)
+        # --- BEGIN MODIFICATION: Move this block UP ---
+        # Fetch all historical questions ONCE for efficient lookup BEFORE the loop
+        all_db_questions_docs: List[ESGQuestion] = await ESGQuestion.find_all().to_list()
         all_historical_questions_by_theme: Dict[str, List[ESGQuestion]] = {}
-        for q_doc in all_db_questions_docs:
-            all_historical_questions_by_theme.setdefault(q_doc.theme, []).append(q_doc)
-        for theme_name_hist in all_historical_questions_by_theme:
-            all_historical_questions_by_theme[theme_name_hist].sort(key=lambda q: q.version, reverse=True)
-
-        for candidate_q_pydantic in candidate_bilingual_questions_pydantic:
-            theme_name = candidate_q_pydantic.theme
-            keywords_for_candidate_q = candidate_question_keywords_map.get(theme_name, '')
-            historical_versions_for_theme = all_historical_questions_by_theme.get(theme_name, [])
-            latest_historical_q_doc = historical_versions_for_theme[0] if historical_versions_for_theme else None
-
-            if latest_historical_q_doc:
-                is_similar = await self.are_questions_substantially_similar(
-                    candidate_q_pydantic.question_text_en, latest_historical_q_doc.question_text_en)
-                if not is_similar:
-                    print(f"[QG_SERVICE INFO] Q for theme '{theme_name}' CHANGED. Deactivating old (v{latest_historical_q_doc.version}), inserting new.")
-                    if latest_historical_q_doc.is_active:
-                         await ESGQuestion.find_one(ESGQuestion.id == latest_historical_q_doc.id).update(
-                             {"$set": {"is_active": False, "updated_at": current_time_utc}})
-                    new_version_num = latest_historical_q_doc.version + 1
-                    esg_new_q_doc = ESGQuestion(
-                        **candidate_q_pydantic.model_dump(), keywords=keywords_for_candidate_q,
-                        is_active=True, version=new_version_num,
-                        generated_at=current_time_utc, updated_at=current_time_utc)
-                    try: 
-                        await esg_new_q_doc.insert()
-                        all_final_questions_to_return_for_ui.append(candidate_q_pydantic)
-                    except Exception as e: print(f"[QG_SERVICE ERROR] DB Insert (new ver) for Q '{theme_name}': {e}")
-                else:
-                    print(f"[QG_SERVICE INFO] Q for theme '{theme_name}' SIMILAR to latest historical (v{latest_historical_q_doc.version}). Ensuring it's active & updating.")
-                    update_payload = {"updated_at": current_time_utc, "is_active": True}
-                    if hasattr(latest_historical_q_doc, 'keywords') and latest_historical_q_doc.keywords != keywords_for_candidate_q:
-                        update_payload["keywords"] = keywords_for_candidate_q
-                    await ESGQuestion.find_one(ESGQuestion.id == latest_historical_q_doc.id).update({"$set": update_payload})
-                    updated_doc_for_pydantic = latest_historical_q_doc.model_copy(update=update_payload)
-                    all_final_questions_to_return_for_ui.append(
-                        GeneratedQuestion(**updated_doc_for_pydantic.model_dump(exclude={'id', '_id', 'revision_id'})))
-            else:
-                print(f"[QG_SERVICE INFO] Theme '{theme_name}' is NEW. Inserting as v1.")
-                esg_new_q_doc = ESGQuestion(
-                    **candidate_q_pydantic.model_dump(), keywords=keywords_for_candidate_q,
-                    is_active=True, version=1,
-                    generated_at=current_time_utc, updated_at=current_time_utc)
-                try: 
-                    await esg_new_q_doc.insert()
-                    all_final_questions_to_return_for_ui.append(candidate_q_pydantic)
-                except Exception as e: print(f"[QG_SERVICE ERROR] DB Insert (new theme) for Q '{theme_name}': {e}")
-
-        themes_handled_in_current_run = {q.theme for q in all_final_questions_to_return_for_ui}
+        for q_doc_hist in all_db_questions_docs:
+            all_historical_questions_by_theme.setdefault(q_doc_hist.theme, []).append(q_doc_hist)
         
-        for theme_name_previously_active, previously_active_q_doc in active_themes_map.items():
-            if theme_name_previously_active not in themes_handled_in_current_run:
-                should_deactivate_due_to_empty_kg = (
-                    process_scope == PROCESS_SCOPE_KG_FULL_SCAN_SCHEDULED_INITIAL_OR_EMPTY_KG and
-                    initial_neo4j_empty_check_result 
+        # Sort historical questions by version descending for each theme
+        for theme_name_hist_sort in all_historical_questions_by_theme:
+            all_historical_questions_by_theme[theme_name_hist_sort].sort(key=lambda q: q.version, reverse=True)
+        
+        print(f"[QG_SERVICE INFO] Fetched and prepared {len(all_db_questions_docs)} historical questions from DB, grouped into {len(all_historical_questions_by_theme)} themes.")
+
+        for pydantic_candidate_q in candidate_bilingual_pydantic_questions:
+            theme_name_cand = pydantic_candidate_q.theme # This is the consolidated theme name EN
+
+            # Find the original theme_info that generated this pydantic_candidate_q
+            # This is a bit indirect. We need to find which object in `temp_english_questions_for_translation`
+            # corresponds to `pydantic_candidate_q` to then use its ID for the map.
+            original_theme_info_for_db_op: Optional[Dict[str, Any]] = None
+            for eng_q_obj_ref in temp_english_questions_for_translation:
+                if eng_q_obj_ref.theme == pydantic_candidate_q.theme and \
+                   eng_q_obj_ref.question_text_en == pydantic_candidate_q.question_text_en:
+                    original_theme_info_for_db_op = successful_english_q_objs_map_to_theme_info.get(id(eng_q_obj_ref))
+                    break
+            
+            if not original_theme_info_for_db_op:
+                print(f"[QG_SERVICE WARNING] Critical: Could not map Pydantic candidate Q for theme '{theme_name_cand}' back to its original theme_info. Skipping DB ops.")
+                continue
+
+            # ตอนนี้ all_historical_questions_by_theme ถูก define แล้ว
+            historical_q_versions_for_theme = all_historical_questions_by_theme.get(theme_name_cand, [])
+            latest_db_q_for_theme = historical_q_versions_for_theme[0] if historical_q_versions_for_theme else None
+            
+            detailed_source_info_from_additional = None
+        # Use the new field name here:
+            if pydantic_candidate_q.additional_info: 
+                detailed_source_info_from_additional = pydantic_candidate_q.additional_info.get("detailed_source_info_for_subquestions")
+            # Prepare data for ESGQuestion model from pydantic_candidate_q and original_theme_info_for_db_op
+            db_question_data = {
+                "question_text_en": pydantic_candidate_q.question_text_en,
+                "question_text_th": pydantic_candidate_q.question_text_th,
+                "category": pydantic_candidate_q.category,
+                "theme": theme_name_cand,
+                "keywords": original_theme_info_for_db_op.get("keywords", ""),
+                "theme_description_en": original_theme_info_for_db_op.get("description_en"),
+                "theme_description_th": original_theme_info_for_db_op.get("theme_name_th"), # This was translated theme name, TODO: translate description_en
+                "dimension": original_theme_info_for_db_op.get("dimension"),
+                "source_document_references": original_theme_info_for_db_op.get("source_standards", []),
+                "constituent_chunk_ids": original_theme_info_for_db_op.get("constituent_chunk_ids", []),
+                "detailed_source_info_for_subquestions": detailed_source_info_from_additional,
+                "updated_at": current_time_utc,
+                "is_active": True
+            }
+
+            if latest_db_q_for_theme: # Theme already exists in DB
+                is_content_similar = await self.are_questions_substantially_similar(
+                    pydantic_candidate_q.question_text_en, latest_db_q_for_theme.question_text_en
                 )
-                if should_deactivate_due_to_empty_kg:
-                    if previously_active_q_doc.is_active: 
-                        print(f"[QG_SERVICE INFO] Theme '{theme_name_previously_active}' (v{previously_active_q_doc.version}) is OBSOLETE due to initial empty KG state. Deactivating.")
-                        await ESGQuestion.find_one(ESGQuestion.id == previously_active_q_doc.id).update(
-                            {"$set": {"is_active": False, "updated_at": current_time_utc}})
-                else:
-                    print(f"[QG_SERVICE INFO] Theme '{theme_name_previously_active}' (v{previously_active_q_doc.version}) was not processed for update in this run (scope: {process_scope}). PRESERVING as active.")
-                    all_final_questions_to_return_for_ui.append(
-                        GeneratedQuestion(**previously_active_q_doc.model_dump(exclude={'id', '_id', 'revision_id'})))
-        
-        seen_questions_tuples = set()
-        deduplicated_final_list = []
-        for q_to_return in all_final_questions_to_return_for_ui:
-            q_tuple = (q_to_return.theme, q_to_return.question_text_en)
-            if q_tuple not in seen_questions_tuples:
-                deduplicated_final_list.append(q_to_return)
-                seen_questions_tuples.add(q_tuple)
-        
-        print(f"[QG_SERVICE LOG] Evolution complete. Total {len(deduplicated_final_list)} bilingual questions are effectively active.")
-        return deduplicated_final_list
+                if not is_content_similar: # Content changed significantly
+                    print(f"[QG_SERVICE INFO] Question for theme '{theme_name_cand}' content CHANGED. Deactivating old v{latest_db_q_for_theme.version}, inserting new.")
+                    if latest_db_q_for_theme.is_active:
+                        await ESGQuestion.find_one(ESGQuestion.id == latest_db_q_for_theme.id).update(
+                            {"$set": {"is_active": False, "updated_at": current_time_utc}}
+                        )
+                    db_question_data["version"] = latest_db_q_for_theme.version + 1
+                    db_question_data["generated_at"] = current_time_utc
+                    new_q_to_insert = ESGQuestion(**db_question_data)
+                    try: await new_q_to_insert.insert()
+                    except Exception as e_ins_v: print(f"[QG_SERVICE ERROR] DB Insert (new ver) for Q '{theme_name_cand}': {e_ins_v}")
+                else: # Content is similar, update details if needed, ensure active
+                    print(f"[QG_SERVICE INFO] Question for theme '{theme_name_cand}' content SIMILAR to v{latest_db_q_for_theme.version}. Updating details/activating.")
+                    # Check if any other field (keywords, descriptions, sources etc.) changed
+                    fields_to_check_for_update = [
+                        "keywords", "theme_description_en", "theme_description_th", "dimension", 
+                        "source_document_references", "constituent_chunk_ids", 
+                        "detailed_source_info_for_subquestions", "question_text_th", "category"
+                    ]
+                    update_payload = {"is_active": True, "updated_at": current_time_utc}
+                    needs_db_update = not latest_db_q_for_theme.is_active
+                    for field_key in fields_to_check_for_update:
+                        new_value = db_question_data.get(field_key)
+                        old_value = getattr(latest_db_q_for_theme, field_key, None)
+                        # Handle list comparison carefully if they are not hashable or order matters
+                        if isinstance(new_value, list) and isinstance(old_value, list):
+                            if sorted(new_value) != sorted(old_value): # Simple list content check
+                                update_payload[field_key] = new_value
+                                needs_db_update = True
+                        elif new_value != old_value:
+                            update_payload[field_key] = new_value
+                            needs_db_update = True
+                    
+                    if needs_db_update:
+                        await ESGQuestion.find_one(ESGQuestion.id == latest_db_q_for_theme.id).update({"$set": update_payload})
+                        print(f"[QG_SERVICE INFO] Updated existing similar question for theme '{theme_name_cand}'.")
+            else: # Theme is completely new
+                print(f"[QG_SERVICE INFO] Theme '{theme_name_cand}' is NEW to DB. Inserting as v1.")
+                db_question_data["version"] = 1
+                db_question_data["generated_at"] = current_time_utc
+                new_q_to_insert = ESGQuestion(**db_question_data)
+                try: await new_q_to_insert.insert()
+                except Exception as e_ins_new_t: print(f"[QG_SERVICE ERROR] DB Insert (new theme) for Q '{theme_name_cand}': {e_ins_new_t}")
+
+    # --- Deactivate themes that were active but not generated in this run (if full scan) ---
+        current_run_generated_theme_names_set = {theme_info["theme_name"] for theme_info in themes_info_for_question_generation}
+        should_deactivate_obsolete_themes = process_scope in [
+            PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT, 
+            PROCESS_SCOPE_KG_UPDATED_FULL_SCAN_FROM_CONTENT, 
+            PROCESS_SCOPE_KG_FULL_SCAN_DB_EMPTY_FROM_CONTENT, 
+            PROCESS_SCOPE_KG_SCHEDULED_REFRESH_FROM_CONTENT
+        ]
+
+        if should_deactivate_obsolete_themes:
+            for active_theme_name, active_q_doc in active_themes_map.items(): # active_themes_map from earlier in the function
+                if active_theme_name not in current_run_generated_theme_names_set and active_q_doc.is_active:
+                    print(f"[QG_SERVICE INFO] Theme '{active_theme_name}' (v{active_q_doc.version}) no longer identified from KG content during a full scan. Deactivating.")
+                    # This await is correctly placed if evolve_and_store_questions is an async def method
+                    await ESGQuestion.find_one(ESGQuestion.id == active_q_doc.id).update( # This is likely your line 690
+                        {"$set": {"is_active": False, "updated_at": current_time_utc}}
+                    )
+
+        # --- Prepare final list for API response (all currently active questions) ---
+        final_active_db_questions: List[ESGQuestion] = await ESGQuestion.find(ESGQuestion.is_active == True).to_list()
+        final_pydantic_questions_for_api: List[GeneratedQuestion] = [
+            GeneratedQuestion(
+                question_text_en=q.question_text_en,
+                question_text_th=q.question_text_th,
+                category=q.category,
+                theme=q.theme
+            ) for q in final_active_db_questions
+        ]
+            
+        print(f"[QG_SERVICE LOG] Evolution complete. Total {len(final_pydantic_questions_for_api)} bilingual questions are effectively active in DB.")
+        return final_pydantic_questions_for_api
