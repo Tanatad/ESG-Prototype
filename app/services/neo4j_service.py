@@ -579,7 +579,7 @@ class Neo4jService:
                 self.graph.add_graph_documents,
                 graph_documents_from_llm,
                 baseEntityLabel=True, 
-                include_source=False # We handle linking manually for precision
+                include_source=True 
             )
             print(f"Added nodes and relationships from LLMGraphTransformer.")
         except Exception as e_add_graph:
