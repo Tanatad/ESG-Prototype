@@ -96,8 +96,8 @@ class QuestionGenerationService:
     async def identify_consolidated_themes_from_kg(
         self,
         existing_active_theme_names: Optional[List[str]] = None, # Can be used to guide LLM or for diffing
-        min_cluster_size_hdbscan: int = 7, # Parameter for HDBSCAN
-        min_samples_hdbscan: Optional[int] = None # Parameter for HDBSCAN
+        min_cluster_size_hdbscan: int = 2, # Parameter for HDBSCAN
+        min_samples_hdbscan: Optional[int] = 2 # Parameter for HDBSCAN
     ) -> List[Dict[str, Any]]:
         print("[QG_SERVICE LOG] Starting Consolidated Theme Identification from KG content...")
         
@@ -136,7 +136,7 @@ class QuestionGenerationService:
                 min_cluster_size=min_cluster_size_hdbscan, 
                 min_samples=min_samples_hdbscan, # If None, defaults to min_cluster_size
                 metric='cosine', # Cosine distance is often good for text embeddings
-                # allow_single_cluster=True # Add if you want to allow a single large cluster
+                allow_single_cluster=True # Add if you want to allow a single large cluster
             )
             # HDBSCAN fit_predict is synchronous
             cluster_labels = await loop.run_in_executor(None, clusterer.fit_predict, embeddings_array)
@@ -326,7 +326,7 @@ class QuestionGenerationService:
         if not theme_name or not constituent_chunk_ids:
             print(f"[QG_SERVICE ERROR /gen_q_consolidated] Insufficient theme_info for theme: '{theme_name}'. Missing name or chunk_ids.")
             return None
-
+        
         if constituent_chunk_ids:
             query = """
             UNWIND $chunk_ids AS target_chunk_id
@@ -398,6 +398,24 @@ class QuestionGenerationService:
         if not context_from_chunks.strip(): # Check if it became empty after potential processing
             context_from_chunks = "No specific content chunks available for this theme. Focus on the theme name and description."
 
+        graph_structure_context_str = "Graph structure context was not retrieved or is unavailable for this theme." 
+        if theme_keywords or theme_name: # ตรวจสอบว่ามีข้อมูลสำหรับ query
+            try:
+                graph_context_result = await self.neo4j_service.get_graph_context_for_theme_chunks_v2( # <--- เรียกชื่อเมธอดที่ถูกต้อง
+                    theme_name=theme_name,
+                    theme_keywords=theme_keywords,
+                    max_central_entities=2,  # <--- *** ใช้ชื่อ keyword argument ที่ถูกต้อง: max_central_entities ***
+                    max_hops_for_central_entity=1,
+                    max_relations_to_collect_per_central_entity=5,
+                    max_total_context_items_str_len=3000 # <--- ส่ง parameter นี้ไปด้วย
+                )
+                if graph_context_result:
+                    graph_structure_context_str = graph_context_result
+                # print(f"[QG_SERVICE INFO] Graph structure context (v2) for theme '{theme_name}': {graph_structure_context_str[:300]}...")
+            except Exception as e_graph_ctx:
+                print(f"[QG_SERVICE ERROR] Failed to get graph structure context (v2) for theme '{theme_name}': {e_graph_ctx}")
+                traceback.print_exc()
+
         prompt_template_str = """
         You are an expert ESG consultant assisting an **industrial packaging factory** in preparing its **Sustainability Report**.
         Your task is to formulate a set of 2-5 specific, actionable, and data-driven sub-questions for the given consolidated ESG theme. These sub-questions are crucial for gathering the precise information needed for comprehensive sustainability reporting.
@@ -415,6 +433,11 @@ class QuestionGenerationService:
         ---CONTEXT START---
         {context_from_chunks}
         ---CONTEXT END---
+
+        Context from Knowledge Graph (Key Entities and their Relationships related to this theme):
+        ---CONTEXT (GRAPH STRUCTURE) START---
+        {graph_structure_context_str} 
+        ---CONTEXT (GRAPH STRUCTURE) END---
 
         Instructions for Output:
         Return ONLY a single, valid JSON object with these exact keys:
@@ -436,7 +459,8 @@ class QuestionGenerationService:
             theme_description=theme_description if theme_description else "Not specified.",
             theme_keywords=theme_keywords if theme_keywords else "Not specified.",
             source_standards_list_str=", ".join(source_standards_involved) if source_standards_involved else "Various ESG standards.",
-            context_from_chunks=context_from_chunks
+            context_from_chunks=context_from_chunks,
+            graph_structure_context_str=graph_structure_context_str
         )
         
         llm_output = "" 

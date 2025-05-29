@@ -3,7 +3,9 @@ import os
 import asyncio
 import inspect
 import traceback
-from typing import IO, List
+import functools
+import neo4j
+from typing import IO, List, Optional
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_google_genai import ChatGoogleGenerativeAI #, GoogleGenerativeAIEmbeddings # GoogleGenerativeAIEmbeddings not used directly
@@ -17,8 +19,10 @@ from langchain_community.graphs.graph_document import GraphDocument, Node as Gra
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_cohere import CohereEmbeddings
 from app.services.rate_limit import llm_rate_limiter
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate # Import specific prompt types
 from pydantic import BaseModel
-
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
 load_dotenv()
 
 # placeholder_data is not ideal for initializing a specific schema.
@@ -27,6 +31,45 @@ load_dotenv()
 # placeholder_data = [
 # Document(page_content="Initial document to create vector index if it doesn't exist.")
 # ]
+CUSTOM_GRAPH_EXTRACTION_SYSTEM_PROMPT = (
+    "# Knowledge Graph Instructions\n"
+    "## 1. Overview\n"
+    "You are a top-tier algorithm for extracting information in structured formats to build a knowledge graph from ESG (Environmental, Social, and Governance) documents.\n"
+    "Focus on accuracy and capturing as much relevant ESG information as possible. Do not add information not explicitly mentioned.\n"
+    "- **Nodes** represent entities, concepts, metrics, standards, disclosures, etc.\n"
+    "- **Relationships** represent connections between them.\n"
+    "The goal is a clear, simple, and accurate knowledge graph.\n\n"
+
+    "## 2. Extracting Nodes (Entities and Concepts)\n"
+    "- **Node ID (`id`)**: Use a human-readable, unique identifier for the node, typically the name of the entity or concept found in the text (e.g., 'GRI 201', 'Climate Change', 'Operating Costs'). Prefer concise identifiers.\n"
+    "- **Node Type (`type`)**: Use a consistent and basic type from the provided list of allowed node types. For example, if 'Metric' is an allowed type, use 'Metric' instead of 'FinancialMetric'.\n"
+    "- **Node Name Property (`name`)**: If the primary identifier is different from a common name, extract the common name as the 'name' property. Often, `id` and `name` might be the same.\n"
+    "- **Node Description Property (`description`) [VERY IMPORTANT]**: For EACH extracted node, you MUST generate a concise but informative 'description' property. This description should summarize the entity's meaning, context, and significance *based only on the provided text segment*. Aim for 1-2 clear sentences that would help differentiate this entity and be useful for semantic search. If the text provides a definition, key characteristics, or its role, include that in the description. For example, for a node ID 'EVG&D', a good description might be 'Direct economic value generated and distributed (EVG&D) by an organization, including revenues, operating costs, employee compensation, and payments to capital providers and governments.'\n\n"
+
+    "## 3. Extracting Relationships\n"
+    "- Use general yet descriptive relationship types from the provided list of allowed relationship types (e.g., 'REQUIRES_DISCLOSURE_OF', 'COMPONENT_OF', 'IMPACTS').\n"
+    "- **Relationship Description Property (`description`)**: If the relationship itself has specific nuances or context mentioned in the text, capture that in the 'description' property of the relationship.\n\n"
+
+    "## 4. Coreference Resolution\n"
+    "Maintain entity consistency. If an entity is mentioned multiple times with different names (e.g., 'Global Reporting Initiative', 'GRI'), use the most complete or official identifier (e.g., 'Global Reporting Initiative') as the Node ID and try to capture aliases if possible (though the primary focus is the main ID and description).\n\n"
+
+    "## 5. Strict Compliance and Output Format\n"
+    "Adhere to the output format (Nodes and Relationships) and these rules strictly. Provide JSON output as requested by the system."
+)
+
+CUSTOM_GRAPH_EXTRACTION_HUMAN_MESSAGE = (
+    "Tip: Make sure to answer in the correct JSON format with 'nodes' and 'relationships' keys. "
+    "Do not include any explanations outside the JSON structure. "
+    "Focus on extracting entities and their relationships from the following ESG text based on the instructions and schema provided.\n"
+    "Input Text: {input}"
+)
+
+custom_esg_graph_extraction_prompt = ChatPromptTemplate.from_messages(
+    [
+        SystemMessagePromptTemplate.from_template(CUSTOM_GRAPH_EXTRACTION_SYSTEM_PROMPT),
+        HumanMessagePromptTemplate.from_template(CUSTOM_GRAPH_EXTRACTION_HUMAN_MESSAGE),
+    ]
+)
 
 class RetrieveAnswer(BaseModel):
     cypher_answer: str
@@ -40,15 +83,17 @@ class Neo4jService:
         self.environment = os.getenv("ENVIRONMENT", "development")
         self.llm = ChatGoogleGenerativeAI(
             temperature=0.8,
-            model=os.getenv("NEO4J_MODEL", "gemini-2.0-flash"), # Adjusted to a common Gemini model
+            model=os.getenv("NEO4J_MODEL", "gemini-2.5-flash-preview-05-20"), # Adjusted to a common Gemini model
             max_retries=10,
-            # rate_limiter=llm_rate_limiter # Assuming llm_rate_limiter is defined elsewhere
+            rate_limiter=llm_rate_limiter # Assuming llm_rate_limiter is defined elsewhere
         )
         self.llm_embbedding = CohereEmbeddings( # This is your embedding model
             model='embed-v4.0', # Or your preferred cohere model like 'embed-english-v3.0'
             cohere_api_key=os.getenv("COHERE_API_KEY"),
             max_retries=10
         )
+        self.azure_doc_intelligence_endpoint = os.getenv("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT")
+        self.azure_doc_intelligence_key = os.getenv("AZURE_DOCUMENTINTELLIGENCE_KEY")
         
         # Define these before init_vector uses them
         self.standard_chunk_vector_index_name = "standard_chunk_embedding_index"
@@ -61,6 +106,24 @@ class Neo4jService:
         self.setup_neo4j_indexes()
         self.init_vector()
         self.init_cypher()
+
+        self.azure_doc_intelligence_endpoint = os.getenv("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT")
+        self.azure_doc_intelligence_key = os.getenv("AZURE_DOCUMENTINTELLIGENCE_KEY")
+
+        if not self.azure_doc_intelligence_endpoint or not self.azure_doc_intelligence_key:
+            print("WARNING: Azure Document Intelligence endpoint or key is not configured. PDF processing via Azure will fail.")
+            self.document_intelligence_client = None
+        else:
+            try:
+                self.document_intelligence_client = DocumentIntelligenceClient(
+                    endpoint=self.azure_doc_intelligence_endpoint,
+                    credential=AzureKeyCredential(self.azure_doc_intelligence_key)
+                )
+                print("Azure Document Intelligence client initialized.")
+            except Exception as e:
+                self.document_intelligence_client = None
+                print(f"Error initializing Azure Document Intelligence client: {e}")
+                traceback.print_exc()
 
     def init_graph(self, url=None, username=None, password=None):
         if not self.graph:
@@ -232,6 +295,81 @@ class Neo4jService:
             os.rmdir(temp_dir)
             
         return docs
+
+    async def read_PDFs_and_create_documents_azure(
+        self, files: List[IO[bytes]], file_names: List[str]
+    ) -> List[Document]:
+        if not self.document_intelligence_client:
+            print("ERROR: Azure Document Intelligence client is not initialized. Cannot process PDFs.")
+            return []
+
+        all_lc_documents: List[Document] = []
+        loop = asyncio.get_running_loop() # Get the current event loop
+
+        for i, file_content_io in enumerate(files):
+            file_name = file_names[i]
+            print(f"Processing PDF with Azure Document Intelligence: {file_name}")
+
+            try:
+                file_content_io.seek(0)
+                file_bytes = file_content_io.read()
+
+                poller = self.document_intelligence_client.begin_analyze_document(
+                    model_id="prebuilt-layout",
+                    analyze_request=file_bytes,
+                    content_type="application/octet-stream"
+                )
+
+                # ถ้า poller.result() เป็น blocking call ให้รันใน executor
+                # สร้าง partial function เพื่อให้ poller.result ถูกเรียกใน thread ที่ถูกต้อง
+                blocking_call = functools.partial(poller.result)
+                result = await loop.run_in_executor(None, blocking_call)
+
+                if result and hasattr(result, 'pages') and result.pages:
+                    for page_idx, page in enumerate(result.pages): # ใช้ _ ถ้า page_idx ไม่ได้ใช้
+                        page_text_parts = []
+                        if page.lines:
+                            for line in page.lines:
+                                page_text_parts.append(line.content)
+
+                        full_page_text = "\n".join(page_text_parts).strip()
+
+                        if not full_page_text:
+                            print(f"  Skipping page {page.page_number} of {file_name} as it contains no extracted text.")
+                            continue
+
+                        lc_doc_metadata = {
+                            "source_file_name": file_name,
+                            "page_number": page.page_number,
+                        }
+
+                        page_roles = set()
+                        if hasattr(result, 'paragraphs') and result.paragraphs:
+                            for para in result.paragraphs:
+                                if para.bounding_regions:
+                                    for region in para.bounding_regions:
+                                        if region.page_number == page.page_number and para.role:
+                                            page_roles.add(para.role)
+
+                        if "title" in page_roles:
+                            lc_doc_metadata["category"] = "title"
+                        elif "sectionHeading" in page_roles:
+                            lc_doc_metadata["category"] = "sectionHeading"
+
+                        all_lc_documents.append(
+                            Document(page_content=full_page_text, metadata=lc_doc_metadata)
+                        )
+                    print(f"Successfully processed {len(result.pages)} pages from {file_name} using Azure Document Intelligence.")
+                elif result:
+                    print(f"Azure Document Intelligence processed {file_name}, but no pages were found in the result.")
+                else:
+                    print(f"Azure Document Intelligence returned a None result for {file_name}.")
+
+            except Exception as e_azure_ocr:
+                print(f"Error processing PDF {file_name} with Azure Document Intelligence: {e_azure_ocr}")
+                traceback.print_exc()
+
+        return all_lc_documents
 
     async def split_documents_into_chunks(self, documents: List[Document], chunk_size: int = 2048, chunk_overlap: int = 1024): # Reduced overlap
         # Using RecursiveCharacterTextSplitter which is good for general text
@@ -497,10 +635,18 @@ class Neo4jService:
     async def flow(self, files: List[IO[bytes]], file_names: List[str]):
         loop = asyncio.get_running_loop()
 
-        # 1. Load PDFs and create Langchain Document objects (one per file by UnstructuredFileLoader)
-        #    These initial documents might be large.
-        documents_from_pdf_loader = await loop.run_in_executor(None, self.read_PDFs_and_create_documents, files, file_names)
-        print(f"Loaded {len(documents_from_pdf_loader)} initial document(s)/element(s) from PDFs via UnstructuredFileLoader.")
+        # 1. Load PDFs and create Langchain Document objects (one per page using Azure)
+        if self.document_intelligence_client:
+            print("Using Azure Document Intelligence for PDF processing.")
+            # documents_from_pdf_loader จะเป็น List[Document] โดยแต่ละ Document คือ 1 หน้าจาก PDF
+            documents_from_pdf_loader = await self.read_PDFs_and_create_documents_azure(files, file_names)
+        else:
+            print("Azure Document Intelligence client not available, falling back to UnstructuredFileLoader (if implemented).")
+            # Fallback to original method if Azure client is not available (optional)
+            # หรือคุณอาจจะ raise error ถ้าต้องการให้ Azure เป็น prerequisite
+            documents_from_pdf_loader = await loop.run_in_executor(None, self.read_PDFs_and_create_documents, files, file_names)
+        
+        print(f"Loaded {len(documents_from_pdf_loader)} initial document(s)/element(s) from PDF processing.")
 
         if not documents_from_pdf_loader:
             print("No documents were loaded from PDFs. Aborting flow.")
@@ -535,11 +681,43 @@ class Neo4jService:
                 docs_by_source_file[source_fn] = []
             docs_by_source_file[source_fn].append(chunk_lc_doc)
 
+        esg_allowed_relationships: List[str] = [
+            "HAS_FRAMEWORK", "COMPLIES_WITH", "REFERENCES_STANDARD", "DISCLOSES_INFORMATION_ON",
+            "REPORTS_ON", "APPLIES_TO", "MENTIONS", "DEFINES",
+            "HAS_METRIC", "MEASURES", "TRACKS_KPI", "SETS_TARGET", "ACHIEVES_GOAL",
+            "IDENTIFIES_RISK", "PRESENTS_OPPORTUNITY", "HAS_IMPACT_ON", "MITIGATES_RISK",
+            "HAS_STRATEGY", "IMPLEMENTS_POLICY", "FOLLOWS_PROCESS", "ENGAGES_IN_ACTIVITY",
+            "INVESTS_IN", "OPERATES_IN", "LOCATED_IN", "GOVERNED_BY",
+            "PART_OF", "COMPONENT_OF", "SUBCLASS_OF", "INSTANCE_OF",
+            "RELATES_TO", "ASSOCIATED_WITH", "CAUSES", "INFLUENCES", "CONTRIBUTES_TO",
+            "REQUIRES", "ADDRESSES", "MANAGES", "MONITORS", "EVALUATES",
+            "ISSUED_BY", "DEVELOPED_BY", "PUBLISHED_IN", "EFFECTIVE_DATE"
+        ]
+
+        esg_allowed_nodes: List[str] = [
+            "Organization", "Person", "Standard", "Framework", "Guideline", "Regulation", "Law",
+            "Report", "Document", "Disclosure", "Topic", "SubTopic", "Category",
+            "Metric", "Indicator", "KPI", "Target", "Goal", "Objective",
+            "Risk", "Opportunity", "Impact", "Strategy", "Policy", "Process", "Practice",
+            "Activity", "Initiative", "Program", "Project",
+            "Stakeholder", "Investor", "Employee", "Customer", "Supplier", "Community", "Government",
+            "Region", "Country", "Location", "Facility",
+            "EnvironmentalFactor", "SocialFactor", "GovernanceFactor",
+            "ClimateChange", "GreenhouseGas", "GHGEmissions", "Energy", "Water", "Waste", "Biodiversity",
+            "HumanRights", "LaborPractices", "HealthAndSafety", "DiversityAndInclusion", "CommunityEngagement",
+            "BoardComposition", "Ethics", "Corruption", "ShareholderRights",
+            "EconomicValue", "FinancialPerformance", "OperatingCost", "Revenue", "Investment",
+            "Date", "Year", "Period", "Unit", "Value", "Percentage", "Currency", "Source", "Reference", "Term", "Concept"
+        ]
+
         llm_transformer_for_kg = LLMGraphTransformer(
             llm=self.llm,
             node_properties=["description", "name"],
             relationship_properties=["description"],
             strict_mode=True,
+            allowed_nodes=esg_allowed_nodes, # <--- เพิ่มรายการ Node ที่อนุญาต
+            allowed_relationships=esg_allowed_relationships, # <--- เพิ่มรายการ Relationship ที่อนุญาต
+            prompt=custom_esg_graph_extraction_prompt # <--- ใช้ Prompt ที่ปรับแต่งเอง
         )
         
         all_chunk_docs_for_llm_transformer = []
@@ -714,3 +892,160 @@ class Neo4jService:
                 print(f"[NEO4J_SERVICE ERROR] Error retrieving StandardChunks: {e}")
                 traceback.print_exc()
                 return []
+            
+    async def get_graph_context_for_theme_chunks_v2(
+        self,
+        theme_name: str,
+        theme_keywords: str,
+        max_central_entities: int = 2,
+        max_hops_for_central_entity: int = 1,
+        max_relations_to_collect_per_central_entity: int = 5,
+        max_total_context_items_str_len: int = 3000
+    ) -> Optional[str]:
+        if not theme_name and not theme_keywords:
+            print("[NEO4J WARNING] Theme name or keywords required for get_graph_context_for_theme_chunks_v2.")
+            return "Theme name or keywords required to find central entities for graph context."
+
+        central_entity_ids: List[str] = []
+        try:
+            url, username, password = self.__get_auth_env()
+            entity_description_index_name = "entity_description_embedding_index"
+
+            # Query เพื่อดึง ID และข้อมูลเบื้องต้นของ Entity ที่เกี่ยวข้องกับ Keywords
+            # เราต้องการ text (description) สำหรับ vector search และ metadata (id, labels)
+            temp_entity_retrieval_query = """
+            RETURN COALESCE(node.description, node.name, node.id, '') AS text, // <--- เพิ่ม node.name, node.id เป็น fallback สำหรับ text
+                score, 
+                {
+                    id: node.id,
+                    name: node.name, // <-- ถ้ามี property name
+                    description: node.description,
+                    labels: labels(node)
+                } AS metadata
+            """
+
+            entity_store_for_seed_search = Neo4jVector.from_existing_index(
+                embedding=self.llm_embbedding,
+                url=url, username=username, password=password,
+                index_name=entity_description_index_name,
+                text_node_property="description",
+                embedding_node_property="description_embedding",
+                retrieval_query=temp_entity_retrieval_query
+            )
+
+            search_query_for_central_entities = f"{theme_name} {theme_keywords}"
+            seed_entity_docs = await entity_store_for_seed_search.asimilarity_search(
+                query=search_query_for_central_entities, k=max_central_entities
+            )
+
+            if seed_entity_docs:
+                for doc in seed_entity_docs:
+                    if doc.metadata and doc.metadata.get('id'):
+                        central_entity_ids.append(doc.metadata.get('id'))
+            
+            if not central_entity_ids:
+                print(f"[NEO4J INFO] No distinct central entities found for theme '{theme_name}' using vector search on keywords.")
+                # (ส่วน fallback logic เดิมถ้ามี)
+                pass 
+            
+            if not central_entity_ids: # Double check after any fallback
+                print(f"[NEO4J WARNING] No central entities found for theme '{theme_name}' to build graph context.")
+                return "No central entities identified for this theme to build detailed graph context."
+
+            print(f"[NEO4J INFO] Found central entity IDs for theme '{theme_name}': {central_entity_ids}")
+
+        except neo4j.exceptions.CypherSyntaxError as cse: # ดักจับ CypherSyntaxError โดยเฉพาะ
+            print(f"[NEO4J ERROR] CypherSyntaxError finding central entities for theme '{theme_name}': {cse}")
+            print(f"Problematic Query (ensure no Python comments like # are inside the query string):\n{temp_entity_retrieval_query}")
+            traceback.print_exc()
+            return f"CypherSyntaxError finding central entities. Please check query syntax. Error: {cse.message}"
+        except ValueError as ve: 
+            print(f"[NEO4J ERROR] ValueError finding central entities for theme '{theme_name}': {ve}")
+            traceback.print_exc()
+            return f"ValueError finding central entities for graph context. Check if entities have descriptions. Error: {ve}"
+        except Exception as e_seed_search:
+            print(f"[NEO4J ERROR] Error finding central entities for theme '{theme_name}': {e_seed_search}")
+            traceback.print_exc()
+            return "Error finding central entities for graph context."
+
+        final_graph_context_parts = []
+        loop = asyncio.get_running_loop()
+        
+        # Query เพื่อดึง neighborhood ของแต่ละ central_entity_id
+        # แก้ไข {{id: ...}} เป็น {id: ...}
+        entity_neighborhood_query_template = """
+        MATCH (node:__Entity__ {id: $center_entity_id}) 
+        OPTIONAL MATCH (node)-[rel*1..{max_hops}]-(neighbor) 
+        WHERE neighbor IS NOT NULL AND (NOT 'StandardChunk' IN labels(neighbor) AND NOT 'StandardDocument' IN labels(neighbor)) // Ensure neighbor is not a chunk/doc
+        WITH node, 
+             COLLECT(DISTINCT {
+                 relationship_path: [r_hop IN rel | type(r_hop)], 
+                 neighbor_details: neighbor { 
+                     id: COALESCE(neighbor.id, elementId(neighbor)), 
+                     description: neighbor.description, 
+                     labels: [l IN labels(neighbor) WHERE l <> '__Entity__']
+                 }
+             })[0..{max_rels}] AS neighbors_and_relations_list
+        RETURN node.id as id, 
+               COALESCE(node.description, "No description available") as description, 
+               [l IN labels(node) WHERE l <> '__Entity__'] as labels,
+               neighbors_and_relations_list AS neighbors_and_relations
+        """
+        entity_neighborhood_query = entity_neighborhood_query_template.replace(
+            "{max_hops}", str(max_hops_for_central_entity)
+        ).replace(
+            "{max_rels}", str(max_relations_to_collect_per_central_entity)
+        )
+
+        total_context_len = 0
+        for center_id in central_entity_ids:
+            if total_context_len >= max_total_context_items_str_len : break # Check before making more DB calls
+            try:
+                query_callable_entity_context = functools.partial(
+                    self.graph.query,
+                    entity_neighborhood_query,
+                    params={'center_entity_id': center_id}
+                )
+                entity_context_results = await loop.run_in_executor(None, query_callable_entity_context)
+
+                if entity_context_results:
+                    record = entity_context_results[0] 
+                    
+                    e_id = record.get('id', 'UnknownEntity')
+                    e_desc = record.get('description', 'N/A')
+                    e_labels_list = record.get('labels', [])
+                    display_e_labels = e_labels_list if e_labels_list else ["Entity"]
+                    
+                    part_str = f"CENTRAL ENTITY: {e_id} (Type: {', '.join(display_e_labels)}; Desc: {e_desc})"
+                    
+                    relations_list = record.get('neighbors_and_relations', [])
+                    if relations_list:
+                        part_str += "\n  RELATIONS:"
+                        for rel_detail_idx, rel_detail in enumerate(relations_list):
+                            if rel_detail_idx >= max_relations_to_collect_per_central_entity: break # Should be handled by Cypher's slice [0..{max_rels}] but double check
+
+                            neighbor_details = rel_detail.get('neighbor_details', {})
+                            n_id = neighbor_details.get('id', 'UnknownNeighbor')
+                            n_desc = neighbor_details.get('description', 'N/A')
+                            n_labels_list = neighbor_details.get('labels', [])
+                            display_n_labels = n_labels_list if n_labels_list else ["Node"]
+                            
+                            rel_path_types_str = ", ".join(rel_detail.get('relationship_path', ['RELATED_TO']))
+                            part_str += f"\n    --[{rel_path_types_str}]--> NEIGHBOR: {n_id} (Type: {', '.join(display_n_labels)}; Desc: {n_desc})"
+                    else:
+                        part_str += "\n  (No distinct relationships/neighbors found for this entity)"
+                    
+                    if total_context_len + len(part_str) + 2 <= max_total_context_items_str_len: # +2 for \n\n
+                        final_graph_context_parts.append(part_str)
+                        total_context_len += len(part_str) + 2
+                    else:
+                        final_graph_context_parts.append("... [Further graph context truncated due to length limit]")
+                        break # Stop adding more entities if total length exceeded
+            except Exception as e_entity_ctx:
+                print(f"[NEO4J ERROR] Error fetching context for central entity '{center_id}': {e_entity_ctx}")
+                # traceback.print_exc() # Uncomment for full traceback if needed
+        
+        if not final_graph_context_parts:
+            return "No detailed graph context elements could be formatted from central entities."
+        
+        return "\n\n".join(final_graph_context_parts)
