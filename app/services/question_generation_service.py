@@ -614,7 +614,7 @@ class QuestionGenerationService:
                     doc_node.doc_id AS source_doc, // ใช้ doc_node.doc_id
                     doc_node.chunk_id AS chunk_id   // ใช้ doc_node.chunk_id
                 ORDER BY size(doc_node.text) ASC
-                LIMIT 2
+                LIMIT 20
                 """ # Fetches 1 shortest chunk linked to any of the constituent entities
                 try:
                     loop = asyncio.get_running_loop()
@@ -733,7 +733,7 @@ class QuestionGenerationService:
                 // หรือเอา ORDER BY ที่ซับซ้อนออกไปก่อนถ้าไม่แน่ใจ
                 doc_node.page_number AS order_prop // สมมติว่าใช้ page_number เรียง
             ORDER BY order_prop ASC
-            LIMIT 15
+            LIMIT 20
             """
             try:
                 loop = asyncio.get_running_loop()
@@ -936,32 +936,45 @@ class QuestionGenerationService:
             traceback.print_exc()
             return False
     
-    async def evolve_and_store_questions(self, uploaded_file_content_bytes: Optional[bytes] = None) -> List[GeneratedQuestion]: # API Response
-        print(f"[QG_SERVICE LOG] Orchestrating Hierarchical Question (Denormalized Roll-up) Evolution. File uploaded: {'Yes' if uploaded_file_content_bytes else 'No'}")
+    async def evolve_and_store_questions(self, uploaded_file_content_bytes: Optional[bytes] = None) -> List[GeneratedQuestion]:
+        print(f"[QG_SERVICE LOG] Orchestrating Hierarchical Question Evolution with Agentic Behavior. File uploaded: {'Yes' if uploaded_file_content_bytes else 'No'}")
         current_time_utc = datetime.now(timezone.utc)
-        
-        # --- Scope Determination ---
-        # ... (Your existing scope determination logic - ensure it's robust) ...
-        process_scope = PROCESS_SCOPE_KG_UPDATED_FULL_SCAN_FROM_CONTENT # Example
+
+        # --- Scope Determination (existing logic) ---
+        process_scope = PROCESS_SCOPE_KG_UPDATED_FULL_SCAN_FROM_CONTENT # Default
         initial_neo4j_empty_check_result = await self.neo4j_service.is_graph_substantially_empty()
         active_questions_in_db_count = await ESGQuestion.find(ESGQuestion.is_active == True).count()
+
         if initial_neo4j_empty_check_result:
             process_scope = PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT
             if active_questions_in_db_count > 0:
+                print("[QG_SERVICE SCOPE] Initial KG scan, deactivating all existing questions.")
                 await ESGQuestion.find(ESGQuestion.is_active == True).update({"$set": {"is_active": False, "updated_at": current_time_utc}})
         elif not uploaded_file_content_bytes and active_questions_in_db_count == 0 and not initial_neo4j_empty_check_result:
             process_scope = PROCESS_SCOPE_KG_FULL_SCAN_DB_EMPTY_FROM_CONTENT
-        elif not uploaded_file_content_bytes and active_questions_in_db_count > 0 :
-             process_scope = PROCESS_SCOPE_KG_SCHEDULED_REFRESH_FROM_CONTENT
+        elif not uploaded_file_content_bytes and active_questions_in_db_count > 0:
+            process_scope = PROCESS_SCOPE_KG_SCHEDULED_REFRESH_FROM_CONTENT
         print(f"[QG_SERVICE INFO] Determined process_scope: {process_scope}")
         # --- End Scope Determination ---
 
+        # 1. Load SET Benchmark Questions
+        benchmark_set_questions = self.load_set_benchmark_questions()
+        if not benchmark_set_questions:
+            print("[QG_SERVICE WARNING] SET Benchmark questions could not be loaded. Validation against SET will be skipped.")
+
+        # 2. Identify Themes from KG
         hierarchical_themes_structure: List[Dict[str, Any]] = await self.identify_hierarchical_themes_from_kg()
         if not hierarchical_themes_structure:
-            print("[QG_SERVICE WARNING] No hierarchical theme structure identified. Aborting question evolution.")
-            # ... (Fallback logic) ...
-            return []
+            print("[QG_SERVICE WARNING] No hierarchical theme structure identified from KG.")
+            # Fallback: If no themes from KG, directly try to cover SET questions if benchmarks are available
+            if benchmark_set_questions:
+                 pass # This path will be handled by the gap-filling loop later
+            else:
+                print("[QG_SERVICE WARNING] No KG themes and no benchmarks. Aborting question evolution.")
+                return []
 
+
+        # Load historical questions from DB
         all_db_main_category_docs: List[ESGQuestion] = await ESGQuestion.find_all().to_list()
         all_historical_main_categories_map: Dict[str, List[ESGQuestion]] = {
             doc.theme: [d for d in all_db_main_category_docs if d.theme == doc.theme]
@@ -969,137 +982,323 @@ class QuestionGenerationService:
         }
         for theme_key in all_historical_main_categories_map:
             all_historical_main_categories_map[theme_key].sort(key=lambda q: q.version, reverse=True)
-        print(f"[QG_SERVICE INFO] Fetched {len(all_db_main_category_docs)} historical Main Category docs, grouped into {len(all_historical_main_categories_map)} unique Main Categories.")
+        
+        active_theme_names_at_start_of_run: Set[str] = {
+            theme_name for theme_name, docs in all_historical_main_categories_map.items() if docs and docs[0].is_active
+        }
 
-        question_set_generation_tasks = []
-        all_current_run_main_category_names_generated: Set[str] = set()
+        api_response_questions: List[GeneratedQuestion] = []
+        # Tracks SET Question IDs covered by any theme (KG-derived or gap-filled) in this run
+        successfully_covered_set_question_ids_this_run: Set[str] = set()
+        # Tracks theme names that are successfully processed and should be active at the end of this run
+        themes_to_be_active_this_run: Set[str] = set()
 
-        for main_category_info in hierarchical_themes_structure:
-            main_category_name = main_category_info.get("main_category_name_en")
-            if not main_category_name: continue
-            all_current_run_main_category_names_generated.add(main_category_name)
+
+        # --- AGENTIC LOOP FOR KG-DERIVED THEMES ---
+        print(f"[QG_SERVICE AGENT LOOP] Processing {len(hierarchical_themes_structure)} themes derived from KG.")
+        for main_category_info_from_kg in hierarchical_themes_structure:
+            mc_name_kg = main_category_info_from_kg.get("main_category_name_en")
+            if not mc_name_kg:
+                print("[QG_SERVICE WARNING] KG theme info missing 'main_category_name_en'. Skipping.")
+                continue
+
+            # Generate initial question set for this KG theme
+            current_q_set_for_kg_theme: Optional[GeneratedQuestionSet] = \
+                await self.generate_question_for_theme_level(theme_info=main_category_info_from_kg)
+
+            if not current_q_set_for_kg_theme:
+                print(f"[QG_SERVICE WARNING] Initial QSet generation failed for KG theme '{mc_name_kg}'. Skipping this theme.")
+                continue
             
-            question_set_generation_tasks.append(
-                self.generate_question_for_theme_level(theme_info=main_category_info) # No is_main_category needed now
+            # These will be updated in the refinement loop
+            current_main_q_text = current_q_set_for_kg_theme.main_question_text_en
+            current_sub_q_text = current_q_set_for_kg_theme.rolled_up_sub_questions_text_en
+            current_sub_q_source_info = current_q_set_for_kg_theme.detailed_source_info_for_subquestions
+
+            max_refinement_iterations = int(os.getenv("QG_MAX_REFINEMENT_ITERATIONS", "1")) # e.g., 0 for no refinement, 1 for one try
+            current_iteration = 0
+            
+            validation_status_for_this_kg_theme = "Pending_Validation"
+            all_feedback_for_this_kg_theme: List[Dict[str, Any]] = []
+            set_ids_covered_by_this_kg_theme: Set[str] = set()
+
+            relevant_set_benchmarks_for_kg_theme = []
+            if benchmark_set_questions:
+                relevant_set_benchmarks_for_kg_theme = await self._find_relevant_set_benchmark_questions(
+                    mc_dimension=current_q_set_for_kg_theme.main_category_dimension,
+                    mc_name=mc_name_kg, 
+                    mc_keywords=current_q_set_for_kg_theme.main_category_keywords,
+                    generated_main_q_text=current_main_q_text,
+                    generated_sub_q_text=current_sub_q_text,
+                    all_set_benchmarks=benchmark_set_questions,
+                    relevance_threshold=0.65
+                )
+
+            is_fully_validated_against_relevant_set = False
+            if not relevant_set_benchmarks_for_kg_theme: # No relevant SET Qs for this KG theme
+                is_fully_validated_against_relevant_set = True 
+                validation_status_for_this_kg_theme = "Validated_Extended_Coverage" # Covers beyond SET or SET not applicable
+            
+            while current_iteration < max_refinement_iterations and not is_fully_validated_against_relevant_set:
+                print(f"[QG_SERVICE AGENT LOOP - KG THEME] '{mc_name_kg}', Iteration {current_iteration + 1}/{max_refinement_iterations}")
+                
+                # Assume all relevant benchmarks will be covered in this iteration pass
+                all_benchmarks_covered_this_iteration_pass = True 
+                
+                # Fetch fresh context for evaluation and potential refinement
+                # Context can be more targeted here if needed based on previous feedback (more advanced)
+                refine_kg_ctx = await self.neo4j_service.get_graph_context_for_theme_chunks_v2(
+                    theme_name=mc_name_kg, theme_keywords=current_q_set_for_kg_theme.main_category_keywords or "",
+                    max_central_entities=2, max_hops_for_central_entity=1, max_relations_to_collect_per_central_entity=3,
+                    max_total_context_items_str_len=700000 
+                ) or "No specific KG context for refinement."
+                refine_chunk_ctx = "No specific document excerpts for refinement." # Simplified
+                # (Add logic to fetch relevant chunk context if desired, similar to generate_question_for_theme_level)
+
+                temp_set_ids_covered_this_iteration_pass: Set[str] = set()
+
+                for benchmark_q in relevant_set_benchmarks_for_kg_theme:
+                    if benchmark_q['id'] in set_ids_covered_by_this_kg_theme: # Already fully covered by this theme in a previous iteration
+                        temp_set_ids_covered_this_iteration_pass.add(benchmark_q['id'])
+                        continue
+
+                    eval_result = await self._llm_as_evaluator(
+                        benchmark_question_detail=benchmark_q,
+                        generated_main_category_name=mc_name_kg,
+                        generated_main_question_en=current_main_q_text,
+                        generated_sub_questions_en=current_sub_q_text,
+                        generated_dimension=current_q_set_for_kg_theme.main_category_dimension,
+                        knowledge_graph_context=refine_kg_ctx,
+                        standard_document_excerpts=refine_chunk_ctx
+                    )
+                    eval_result_with_id = {**eval_result, "benchmark_id_evaluated": benchmark_q['id']}
+                    all_feedback_for_this_kg_theme.append(eval_result_with_id)
+
+                    if eval_result.get("coverage_assessment", "None").lower() == "full":
+                        temp_set_ids_covered_this_iteration_pass.add(benchmark_q['id'])
+                    else: # Partial or None coverage for this benchmark
+                        all_benchmarks_covered_this_iteration_pass = False
+                        print(f"[QG_SERVICE AGENT LOOP - KG THEME] '{mc_name_kg}' needs refinement for SET Q: {benchmark_q['id']}.")
+                        current_sub_q_text, current_sub_q_source_info = await self._refine_sub_questions_based_on_feedback(
+                            main_category_name=mc_name_kg, main_question_text=current_main_q_text,
+                            existing_sub_questions=current_sub_q_text,
+                            feedback_suggestions=eval_result.get("suggested_improvements"),
+                            missing_aspects=eval_result.get("missing_aspects"),
+                            original_main_category_info=main_category_info_from_kg, # Pass the original KG theme info
+                            knowledge_graph_context=refine_kg_ctx, standard_document_excerpts=refine_chunk_ctx,
+                            main_category_dimension=current_q_set_for_kg_theme.main_category_dimension
+                        )
+                        # After one refinement for a specific benchmark, break to re-evaluate all benchmarks for this KG theme
+                        break 
+                
+                set_ids_covered_by_this_kg_theme.update(temp_set_ids_covered_this_iteration_pass)
+                
+                if all_benchmarks_covered_this_iteration_pass and len(set_ids_covered_by_this_kg_theme) == len(relevant_set_benchmarks_for_kg_theme):
+                    is_fully_validated_against_relevant_set = True
+                    validation_status_for_this_kg_theme = "Validated_SET_Covered"
+                
+                current_iteration += 1
+            
+            if not is_fully_validated_against_relevant_set and relevant_set_benchmarks_for_kg_theme:
+                 validation_status_for_this_kg_theme = "Validated_Partial_SET_Coverage"
+            
+            successfully_covered_set_question_ids_this_run.update(set_ids_covered_by_this_kg_theme)
+            themes_to_be_active_this_run.add(mc_name_kg) # Mark this KG theme as processed for activation
+
+            # Upsert the (potentially refined) KG-derived theme
+            final_kg_theme_q_set = GeneratedQuestionSet(
+                main_question_text_en=current_main_q_text, rolled_up_sub_questions_text_en=current_sub_q_text,
+                main_category_name=mc_name_kg, main_category_dimension=current_q_set_for_kg_theme.main_category_dimension,
+                main_category_keywords=current_q_set_for_kg_theme.main_category_keywords,
+                main_category_description=current_q_set_for_kg_theme.main_category_description,
+                main_category_constituent_entities=current_q_set_for_kg_theme.main_category_constituent_entities,
+                main_category_source_docs=current_q_set_for_kg_theme.main_category_source_docs,
+                detailed_source_info_for_subquestions=current_sub_q_source_info
             )
-        
-        generated_question_sets_with_exc: List[Union[GeneratedQuestionSet, Exception, None]] = []
-        if question_set_generation_tasks:
-            generated_question_sets_with_exc = await asyncio.gather(*question_set_generation_tasks, return_exceptions=True)
+            await self._prepare_and_upsert_theme_to_db(final_kg_theme_q_set, main_category_info_from_kg, 
+                                                      validation_status_for_this_kg_theme, all_feedback_for_this_kg_theme, 
+                                                      list(set_ids_covered_by_this_kg_theme), 
+                                                      all_historical_main_categories_map, current_time_utc, api_response_questions)
+        # --- END LOOP for KG-derived themes ---
 
-        # --- DB Operations for Main Category Documents (Denormalized) ---
-        api_response_questions: List[GeneratedQuestion] = [] # For API response
 
-        for i, q_set_result_item in enumerate(generated_question_sets_with_exc):
-            original_main_category_info = hierarchical_themes_structure[i] # Assuming order is maintained
+        # --- STEP 7 (from plan): Addressing Uncovered SET Questions (Gap-Filling Loop) ---
+        if benchmark_set_questions: # Only run if benchmarks are loaded
+            print(f"[QG_SERVICE AGENT GAP-FILL] Checking for SET questions not covered by KG themes. Total KG-covered SET IDs: {len(successfully_covered_set_question_ids_this_run)}")
+            uncovered_set_qs = [
+                bq for bq in benchmark_set_questions 
+                if bq['id'] not in successfully_covered_set_question_ids_this_run
+            ]
 
-            if isinstance(q_set_result_item, GeneratedQuestionSet):
-                generated_q_set = q_set_result_item # This is a GeneratedQuestionSet Pydantic object
-                
-                main_cat_name_from_q_set = generated_q_set.main_category_name # Should match original_main_category_info's name
-                
-                # Prepare data for ESGQuestion (Denormalized MongoDB Model)
-                main_question_text_th = await self.translate_text_to_thai(
-                    generated_q_set.main_question_text_en,
-                    category_name=main_cat_name_from_q_set,
-                    keywords=original_main_category_info.get("main_category_keywords_en", "")
-                )
-                sub_questions_text_th = await self.translate_text_to_thai(generated_q_set.rolled_up_sub_questions_text_en, 
-                    category_name=main_cat_name_from_q_set, 
-                    keywords=original_main_category_info.get("main_category_keywords_en", "")
-                )
+            if uncovered_set_qs:
+                print(f"[QG_SERVICE AGENT GAP-FILL] Found {len(uncovered_set_qs)} SET questions for direct gap-filling.")
+                for set_q_to_cover in uncovered_set_qs:
+                    print(f"[QG_SERVICE AGENT GAP-FILL] Attempting for SET ID: {set_q_to_cover['id']} - {set_q_to_cover['theme_set']}")
+                    
+                    gap_fill_theme_name = f"SET Coverage: {set_q_to_cover['theme_set']} (ID: {set_q_to_cover['id']})"
+                    
+                    # Check if this gap-fill theme already exists and is active from a previous successful run
+                    # This avoids re-processing if the content for this specific SET ID is already optimally generated
+                    existing_gap_theme_versions = all_historical_main_categories_map.get(gap_fill_theme_name, [])
+                    if existing_gap_theme_versions and existing_gap_theme_versions[0].is_active and \
+                       (existing_gap_theme_versions[0].validation_status == "Validated_SET_Targeted" or 
+                        existing_gap_theme_versions[0].validation_status == "Validated_SET_Targeted_No_SubQs"):
+                        print(f"[QG_SERVICE AGENT GAP-FILL] SET ID {set_q_to_cover['id']} already covered by active theme '{gap_fill_theme_name}'. Adding to response.")
+                        successfully_covered_set_question_ids_this_run.add(set_q_to_cover['id'])
+                        themes_to_be_active_this_run.add(gap_fill_theme_name) # Ensure it's considered active
+                        # Add existing questions to API response if not already added by KG theme processing
+                        # (this ensures UI gets all relevant questions if a KG theme coincidentally had same name)
+                        if not any(q.theme == gap_fill_theme_name for q in api_response_questions):
+                            self._add_existing_theme_to_api_response(existing_gap_theme_versions[0], api_response_questions)
+                        continue
 
-                # Create the SubQuestionDetail for the rolled-up sub-questions
-                rolled_up_sub_q_detail = SubQuestionDetail(
-                    sub_question_text_en=generated_q_set.rolled_up_sub_questions_text_en,
-                    sub_question_text_th=sub_questions_text_th,
-                    sub_theme_name=f"Overall Sub-Questions for {main_cat_name_from_q_set}", # Generic name
-                    category_dimension=generated_q_set.main_category_dimension, # Dimension of the main category
-                    # Keywords/Desc for sub_questions_sets can be derived from main_category_info or be generic
-                    keywords=original_main_category_info.get("main_category_keywords_en"), 
-                    theme_description_en=f"Detailed inquiries related to {main_cat_name_from_q_set}.",
-                    constituent_entity_ids=original_main_category_info.get("_constituent_entity_ids_in_mc", []),
-                    source_document_references=original_main_category_info.get("_source_document_ids_for_mc", []),
-                    detailed_source_info=generated_q_set.detailed_source_info_for_subquestions
-                )
-                if rolled_up_sub_q_detail.theme_description_en:
-                    rolled_up_sub_q_detail.theme_description_th = await self.translate_text_to_thai(rolled_up_sub_q_detail.theme_description_en, category_name=main_cat_name_from_q_set, keywords=original_main_category_info.get("main_category_keywords_en", ""))
+                    # Use iterative search and generation for this SET gap
+                    max_search_iter_for_gap = int(os.getenv("QG_MAX_SEARCH_ITERATIONS_GAP_FILL", "1")) # 0 means one attempt, 1 means initial + 1 retry
+                    generated_sub_q_for_gap, source_info_for_gap, final_kg_ctx_gap, final_chunk_ctx_gap = \
+                        await self._iterative_search_and_generate_for_set_gap(set_q_to_cover, max_search_iterations=max_search_iter_for_gap)
 
-                db_main_category_doc_data = {
-                    "theme": main_cat_name_from_q_set,
-                    "category": generated_q_set.main_category_dimension,
-                    "main_question_text_en": generated_q_set.main_question_text_en,
-                    "main_question_text_th": main_question_text_th,
-                    "keywords": original_main_category_info.get("main_category_keywords_en", ""),
-                    "theme_description_en": original_main_category_info.get("main_category_description_en", ""),
-                    "theme_description_th": await self.translate_text_to_thai(original_main_category_info.get("main_category_description_en", "")),
-                    "sub_questions_sets": [rolled_up_sub_q_detail.model_dump(exclude_none=True)] if rolled_up_sub_q_detail.sub_question_text_en.strip() and "No specific sub-questions" not in rolled_up_sub_q_detail.sub_question_text_en else [], # Only add if not empty
-                    "main_category_constituent_entity_ids": original_main_category_info.get("_constituent_entity_ids_in_mc", []),
-                    "main_category_source_document_references": original_main_category_info.get("_source_document_ids_for_mc", []),
-                    "generation_method": original_main_category_info.get("generation_method", "kg_hierarchical_rollup"),
-                    "metadata_extras": {"_main_category_raw_id": original_main_category_info.get("_main_category_raw_id")},
-                    "updated_at": current_time_utc, "is_active": True,
-                }
-                
-                theme_desc_en_for_translation = original_main_category_info.get("main_category_description_en", "")
-                theme_desc_th_for_translation = None
-                if theme_desc_en_for_translation:
-                    theme_desc_th_for_translation = await self.translate_text_to_thai(
-                        theme_desc_en_for_translation,
-                        category_name=main_cat_name_from_q_set,
-                        keywords=original_main_category_info.get("main_category_keywords_en") # Get keywords from original_main_category_info
-                    )
-                
-                db_main_category_doc_data["theme_description_th"] = theme_desc_th_for_translation
+                    if generated_sub_q_for_gap: # Meaningful sub-questions were generated
+                        print(f"[QG_SERVICE AGENT GAP-FILL] Successfully generated questions for SET ID: {set_q_to_cover['id']}")
+                        
+                        gap_main_q_en = set_q_to_cover.get('question_text_en', f"What is the company's approach regarding {set_q_to_cover['theme_set']}?")
+                        gap_theme_keywords = f"{set_q_to_cover['theme_set']}, {set_q_to_cover.get('question_text_en','')}"
+                        gap_theme_desc = f"Questions specifically generated to cover SET benchmark ID: {set_q_to_cover['id']} - {set_q_to_cover['question_text_th']}"
+                        
+                        gap_fill_q_set = GeneratedQuestionSet(
+                            main_question_text_en=gap_main_q_en,
+                            rolled_up_sub_questions_text_en=generated_sub_q_for_gap,
+                            main_category_name=gap_fill_theme_name,
+                            main_category_dimension=set_q_to_cover['dimension'],
+                            main_category_keywords=gap_theme_keywords,
+                            main_category_description=gap_theme_desc,
+                            # constituent_entities and source_docs might be inferred from context if needed, or left empty
+                            detailed_source_info_for_subquestions=source_info_for_gap
+                        )
+                        
+                        original_info_for_gap_fill = { # Mocking structure for _prepare_and_upsert_theme_to_db
+                            "main_category_name_en": gap_fill_theme_name, # Important: use the unique gap-fill theme name
+                            "main_category_description_en": gap_theme_desc,
+                            "dimension": set_q_to_cover['dimension'],
+                            "main_category_keywords_en": gap_theme_keywords,
+                            "generation_method": "set_gap_filling_agentic_loop",
+                             "_main_category_raw_id": f"set_gap_{set_q_to_cover['id']}",
+                            # Add KG/Chunk context used, if desired for metadata
+                            "_final_kg_context_used": final_kg_ctx_gap,
+                            "_final_chunk_context_used": final_chunk_ctx_gap
+                        }
+                        
+                        await self._prepare_and_upsert_theme_to_db(
+                            q_set=gap_fill_q_set,
+                            original_theme_info_from_source=original_info_for_gap_fill, # This is mocked for gap-fill
+                            validation_status="Validated_SET_Targeted",
+                            validation_feedback_list=[{"benchmark_id_evaluated": set_q_to_cover['id'], "coverage_assessment": "Full_Via_Gap_Fill"}],
+                            set_benchmark_ids_covered_list=[set_q_to_cover['id']],
+                            all_historical_main_categories_map=all_historical_main_categories_map,
+                            current_time_utc=current_time_utc,
+                            api_response_questions_list=api_response_questions
+                        )
+                        successfully_covered_set_question_ids_this_run.add(set_q_to_cover['id'])
+                        themes_to_be_active_this_run.add(gap_fill_theme_name)
+                    else:
+                        print(f"[QG_SERVICE AGENT GAP-FILL] Could not generate or context insufficient for SET ID: {set_q_to_cover['id']}. Details: {source_info_for_gap}")
+                        # Optionally, store a placeholder "theme" indicating this SET question was attempted but not covered
+                        # For now, we just log and it remains "uncovered" for this run.
+            else: # No benchmarks loaded or all covered
+                print("[QG_SERVICE AGENT GAP-FILL] No uncovered SET questions to process or benchmarks not loaded.")
+        # --- END GAP-FILLING LOOP ---
 
-                await self._upsert_main_question_document_to_db(
-                    db_main_category_doc_data, 
-                    all_historical_main_categories_map, 
-                    current_time_utc
-                )
-                
-                # Populate API response (flat list of GeneratedQuestion)
-                api_response_questions.append(GeneratedQuestion(
-                    question_text_en=generated_q_set.main_question_text_en,
-                    question_text_th=main_question_text_th,
-                    category=generated_q_set.main_category_dimension,
-                    theme=main_cat_name_from_q_set,
-                    is_main_question=True,
-                    additional_info=None # Main question usually doesn't have detailed source here
-                ))
-                if rolled_up_sub_q_detail.sub_question_text_en.strip() and "No specific sub-questions" not in rolled_up_sub_q_detail.sub_question_text_en:
-                    api_response_questions.append(GeneratedQuestion(
-                        question_text_en=rolled_up_sub_q_detail.sub_question_text_en,
-                        question_text_th=rolled_up_sub_q_detail.sub_question_text_th,
-                        category=rolled_up_sub_q_detail.category_dimension,
-                        theme=main_cat_name_from_q_set, # Belongs to the same Main Category
-                        sub_theme_name=rolled_up_sub_q_detail.sub_theme_name, # "Overall Sub-Questions..."
-                        is_main_question=False,
-                        additional_info={"detailed_source_info_for_subquestions": rolled_up_sub_q_detail.detailed_source_info}
-                    ))
-
-            elif isinstance(q_set_result_item, Exception):
-                mc_name_err = original_main_category_info.get("main_category_name_en", f"Unknown MainCat (index {i})")
-                print(f"[QG_SERVICE ERROR] Question set generation for MainCat '{mc_name_err}' failed: {q_set_result_item}")
-            elif q_set_result_item is None:
-                mc_name_err = original_main_category_info.get("main_category_name_en", f"Unknown MainCat (index {i})")
-                print(f"[QG_SERVICE WARNING] Question set generation for MainCat '{mc_name_err}' returned None.")
-        
-        # --- Deactivation Logic for Main Categories (เหมือนเดิม) ---
+        # --- Final Deactivation Logic ---
         if process_scope in [PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT, PROCESS_SCOPE_KG_UPDATED_FULL_SCAN_FROM_CONTENT, PROCESS_SCOPE_KG_FULL_SCAN_DB_EMPTY_FROM_CONTENT, PROCESS_SCOPE_KG_SCHEDULED_REFRESH_FROM_CONTENT]:
-            # ... (Deactivation logic using all_current_run_main_category_names_generated) ...
-            current_active_main_cat_docs_in_db: List[ESGQuestion] = await ESGQuestion.find(ESGQuestion.is_active == True).to_list()
-            active_main_cat_names_in_db_for_deact: Set[str] = {q.theme for q in current_active_main_cat_docs_in_db} # Assuming theme is main_category_name
-            for active_mc_name_in_db in active_main_cat_names_in_db_for_deact:
-                if active_mc_name_in_db not in all_current_run_main_category_names_generated:
-                    print(f"[QG_SERVICE INFO] Main Category '{active_mc_name_in_db}' no longer identified. Deactivating.")
-                    await ESGQuestion.find(ESGQuestion.theme == active_mc_name_in_db, ESGQuestion.is_active == True).update(
-                        {"$set": {"is_active": False, "updated_at": current_time_utc}}
-                    )
-
-        print(f"[QG_SERVICE LOG] Hierarchical evolution (denormalized roll-up) complete. API response contains {len(api_response_questions)} question entries.")
+            for theme_name_to_check_deact in active_theme_names_at_start_of_run:
+                if theme_name_to_check_deact not in themes_to_be_active_this_run:
+                    print(f"[QG_SERVICE DEACTIVATION] Theme '{theme_name_to_check_deact}' was active but not processed/validated in this run. Deactivating.")
+                    await ESGQuestion.find(
+                        ESGQuestion.theme == theme_name_to_check_deact, 
+                        ESGQuestion.is_active == True
+                    ).update({"$set": {"is_active": False, "updated_at": current_time_utc}})
+        
+        print(f"[QG_SERVICE LOG] Evolution with Agentic Behavior complete. API response questions: {len(api_response_questions)}. Total unique SET Qs covered this run: {len(successfully_covered_set_question_ids_this_run)}")
         return api_response_questions
 
+    async def _prepare_and_upsert_theme_to_db(
+        self,
+        q_set: GeneratedQuestionSet,
+        original_theme_info_from_source: Dict[str, Any], # Either from KG theme structure or mocked for gap-fill
+        validation_status: str,
+        validation_feedback_list: List[Dict[str, Any]],
+        set_benchmark_ids_covered_list: List[str],
+        all_historical_main_categories_map: Dict[str, List[ESGQuestion]],
+        current_time_utc: datetime,
+        api_response_questions_list: List[GeneratedQuestion] # To append for API response
+    ):
+        """Helper to translate, build DB model, and upsert, then add to API response."""
+        main_cat_name = q_set.main_category_name
+
+        main_q_text_th = await self.translate_text_to_thai(q_set.main_question_text_en, main_cat_name, q_set.main_category_keywords)
+        sub_q_text_th = await self.translate_text_to_thai(q_set.rolled_up_sub_questions_text_en, main_cat_name, q_set.main_category_keywords)
+        theme_desc_th = await self.translate_text_to_thai(q_set.main_category_description, main_cat_name, q_set.main_category_keywords)
+
+        sub_q_detail_list_for_db = []
+        if q_set.rolled_up_sub_questions_text_en and \
+           "no specific sub-questions" not in q_set.rolled_up_sub_questions_text_en.lower() and \
+           q_set.rolled_up_sub_questions_text_en.strip():
+            
+            sub_theme_desc_en = f"Detailed inquiries related to {main_cat_name}."
+            if q_set.detailed_source_info_for_subquestions and "generated to cover SET benchmark" in q_set.detailed_source_info_for_subquestions: # More specific for gap-fill
+                 sub_theme_desc_en = q_set.detailed_source_info_for_subquestions
+
+            sub_theme_desc_th = await self.translate_text_to_thai(sub_theme_desc_en, main_cat_name, q_set.main_category_keywords)
+            
+            current_sub_q_detail = SubQuestionDetail(
+                sub_question_text_en=q_set.rolled_up_sub_questions_text_en,
+                sub_question_text_th=sub_q_text_th,
+                sub_theme_name=f"Overall Sub-Questions for {main_cat_name}", # Or more specific if available
+                category_dimension=q_set.main_category_dimension,
+                keywords=q_set.main_category_keywords,
+                theme_description_en=sub_theme_desc_en,
+                theme_description_th=sub_theme_desc_th,
+                constituent_entity_ids=q_set.main_category_constituent_entities or [],
+                source_document_references=q_set.main_category_source_docs or [],
+                detailed_source_info=q_set.detailed_source_info_for_subquestions
+            )
+            sub_q_detail_list_for_db.append(current_sub_q_detail.model_dump(exclude_none=True))
+
+        db_doc_data = {
+            "theme": main_cat_name, "category": q_set.main_category_dimension,
+            "main_question_text_en": q_set.main_question_text_en, "main_question_text_th": main_q_text_th,
+            "keywords": q_set.main_category_keywords,
+            "theme_description_en": q_set.main_category_description, "theme_description_th": theme_desc_th,
+            "sub_questions_sets": sub_q_detail_list_for_db,
+            "main_category_constituent_entity_ids": q_set.main_category_constituent_entities or [],
+            "main_category_source_document_references": q_set.main_category_source_docs or [],
+            "generation_method": original_theme_info_from_source.get("generation_method", "unknown_agentic"),
+            "metadata_extras": {
+                "_main_category_raw_id": original_theme_info_from_source.get("_main_category_raw_id"), # from KG themes
+                "_set_gap_fill_id": original_theme_info_from_source.get("_set_gap_fill_id"), # from SET gap fill
+                "validation_feedback": validation_feedback_list,
+                "set_benchmark_ids_covered": set_benchmark_ids_covered_list,
+                 # Store context if it was part of original_theme_info_from_source (e.g., for gap-fill debug)
+                "_final_kg_context_used": original_theme_info_from_source.get("_final_kg_context_used"),
+                "_final_chunk_context_used": original_theme_info_from_source.get("_final_chunk_context_used"),
+            },
+            "validation_status": validation_status,
+            "updated_at": current_time_utc, "is_active": True, # Mark as active
+        }
+        await self._upsert_main_question_document_to_db(db_doc_data, all_historical_main_categories_map, current_time_utc)
+
+        # Add to API response
+        api_response_questions_list.append(GeneratedQuestion(
+            question_text_en=q_set.main_question_text_en, question_text_th=main_q_text_th,
+            category=q_set.main_category_dimension, theme=main_cat_name, is_main_question=True
+        ))
+        if sub_q_detail_list_for_db:
+            sq_api_data = sub_q_detail_list_for_db[0]
+            api_response_questions_list.append(GeneratedQuestion(
+                question_text_en=sq_api_data["sub_question_text_en"], question_text_th=sq_api_data.get("sub_question_text_th"),
+                category=sq_api_data["category_dimension"], theme=main_cat_name,
+                sub_theme_name=sq_api_data["sub_theme_name"], is_main_question=False,
+                additional_info={"detailed_source_info_for_subquestions": sq_api_data.get("detailed_source_info")}
+            ))    
 
     async def _upsert_main_question_document_to_db( 
         self, 
@@ -1211,4 +1410,750 @@ class QuestionGenerationService:
             return hierarchical_data if "main_theme_categories" in hierarchical_data else None
         except Exception as e: print(f"[QG_SERVICE ERROR] LLM clustering fallback failed: {e}"); return None
 
+    def load_set_benchmark_questions(self) -> List[Dict[str, Any]]:
+        """
+        Loads the SET benchmark questions with Thai and rephrased English versions.
+        The English questions are framed to be more open-ended.
+        """
+        benchmark_questions = [
+            # --- Environmental Dimension ---
+            {
+                "id": "SET_E_1", "dimension": "Environmental", "theme_set": "Reporting on SIA/EIA",
+                "question_text_th": "บริษัทมีการการเปิดเผยข้อมูลการประเมินผลกระทบด้านสังคมและสิ่งแวดล้อม (SIA/EIA) หรือไม่?",
+                "question_text_en": "Does the company disclose its social and environmental impact assessment (SIA/EIA)?"
+            },
+            {
+                "id": "SET_E_2", "dimension": "Environmental", "theme_set": "Reporting on SIA/EIA",
+                "question_text_th": "บริษัทมีการการเปิดเผยข้อมูลเกี่ยวกับกระบวนการติดตามผลกระทบด้านสังคมและสิ่งแวดล้อม (SIA/EIA) หรือไม่?",
+                "question_text_en": "Does the company disclose its process for monitoring social and environmental impacts (SIA/EIA)?"
+            },
+            {
+                "id": "SET_E_3", "dimension": "Environmental", "theme_set": "Environmentally Friendly Products", # Mapping to "Policy and guidelines for preventing contamination..."
+                "question_text_th": "บริษัทมีนโยบายและแนวปฏิบัติเกี่ยวกับการป้องกันการปนเปื้อนหรือรั่วไหลจากกระบวนการผลิตหรือไม่?",
+                "question_text_en": "Does the company have a policy and guidelines for preventing contamination or leakage from its production processes?"
+            },
+            {
+                "id": "SET_E_4", "dimension": "Environmental", "theme_set": "Environmentally Friendly Products", # Mapping to "The life cycle impact assessment of products"
+                "question_text_th": "บริษัทมีการการประเมินผลกระทบและวัฏจักรชีวิตของผลิตภัณฑ์ (life cycle impact assessment) หรือไม่?",
+                "question_text_en": "Has the company conducted a life cycle impact assessment of its products?"
+            },
+            {
+                "id": "SET_E_5", "dimension": "Environmental", "theme_set": "Environmentally Friendly Products", # Mapping to "Percentage of sales for environmentally friendly products..."
+                "question_text_th": "ร้อยละของยอดขายผลิตภัณฑ์ที่เป็นมิตรต่อสิ่งแวดล้อม (eco products) ต่อยอดขายผลิตภัณฑ์ทั้งหมด เท่าไหร่?",
+                "question_text_en": "Does the company report the percentage of sales from environmentally friendly products (eco products) compared to total product sales?"
+            },
+            {
+                "id": "SET_E_6", "dimension": "Environmental", "theme_set": "Biodiversity and Cessation of Deforestation",
+                "question_text_th": "บริษัทมีนโยบายและแนวปฏิบัติเกี่ยวกับการอนุรักษ์ความหลากหลายทางชีวภาพและยุติการตัดไม้ทำาลายป่า โดยครอบคลุมกระบวนการดำาเนินธุรกิจและห่วงโซ่อุปทานของบริษัทหรือไม่?",
+                "question_text_en": "Does the company have a policy and guidelines regarding the conservation of biodiversity and cessation of deforestation, covering its business operations and supply chain?"
+            },
+            {
+                "id": "SET_E_7", "dimension": "Environmental", "theme_set": "Biodiversity and Cessation of Deforestation",
+                "question_text_th": "บริษัทมีการการประเมินความเสี่ยงและผลกระทบต่อความหลากหลายทางชีวภาพจากการดำเนินธุรกิจ หรือไม่?",
+                "question_text_en": "Has the company assessed the risks and impacts on biodiversity resulting from its business operations?"
+            },
+            {
+                "id": "SET_E_8", "dimension": "Environmental", "theme_set": "Biodiversity and Cessation of Deforestation",
+                "question_text_th": "จำนวนพื้นที่การดำเนินธุรกิจของบริษัทที่มีการอนุรักษ์ความหลากหลายทางชีวภาพ เป็นจำนวนเท่าใด(ตารางเมตร)?",
+                "question_text_en": "Does the company report the area of its business operations with biodiversity conservation efforts (in square meters)?"
+            },
+            {
+                "id": "SET_E_9", "dimension": "Environmental", "theme_set": "Biodiversity and Cessation of Deforestation",
+                "question_text_th": "จำนวนพื้นที่ที่ได้รับการรักษาภายใต้การดูแลของบริษัท เป็นจำนวนเท่าใด(ตารางเมตร)?", # Assuming "รักษา" means conserved/protected
+                "question_text_en": "Does the company report the area of land conserved or protected under its care (in square meters)?"
+            },
+            {
+                "id": "SET_E_10", "dimension": "Environmental", "theme_set": "Biodiversity and Cessation of Deforestation",
+                "question_text_th": "บริษัทมีแผนงานหรือโครงการอนุรักษ์ความหลากหลายทางชีวภาพในการดำเนินธุรกิจ หรือไม่?",
+                "question_text_en": "Does the company have biodiversity conservation plans or projects in its business operations?"
+            },
+            {
+                "id": "SET_E_11", "dimension": "Environmental", "theme_set": "Biodiversity and Cessation of Deforestation",
+                "question_text_th": "บริษัทมีแผนงานหรือโครงการอนุรักษ์พื้นที่ป่าในการดำเนินธุรกิจ หรือไม่?",
+                "question_text_en": "Does the company have forest conservation plans or projects in its business operations?"
+            },
+            {
+                "id": "SET_E_12", "dimension": "Environmental", "theme_set": "Environmentally Friendly Materials",
+                "question_text_th": "ปริมาณน้ำหนักรวมของวัสดุทั้งหมด เป็นเท่าใด (กิโลกรัม)?",
+                "question_text_en": "Does the company report the total weight of all materials used (in kilograms), optionally classified by type (e.g., non-renewable, renewable)?"
+            },
+            {
+                "id": "SET_E_13", "dimension": "Environmental", "theme_set": "Environmentally Friendly Materials",
+                "question_text_th": "ร้อยละของวัสดุรีไซเคิลที่นำกลับมาใช้ในการพัฒนาผลิตภัณฑ์ เท่าไหร่?",
+                "question_text_en": "Does the company report the percentage of recycled input materials used in its product development?"
+            },
+            {
+                "id": "SET_E_14", "dimension": "Environmental", "theme_set": "Environmentally Friendly Materials",
+                "question_text_th": "ร้อยละของวัสดุจากของเหลือหมดอายุหรือเสื่อมคุณภาพ (reclaimed) และถูกนำกลับมาใช้ในการพัฒนาผลิตภัณฑ์ เท่าไหร่?",
+                "question_text_en": "Does the company report the percentage of reclaimed materials (from expired or deteriorated sources) reused in its product development?"
+            },
+            {
+                "id": "SET_E_15", "dimension": "Environmental", "theme_set": "Air Pollution",
+                "question_text_th": "ปริมาณมลพิษทางอากาศจากการดำเนินธุรกิจ - Nitrogen oxide (NOₓ), Sulfur dioxide (SOₓ), Persistent organic pollutants (POP), Volatile organic compounds (VOC), Hazardous air pollutants (HAP), Particulate matter (PM), อื่น ๆ เป็นเท่าใด?",
+                "question_text_en": "Does the company report the volume of its air pollutants from business operations (e.g., NOₓ, SOₓ, POPs, VOCs, HAPs, PM, others)?"
+            },
+            {
+                "id": "SET_E_16", "dimension": "Environmental", "theme_set": "Climate Change Risks",
+                "question_text_th": "บริษัทมีการการประเมินความเสี่ยงจากการเปลี่ยนแปลงสภาพภูมิอากาศ โดยอธิบายผลกระทบที่อาจส่งผลต่อการดำเนินธุรกิจ หรือไม่?",
+                "question_text_en": "Has the company conducted a climate change risk assessment, including an explanation of potential impacts on its business operations?"
+            },
+            {
+                "id": "SET_E_17", "dimension": "Environmental", "theme_set": "Climate Change Risks",
+                "question_text_th": "บริษัทมีเป้าหมาย แผนงาน และมาตรการบรรเทาความเสี่ยงจากการเปลี่ยนแปลงสภาพภูมิอากาศ หรือไม่?",
+                "question_text_en": "Does the company have established goals, plans, and measures to mitigate climate change risks?"
+            },
+
+            # --- Social Dimension ---
+            {
+                "id": "SET_S_1", "dimension": "Social", "theme_set": "Local Employment",
+                "question_text_th": "บริษัทมีนโยบายและแนวปฏิบัติเกี่ยวกับการจ้างแรงงานท้องถิ่น หรือไม่?",
+                "question_text_en": "Does the company have a policy and guidelines regarding local employment?"
+            },
+            {
+                "id": "SET_S_2", "dimension": "Social", "theme_set": "Local Employment",
+                "question_text_th": "ร้อยละของพนักงานที่มาจากชุมชนท้องถิ่น เท่าไหร่?",
+                "question_text_en": "Does the company report the percentage of its employees from local communities?"
+            },
+            {
+                "id": "SET_S_3", "dimension": "Social", "theme_set": "Respecting Diversity and Equality",
+                "question_text_th": "บริษัทมีนโยบายและแนวปฏิบัติเกี่ยวกับการเคารพความแตกต่างและความเสมอภาคภายในองค์กรและห่วงโซ่อุปทาน โดยไม่แบ่งแยกเพศ อายุ เชื้อชาติ ความพิการ ศาสนา หรืออื่น ๆ หรือไม่?",
+                "question_text_en": "Does the company have a policy and guidelines regarding respect for diversity and equality within the organization and its supply chain (e.g., non-discrimination based on gender, age, race, disability, religion, or other factors)?"
+            },
+            {
+                "id": "SET_S_4", "dimension": "Social", "theme_set": "Respecting Diversity and Equality",
+                "question_text_th": "สถิติจำนวนพนักงานตามเพศและสัญชาติ เป็นจำนวนเท่าใด?",
+                "question_text_en": "Does the company disclose employee statistics categorized by gender and nationality?"
+            },
+            {
+                "id": "SET_S_5", "dimension": "Social", "theme_set": "Respecting Diversity and Equality",
+                "question_text_th": "จำนวนเหตุการณ์หรือข้อร้องเรียนเกี่ยวกับการละเมิดสิทธิ ความเสมอภาค และการปฏิบัติต่อแรงงานอย่างไม่เป็นธรรม พร้อมมาตรการแก้ไขและเยียวยา เป็นจำนวนเท่าใด?",
+                "question_text_en": "Does the company report the number of incidents or complaints related to violations of rights, equality, and unfair labor treatment, along with corresponding remediation and mitigation measures?"
+            },
+            {
+                "id": "SET_S_6", "dimension": "Social", "theme_set": "Promotion of Female Workforce",
+                "question_text_th": "บริษัทมีนโยบายและแนวปฏิบัติเกี่ยวกับการส่งเสริมแรงงานสตรีในสถานประกอบการอย่างเท่าเทียมกัน หรือไม่?",
+                "question_text_en": "Does the company have a policy and guidelines related to promoting equal opportunities for the female workforce in the workplace?"
+            },
+            {
+                "id": "SET_S_7", "dimension": "Social", "theme_set": "Promotion of Female Workforce",
+                "question_text_th": "ข้อมูลพนักงานหญิงแบ่งตามตำแหน่งงานมีจำนวนเท่าใด?",
+                "question_text_en": "Does the company disclose the number of female employees categorized by employment level (e.g., senior management, management, staff level)?"
+            },
+            {
+                "id": "SET_S_8", "dimension": "Social", "theme_set": "Monitoring and Assessing Impacts on Communities",
+                "question_text_th": "บริษัทมีการการติดตามและประเมินผลกระทบต่อชุมชนจากการดำเนินธุรกิจของบริษัท หรือไม่?",
+                "question_text_en": "Does the company monitor and assess the impacts of its business operations on communities?"
+            },
+            {
+                "id": "SET_S_9", "dimension": "Social", "theme_set": "Monitoring and Assessing Impacts on Communities",
+                "question_text_th": "จำนวนกรณีพิพาทหรือเหตุการณ์ร้องเรียนเกี่ยวกับการละเมิดสิทธิชุมชน พร้อมมาตรการแก้ไขและเยียวยา เป็นจำนวนเท่าใด?",
+                "question_text_en": "Does the company report the number of disputes or complaints regarding community rights violations, along with corresponding remediation and mitigation measures?"
+            },
+
+            # --- Governance Dimension ---
+            {
+                "id": "SET_G_1", "dimension": "Governance", "theme_set": "Cybersecurity and Personal Data Protection",
+                "question_text_th": "บริษัทมีนโยบายและแนวปฏิบัติเกี่ยวกับด้านความปลอดภัยทางไซเบอร์และการป้องกันข้อมูลส่วนบุคคล หรือไม่?",
+                "question_text_en": "Does the company have a policy and guidelines on cybersecurity and personal data protection?"
+            },
+            {
+                "id": "SET_G_2", "dimension": "Governance", "theme_set": "Cybersecurity and Personal Data Protection",
+                "question_text_th": "ร้อยละของจำนวนโครงสร้างพื้นฐานด้านเทคโนโลยีที่ได้รับการรับรองมาตรฐานด้านความปลอดภัยทางไซเบอร์ เช่น ISO 27001 หรือมาตรฐานอื่น ๆ เป็นต้น เท่าไหร่?",
+                "question_text_en": "Does the company report the percentage of its technology infrastructures that have been certified with cybersecurity standards (e.g., ISO 27001 or other relevant standards)?"
+            },
+            {
+                "id": "SET_G_3", "dimension": "Governance", "theme_set": "Cybersecurity and Personal Data Protection",
+                "question_text_th": "บริษัทมีมาตรการและแนวปฏิบัติเกี่ยวกับการใช้ข้อมูลส่วนบุคคล หรือไม่?",
+                "question_text_en": "Does the company have established measures and guidelines related to personal data usage?"
+            },
+            {
+                "id": "SET_G_4", "dimension": "Governance", "theme_set": "Cybersecurity and Personal Data Protection",
+                "question_text_th": "ร้อยละของพนักงานที่ได้รับการอบรมด้านความปลอดภัยทางไซเบอร์และการใช้ข้อมูลส่วนบุคคล เท่าไหร่?",
+                "question_text_en": "Does the company report the percentage of its employees who have received training in cybersecurity and personal data usage?"
+            },
+            {
+                "id": "SET_G_5", "dimension": "Governance", "theme_set": "Cybersecurity and Personal Data Protection",
+                "question_text_th": "จำนวนเหตุการณ์หรือกรณีที่บริษัทถูกโจมตีทางไซเบอร์ พร้อมมาตรการแก้ไข เป็นจำนวนเท่าใด?",
+                "question_text_en": "Does the company report the number of incidents or cases of cyberattacks against the company, along with corresponding mitigation measures?"
+            },
+            {
+                "id": "SET_G_6", "dimension": "Governance", "theme_set": "Cybersecurity and Personal Data Protection",
+                "question_text_th": "จำนวนเหตุการณ์หรือกรณีข้อมูลส่วนบุคคลรั่วไหล พร้อมมาตรการแก้ไข เป็นจำนวนเท่าใด?",
+                "question_text_en": "Does the company report the number of incidents or cases of personal data breaches, along with corresponding mitigation measures?"
+            },
+            {
+                "id": "SET_G_7", "dimension": "Governance", "theme_set": "Product Quality and Recall",
+                "question_text_th": "บริษัทมีนโยบายและแนวปฏิบัติเกี่ยวกับการจัดการด้านคุณภาพของผลิตภัณฑ์ ตามมาตรฐานสากล เช่น ISO 9001:2015 หรือมาตรฐานอื่น ๆ เป็นต้น หรือไม่?",
+                "question_text_en": "Does the company have a policy and guidelines for product quality management according to international standards (e.g., ISO 9001:2015 or other standards)?"
+            },
+            {
+                "id": "SET_G_8", "dimension": "Governance", "theme_set": "Product Quality and Recall",
+                "question_text_th": "บริษัทมีแผนการเรียกคืนผลิตภัณฑ์ หรือไม่?",
+                "question_text_en": "Does the company have a product recall plan?"
+            },
+            {
+                "id": "SET_G_9", "dimension": "Governance", "theme_set": "Product Quality and Recall",
+                "question_text_th": "จำนวนกรณีหรือเหตุการณ์เรียกคืนผลิตภัณฑ์ พร้อมมาตรการแก้ไขและเยียวยา เป็นจำนวนเท่าใด?",
+                "question_text_en": "Does the company report the number of cases or incidents of product recall, along with corresponding remediation and mitigation measures?"
+            }
+        ]
+        return benchmark_questions
+
+    async def _llm_as_evaluator(self, benchmark_question_detail: Dict[str, Any], 
+                               generated_main_category_name: str, 
+                               generated_main_question_en: str, 
+                               generated_sub_questions_en: str, 
+                               generated_dimension: str, 
+                               knowledge_graph_context: Optional[str], 
+                               standard_document_excerpts: Optional[str]) -> Dict[str, Any]:
+        evaluator_prompt_template_str = """
+        You are an expert ESG Reporting Analyst tasked with evaluating the coverage of generated questions against a benchmark question from the Stock Exchange of Thailand (SET).
+
+        Benchmark SET Question Details:
+        - Dimension: {benchmark_dimension}
+        - Theme: {benchmark_theme_set}
+        - Question (Thai): {benchmark_question_th}
+        - Question (English): {benchmark_question_en}
+
+        Generated Question Set for Main Category "{generated_main_category_name}" (Dimension: {generated_dimension}):
+        - Generated Main Question (English): {generated_main_question_en}
+        - Generated Rolled-up Sub-Questions (English):
+        {generated_sub_questions_en}
+
+        Supporting Context for "{generated_main_category_name}" (Use this to understand if missing aspects could be covered):
+        Knowledge Graph Hints:
+        {knowledge_graph_context}
+        Relevant Document Excerpt Hints:
+        {standard_document_excerpts}
+
+        Evaluation Task:
+        1.  **Coverage Assessment**: Does the "Generated Question Set" (both Main and Sub-Questions) adequately cover the INTENT and SCOPE of the "Benchmark SET Question"?
+            Choose one: "Full", "Partial", "None".
+        2.  **Missing Aspects**: If coverage is "Partial" or "None", what specific aspects, intents, data points, or nuances from the "Benchmark SET Question" are missing or inadequately covered by the "Generated Question Set"? Be specific.
+        3.  **Redundancies**: Are there any obvious redundancies where the generated questions ask for the exact same information as the benchmark in a less effective way? (Briefly note if any).
+        4.  **Suggestions for Improvement**: Based on the "Supporting Context", suggest specific new sub-questions (in English) or modifications to the existing "Generated Sub-Questions" to fill the identified gaps and achieve "Full" coverage for the "Benchmark SET Question". If coverage is already "Full", state "No suggestions needed".
+
+        Output ONLY a single, valid JSON object with the following exact keys: "coverage_assessment", "missing_aspects", "redundancies", "suggested_improvements".
+        The value for "suggested_improvements" should be a string containing actionable suggestions or new question texts.
+        """
+        prompt = PromptTemplate.from_template(evaluator_prompt_template_str)
+        
+        # Ensure benchmark_question_en exists, fallback to Thai if necessary
+        benchmark_q_en_text = benchmark_question_detail.get('question_text_en', benchmark_question_detail['question_text_th'])
+
+        formatted_prompt = prompt.format(
+            benchmark_dimension=benchmark_question_detail['dimension'],
+            benchmark_theme_set=benchmark_question_detail['theme_set'],
+            benchmark_question_th=benchmark_question_detail['question_text_th'],
+            benchmark_question_en=benchmark_q_en_text,
+            generated_main_category_name=generated_main_category_name,
+            generated_dimension=generated_dimension,
+            generated_main_question_en=generated_main_question_en,
+            generated_sub_questions_en=generated_sub_questions_en,
+            knowledge_graph_context=knowledge_graph_context if knowledge_graph_context else "Not available.",
+            standard_document_excerpts=standard_document_excerpts if standard_document_excerpts else "Not available."
+        )
+        try:
+            # Assuming self.qg_llm is appropriate for evaluation, or you might have a dedicated evaluator LLM
+            response = await self.qg_llm.ainvoke(formatted_prompt) 
+            llm_output = response.content.strip()
+            eval_data = self._extract_json_from_llm_output(llm_output) # Use the helper
+            if eval_data and "coverage_assessment" in eval_data:
+                return eval_data
+            else:
+                print(f"[QG_SERVICE AGENT EVAL] Failed to parse evaluation for MC '{generated_main_category_name}'. LLM output: {llm_output}")
+                # Fallback structure
+                return {"coverage_assessment": "Error_Parsing", "missing_aspects": "LLM output parsing failed.", "redundancies": "", "suggested_improvements": "No suggestions due to parsing error."}
+        except Exception as e:
+            print(f"[QG_SERVICE AGENT EVAL] Error during LLM evaluation for MC '{generated_main_category_name}': {e}")
+            # Fallback structure
+            return {"coverage_assessment": "Error_Exception", "missing_aspects": str(e), "redundancies": "", "suggested_improvements": "No suggestions due to exception."}
+        
+    def _extract_json_from_llm_output(self, llm_output: str) -> Optional[Dict[str, Any]]:
+        """
+        Attempts to extract a JSON object from the LLM's output string.
+        Handles cases where JSON is embedded within triple backticks or is the main content.
+        """
+        try:
+            # Try to find JSON within ```json ... ```
+            match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", llm_output, re.DOTALL | re.MULTILINE)
+            if match:
+                json_str = match.group(1)
+                return json.loads(json_str)
+            else:
+                # Try to find JSON that starts with { and ends with }
+                first_brace = llm_output.find('{')
+                last_brace = llm_output.rfind('}')
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    json_str = llm_output[first_brace : last_brace + 1]
+                    return json.loads(json_str)
+            print(f"[QG_SERVICE JSON_EXTRACT] No JSON object found in LLM output: {llm_output[:500]}") # Log if no JSON
+            return None
+        except json.JSONDecodeError as e:
+            print(f"[QG_SERVICE JSON_EXTRACT] JSONDecodeError: {e}. LLM output: {llm_output[:500]}") # Log decode error
+            return None
+
+    async def _find_relevant_set_benchmark_questions(
+            self,
+            mc_dimension: str,
+            mc_name: str,
+            mc_keywords: Optional[str],
+            generated_main_q_text: str,
+            generated_sub_q_text: str,
+            all_set_benchmarks: List[Dict[str, Any]],
+            relevance_threshold: float = 0.70  # << NEW: Threshold สำหรับ semantic relevance
+        ) -> List[Dict[str, Any]]:
+            """
+            Finds relevant SET benchmark questions using a combination of keyword matching
+            and semantic similarity on the content of generated main and sub-questions.
+            """
+            relevant_q_dict: Dict[str, Dict[str, Any]] = {} # ใช้ dict เพื่อป้องกันการเพิ่ม SET ID ซ้ำ
+
+            # 1. ทำความสะอาดและรวมเนื้อหาคำถามที่ระบบสร้าง
+            placeholder_main_q = f"What is the company's overall strategic approach and commitment to {mc_name}?"
+            clean_generated_main_q = generated_main_q_text if generated_main_q_text != placeholder_main_q else ""
+            
+            placeholder_sub_q = "No specific sub-questions were generated for this main category."
+            clean_generated_sub_q = generated_sub_q_text if placeholder_sub_q not in generated_sub_q_text else ""
+            
+            combined_generated_q_content = f"{clean_generated_main_q} {clean_generated_sub_q}".strip()
+            combined_generated_q_content_lower = combined_generated_q_content.lower()
+
+            # 2. เตรียม Keywords จาก Theme ที่ระบบสร้าง (สำหรับการ matching แบบเดิม)
+            mc_name_lower = mc_name.lower()
+            mc_keywords_list = [k.strip().lower() for k in (mc_keywords or "").split(',') if k.strip()]
+            generated_content_keywords = set(re.findall(r'\b\w{4,}\b', combined_generated_q_content_lower))
+
+            # 3. ถ้ามีเนื้อหาคำถามที่ระบบสร้างและมี embedding model, สร้าง embedding สำหรับเนื้อหานั้น
+            generated_q_embedding = None
+            if combined_generated_q_content and self.similarity_llm_embedding:
+                try:
+                    # embed_query is for single text, embed_documents for list
+                    loop = asyncio.get_running_loop()
+                    generated_q_embedding_list = await loop.run_in_executor(None, self.similarity_llm_embedding.embed_documents, [combined_generated_q_content_lower])
+                    if generated_q_embedding_list and generated_q_embedding_list[0]:
+                        generated_q_embedding = np.array(generated_q_embedding_list[0]).reshape(1, -1)
+                except Exception as e_embed_gen:
+                    print(f"[QG_SERVICE FIND_RELEVANT_SET] Error embedding generated question content for '{mc_name}': {e_embed_gen}")
+
+
+            for set_q_benchmark in all_set_benchmarks:
+                if set_q_benchmark['dimension'] != mc_dimension:
+                    continue
+
+                set_theme_lower = set_q_benchmark['theme_set'].lower()
+                set_q_text_en_lower = set_q_benchmark.get('question_text_en', '').lower()
+                set_question_keywords = set(re.findall(r'\b\w{4,}\b', set_q_text_en_lower))
+
+                match_found = False
+
+                # --- Matching Criteria ---
+
+                # Criterion A: Original logic (Generated Theme Name/Keywords vs. SET Theme Name / SET Question Text)
+                if (mc_name_lower in set_theme_lower or
+                    any(kw in set_theme_lower for kw in mc_keywords_list) or
+                    mc_name_lower in set_q_text_en_lower or
+                    (mc_keywords_list and any(kw in set_q_text_en_lower for kw in mc_keywords_list))):
+                    match_found = True
+
+                # Criterion B: Keywords from Generated Question Content vs. SET Question Text Keywords
+                if not match_found and generated_content_keywords and set_question_keywords:
+                    common_keywords = generated_content_keywords.intersection(set_question_keywords)
+                    if len(common_keywords) >= 2: # Example threshold
+                        match_found = True
+                
+                # Criterion C: Direct substring check (SET question text within combined generated questions)
+                if not match_found and set_q_text_en_lower and combined_generated_q_content_lower:
+                    if set_q_text_en_lower in combined_generated_q_content_lower: # SET Q text is part of generated Q
+                        match_found = True
+                    # elif combined_generated_q_content_lower in set_q_text_en_lower: # Generated Q is part of SET Q (less likely for relevance)
+                    #     match_found = True
+
+
+                # Criterion D: Semantic Similarity (if generated question embedding is available)
+                if not match_found and generated_q_embedding is not None and set_q_text_en_lower and self.similarity_llm_embedding:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        set_q_embedding_list = await loop.run_in_executor(None, self.similarity_llm_embedding.embed_documents, [set_q_text_en_lower])
+                        if set_q_embedding_list and set_q_embedding_list[0]:
+                            set_q_embedding = np.array(set_q_embedding_list[0]).reshape(1, -1)
+                            similarity_score = cosine_similarity(generated_q_embedding, set_q_embedding)[0][0]
+                            
+                            # print(f"DEBUG: Semantic similarity for '{mc_name}' vs SET ID '{set_q_benchmark['id']}': {similarity_score:.4f} (Threshold: {relevance_threshold})")
+                            if similarity_score >= relevance_threshold:
+                                match_found = True
+                                # print(f"DEBUG: MATCHED by semantic similarity: '{mc_name}' with SET '{set_q_benchmark['id']}'")
+                    except Exception as e_sim_set:
+                        print(f"[QG_SERVICE FIND_RELEVANT_SET] Error during semantic similarity for SET Q '{set_q_benchmark['id']}': {e_sim_set}")
+
+                if match_found:
+                    relevant_q_dict[set_q_benchmark['id']] = set_q_benchmark
+            
+            final_relevant_q_list = list(relevant_q_dict.values())
+            if final_relevant_q_list: # Log only if any relevant questions were found
+                print(f"[QG_SERVICE FIND_RELEVANT_SET] For MC '{mc_name}' (Dim: {mc_dimension}), found {len(final_relevant_q_list)} relevant SET Qs.")
+                # for q_found in final_relevant_q_list:
+                #     print(f"  - Relevant SET ID: {q_found['id']} - {q_found['theme_set']}")
+            return final_relevant_q_list
+
+    async def _refine_sub_questions_based_on_feedback(
+        self, 
+        main_category_name: str, 
+        main_question_text: str, 
+        existing_sub_questions: str, 
+        feedback_suggestions: Optional[str], 
+        missing_aspects: Optional[str], 
+        original_main_category_info: Dict[str, Any], # This contains 'consolidated_themes'
+        knowledge_graph_context: Optional[str], 
+        standard_document_excerpts: Optional[str],
+        main_category_dimension: str # Added to provide full context for refinement prompt
+    ) -> Tuple[str, str]: # Returns (refined_sub_questions_text_en, refined_detailed_source_info)
+        
+        # Prepare super_context_from_sub_themes based on original_main_category_info
+        super_context_from_sub_themes = "No specific sub-themes were detailed for this main category."
+        consolidated_sub_themes_in_mc = original_main_category_info.get("consolidated_themes", [])
+        if consolidated_sub_themes_in_mc:
+            temp_super_context_parts = []
+            char_count_super_ctx = 0
+            # Max characters for sub-theme details in sub-question prompt (consistent with generate_question_for_theme_level)
+            MAX_CHARS_SUPER_CTX = 10000 
+            for sub_theme_data_for_ctx in consolidated_sub_themes_in_mc[:7]: # Sample up to 7
+                s_name = sub_theme_data_for_ctx.get("theme_name_en", "N/A")
+                s_desc = sub_theme_data_for_ctx.get("description_en", "N/A")
+                s_keywords = sub_theme_data_for_ctx.get("keywords_en", "N/A")
+                s_dim = sub_theme_data_for_ctx.get("dimension", "N/A")
+                entry = f"Sub-Theme: {s_name}\n  Description: {s_desc}\n  Keywords: {s_keywords}\n  Dimension: {s_dim}\n"
+                if char_count_super_ctx + len(entry) <= MAX_CHARS_SUPER_CTX:
+                    temp_super_context_parts.append(entry)
+                    char_count_super_ctx += len(entry)
+                else:
+                    break
+            super_context_from_sub_themes = "\n---\n".join(temp_super_context_parts)
+        
+        if not super_context_from_sub_themes.strip() and consolidated_sub_themes_in_mc:
+            super_context_from_sub_themes = f"This main category generally covers topics such as: {', '.join([st.get('theme_name_en', 'Unnamed Sub-Theme') for st in consolidated_sub_themes_in_mc[:3]])}."
+        
+        refinement_prompt_template_str = """
+        You are an ESG Question Refinement Specialist for an industrial packaging factory.
+        The Main ESG Category is: "{main_category_name}" (Dimension: {main_category_dimension})
+        The Main Question for this category is: "{main_question_text}"
+
+        Current Sub-Questions that need refinement:
+        {existing_sub_questions}
+
+        Feedback for Refinement:
+        - Missing Aspects to Cover: {missing_aspects}
+        - Suggestions for Improvement/New Questions: {feedback_suggestions}
+
+        Supporting Context (use this to inform your refinements):
+        Knowledge Graph Hints:
+        {knowledge_graph_context}
+        Relevant Document Excerpt Hints:
+        {standard_document_excerpts}
+        Overview of Sub-Themes in this Main Category: 
+        {super_context_from_sub_themes} 
+
+        Task:
+        Revise the "Current Sub-Questions" to:
+        1.  Address the "Missing Aspects to Cover".
+        2.  Incorporate the "Suggestions for Improvement/New Questions".
+        3.  Ensure the revised set still consists of 3-5 specific, actionable, and data-driven sub-questions relevant to the Main Category and its dimension.
+        4.  Maintain relevance to an industrial packaging factory.
+        5.  If possible, specify sources if evident from the context.
+
+        Output ONLY a single, valid JSON object with these exact keys:
+        - "refined_sub_questions_text_en": A string containing ONLY the revised 3-5 sub-questions, each numbered and on a new line. If no meaningful refinement is possible or original questions are already good after considering feedback, you can return the original sub-questions.
+        - "refined_detailed_source_info": A brief textual summary of how the contexts and feedback were used for refinement, or specific sources if attributable for the refined questions.
+        """
+        prompt = PromptTemplate.from_template(refinement_prompt_template_str)
+        formatted_prompt = prompt.format(
+            main_category_name=main_category_name,
+            main_category_dimension=main_category_dimension,
+            main_question_text=main_question_text,
+            existing_sub_questions=existing_sub_questions,
+            missing_aspects=missing_aspects or "None specified.",
+            feedback_suggestions=feedback_suggestions or "None specified.",
+            knowledge_graph_context=knowledge_graph_context or "Not available.",
+            standard_document_excerpts=standard_document_excerpts or "Not available.",
+            super_context_from_sub_themes=super_context_from_sub_themes
+        )
+
+        default_source_info = f"Sub-questions refined for {main_category_name} based on feedback. Contexts were used for grounding."
+        try:
+            response = await self.qg_llm.ainvoke(formatted_prompt)
+            llm_output = response.content.strip()
+            json_output = self._extract_json_from_llm_output(llm_output)
+            if json_output and "refined_sub_questions_text_en" in json_output:
+                refined_text = json_output.get("refined_sub_questions_text_en", existing_sub_questions)
+                refined_info = json_output.get("refined_detailed_source_info", default_source_info)
+                return refined_text, refined_info
+            else:
+                print(f"[QG_SERVICE AGENT REFINE] Failed to get valid JSON refinement for MC '{main_category_name}'. LLM output: {llm_output}")
+                return existing_sub_questions, "Refinement parsing failed, using existing sub-questions."
+        except Exception as e:
+            print(f"[QG_SERVICE AGENT REFINE] Error refining sub-questions for MC '{main_category_name}': {e}")
+            return existing_sub_questions, "Refinement exception, using existing sub-questions."
+        
+    async def _generate_questions_for_set_gap_fill(
+        self, set_question_to_cover: Dict[str, Any],
+        main_question_text_en: str, # This will be the SET question (EN) itself or a slight rephrase
+        knowledge_graph_context: Optional[str],
+        standard_document_excerpts: Optional[str],
+        target_dimension: str
+    ) -> Tuple[Optional[str], Optional[str]]: # (sub_questions_text_en, detailed_source_info)
+        """
+        Generates 3-5 specific sub-questions to help answer a given SET benchmark question,
+        based on the provided KG and chunk context.
+        The main_question_text_en is essentially the SET question we are trying to cover.
+        """
+        prompt_template_str = """
+    You are an expert ESG consultant for an industrial packaging factory.
+    You are tasked with generating detailed sub-questions to ensure full coverage of a specific Stock Exchange of Thailand (SET) benchmark question.
+
+    The SET Benchmark Question to Cover:
+    - Dimension: {set_dimension}
+    - Theme: {set_theme}
+    - English Text: "{set_question_en}" 
+    - Thai Text: "{set_question_th}"
+
+    This SET question serves as the Main Question we need to elaborate on. It is: "{main_question_text_en}"
+
+    Supporting Context (from available ESG documents relevant to an industrial packaging factory):
+    Knowledge Graph Hints:
+    {knowledge_graph_context}
+    Relevant Document Excerpt Hints:
+    {standard_document_excerpts}
+
+    Task:
+    Based ENTIRELY on the provided "Supporting Context" and the "SET Benchmark Question to Cover", formulate a set of 2-4 specific, actionable, and data-driven Sub-Questions.
+    These Sub-Questions should:
+    1.  Directly help answer or provide detailed supporting information for the "SET Benchmark Question to Cover".
+    2.  Explore the MOST CRITICAL and REPRESENTATIVE aspects from the "Supporting Context" that relate to the SET question.
+    3.  If the "Supporting Context" is minimal or does not seem to directly address the SET question, try to formulate broader sub-questions that probe for the existence of policies, processes, or data related to the SET question's intent.
+    4.  Elicit a mix of (if context allows):
+        a. Policies & Commitments (e.g., "What is the company's formal policy on...?")
+        b. Strategies & Processes (e.g., "Describe the strategy/process for managing...")
+        c. Performance & Metrics (e.g., "What are the key performance indicators (KPIs) used for X relevant to the SET question?")
+        d. Governance & Oversight (e.g., "Who is responsible for overseeing X relevant to the SET question?")
+    5.  Be relevant to an industrial packaging factory.
+    6.  If the "Supporting Context" is truly insufficient to generate meaningful sub-questions for the SET benchmark, output "No specific sub-questions can be generated due to insufficient context." in the "rolled_up_sub_questions_text_en" field.
+
+    Output ONLY a single, valid JSON object with these exact keys:
+    - "rolled_up_sub_questions_text_en": A string containing ONLY 2-4 sub-questions, each numbered and on a new line, OR the insufficiency message.
+    - "detailed_source_info_for_subquestions": A brief textual summary of how the contexts were used, or specific sources if attributable. If context was insufficient, state that.
+        """
+        prompt = PromptTemplate.from_template(prompt_template_str)
+        formatted_prompt = prompt.format(
+            set_dimension=set_question_to_cover['dimension'],
+            set_theme=set_question_to_cover['theme_set'],
+            set_question_en=set_question_to_cover.get('question_text_en', main_question_text_en),
+            set_question_th=set_question_to_cover['question_text_th'],
+            main_question_text_en=main_question_text_en,
+            knowledge_graph_context=knowledge_graph_context or "No specific KG context available for this topic.",
+            standard_document_excerpts=standard_document_excerpts or "No specific document excerpts available for this topic."
+        )
+
+        default_source_info = f"Sub-questions generated to cover SET benchmark: {set_question_to_cover['id']}. Contextual information was used if available."
+        try:
+            response = await self.qg_llm.ainvoke(formatted_prompt)
+            llm_output = response.content.strip()
+            json_output = self._extract_json_from_llm_output(llm_output)
+
+            if json_output and "rolled_up_sub_questions_text_en" in json_output:
+                sub_q_text = json_output["rolled_up_sub_questions_text_en"]
+                source_info = json_output.get("detailed_source_info_for_subquestions", default_source_info)
+                
+                if "No specific sub-questions can be generated due to insufficient context." in sub_q_text:
+                    print(f"[QG_SERVICE SET_GAP_FILL] LLM indicated insufficient context for SET ID: {set_question_to_cover['id']}")
+                    return None, source_info # Return None for sub-questions if context is insufficient
+                
+                # Further check if the output is not just a placeholder or too short
+                if sub_q_text.strip() and len(sub_q_text.strip()) > 10:
+                    return sub_q_text, source_info
+                else:
+                    print(f"[QG_SERVICE SET_GAP_FILL] LLM returned empty or minimal sub-questions for SET ID: {set_question_to_cover['id']}. Output: {sub_q_text}")
+                    return None, f"LLM output for sub-questions was insufficient for SET ID {set_question_to_cover['id']}."
+
+            else:
+                print(f"[QG_SERVICE SET_GAP_FILL] Failed to get valid JSON for SET ID: {set_question_to_cover['id']}. LLM output: {llm_output[:300]}...")
+                return None, f"JSON parsing failed for SET ID {set_question_to_cover['id']}."
+        except Exception as e:
+            print(f"[QG_SERVICE SET_GAP_FILL] Error generating sub-questions for SET ID: {set_question_to_cover['id']}: {e}")
+            traceback.print_exc()
+            return None, f"Exception during sub-question generation for SET ID {set_question_to_cover['id']}."
+
+
+    async def _llm_suggest_alternative_search_terms(
+        self,
+        set_question_to_cover: Dict[str, Any],
+        initial_kg_context: Optional[str],
+        initial_chunk_context: Optional[str]
+    ) -> Optional[List[str]]:
+        # ... (ส่วนต้นของฟังก์ชัน) ...
+        prompt_template_str = """
+        You are an ESG Research Strategist. For the following SET Benchmark Question, the initial context retrieval was insufficient to generate detailed sub-questions.
+        Your task is to suggest 2-3 alternative search keywords, key concepts, or entity types that might be present in ESG-related documents (like GRI standards, sustainability reports for an industrial packaging factory) and could help find more relevant information for this SET question.
+
+        SET Benchmark Question:
+        - Dimension: {set_dimension}
+        - Theme: {set_theme}
+        - English Text: "{set_question_en}"
+        - Thai Text: "{set_question_th}"
+
+        Initial Knowledge Graph Context Found (may be sparse or irrelevant):
+        {initial_kg_context}
+
+        Initial Document Excerpt Context Found (may be sparse or irrelevant):
+        {initial_chunk_context}
+
+        Based on the SET question and the (potentially lacking) initial context, what alternative search terms (keywords, specific ESG metrics, policy names, process types, relevant GRI disclosures, etc.) would you recommend to try and find more specific information within a company's ESG knowledge base (documents, graph data)?
+        Focus on terms that would likely appear in text if the company addresses this SET topic.
+
+        Output ONLY a single, valid JSON object with the key "alternative_search_terms", which should be a list of 2-3 suggested string terms.
+        Example: {{"alternative_search_terms": ["Waste reduction targets", "Circular economy initiatives", "GRI 306-2 Management of waste-related impacts"]}}
+        """
+        print("--- DEBUG: _llm_suggest_alternative_search_terms ---")
+        print("Prompt Template String:")
+        print(prompt_template_str)
+        
+        prompt = PromptTemplate.from_template(prompt_template_str)
+        print(f"Inferred input variables: {prompt.input_variables}")
+
+        try:
+            formatted_prompt = prompt.format(
+                set_dimension=set_question_to_cover['dimension'],
+                set_theme=set_question_to_cover['theme_set'],
+                set_question_en=set_question_to_cover.get('question_text_en', ''),
+                set_question_th=set_question_to_cover['question_text_th'],
+                initial_kg_context=initial_kg_context or "No specific KG context initially found.",
+                initial_chunk_context=initial_chunk_context or "No specific document excerpts initially found."
+            )
+        except KeyError as e:
+            print(f"ERROR during prompt.format in _llm_suggest_alternative_search_terms: {e}")
+            print(f"kwargs sent to format: {{'set_dimension': ..., 'set_theme': ..., ...}}") # แสดง kwargs ที่ส่งไป
+            raise e
+        
+        try:
+            response = await self.qg_llm.ainvoke(formatted_prompt) # Use the main qg_llm
+            llm_output = response.content.strip()
+            json_data = self._extract_json_from_llm_output(llm_output)
+            if json_data and "alternative_search_terms" in json_data and isinstance(json_data["alternative_search_terms"], list):
+                return [str(term) for term in json_data["alternative_search_terms"] if str(term).strip()]
+            else:
+                print(f"[QG_SERVICE LLM_SUGGEST_TERMS] Failed to get valid alternative terms. LLM output: {llm_output[:200]}")
+                return None
+        except Exception as e:
+            print(f"[QG_SERVICE LLM_SUGGEST_TERMS] Error: {e}")
+            return None
+        
+    async def _iterative_search_and_generate_for_set_gap(
+        self,
+        set_q_to_cover: Dict[str, Any],
+        max_search_iterations: int = 2 # Number of re-query attempts if first try fails (0 means only initial attempt)
+    ) -> Tuple[Optional[str], Optional[str], str, str]: # (sub_questions_text_en, detailed_source_info, final_kg_context_used, final_chunk_context_used)
+        """
+        Tries to find context and generate questions for a SET gap, with iterative re-querying
+        if initial attempts are insufficient, guided by LLM-suggested alternative search terms.
+        """
+        print(f"[QG_SERVICE ITERATIVE_SEARCH] Starting for SET ID: {set_q_to_cover['id']}")
+        current_iteration = 0
+        generated_sub_q = None
+        source_info = "Initial attempt did not yield results or was not attempted."
+        
+        # Initial search terms from the SET question itself
+        current_search_keywords = f"{set_q_to_cover['theme_set']} {set_q_to_cover.get('question_text_en','')}"
+        
+        # Context variables to be updated in the loop
+        kg_context_for_set_gap = "No specific KG context found yet."
+        chunk_context_for_set_gap = "No specific document excerpts found yet."
+
+        while current_iteration <= max_search_iterations:
+            print(f"[QG_SERVICE ITERATIVE_SEARCH] Iteration {current_iteration + 1} for SET ID: {set_q_to_cover['id']} using keywords: '{current_search_keywords[:100]}...'")
+
+            # 1. Fetch Context based on current_search_keywords
+            kg_context_for_set_gap = await self.neo4j_service.get_graph_context_for_theme_chunks_v2(
+                theme_name=set_q_to_cover['theme_set'], # Main theme for broader context
+                theme_keywords=current_search_keywords, # Specific keywords for this iteration
+                max_central_entities=2, max_hops_for_central_entity=1,
+                max_relations_to_collect_per_central_entity=3,
+                max_total_context_items_str_len=800000 # Keep context reasonable
+            ) or "No specific KG context found for current search terms."
+
+            chunk_context_for_set_gap = "No specific document excerpts found for current search terms."
+            try:
+                similar_chunks = await self.neo4j_service.get_relate(query=current_search_keywords, k=2)
+                if similar_chunks:
+                    chunk_texts_list = [f"Excerpt from '{sc.metadata.get('doc_id', 'Unknown Doc')}': \"{sc.page_content[:1000]}...\"" for sc in similar_chunks]
+                    chunk_context_for_set_gap = "\n---\n".join(chunk_texts_list)
+            except Exception as e_set_chunk_ctx:
+                print(f"[QG_SERVICE ITERATIVE_SEARCH] Error fetching chunk context for SET Q {set_q_to_cover['id']}: {e_set_chunk_ctx}")
+
+            # 2. Attempt to generate questions with current context
+            set_gap_main_q_text_en = set_q_to_cover.get('question_text_en', f"Regarding {set_q_to_cover['theme_set']}, what is the company's approach or disclosure?")
+            
+            generated_sub_q, source_info = await self._generate_questions_for_set_gap_fill(
+                set_question_to_cover=set_q_to_cover,
+                main_question_text_en=set_gap_main_q_text_en,
+                knowledge_graph_context=kg_context_for_set_gap,
+                standard_document_excerpts=chunk_context_for_set_gap,
+                target_dimension=set_q_to_cover['dimension']
+            )
+
+            # 3. Check if meaningful questions were generated
+            is_meaningful_sub_q_generated = False
+            if generated_sub_q and generated_sub_q.strip():
+                insufficiency_messages = [
+                    "no supporting context was found", "context is not relevant",
+                    "lacks sufficient specific details", "no specific sub-questions can be generated"
+                ]
+                if not any(msg.lower() in generated_sub_q.lower() for msg in insufficiency_messages) and len(generated_sub_q.strip()) > 10:
+                    is_meaningful_sub_q_generated = True
+            
+            if is_meaningful_sub_q_generated:
+                print(f"[QG_SERVICE ITERATIVE_SEARCH] Meaningful sub-questions generated for SET ID {set_q_to_cover['id']} in iteration {current_iteration + 1}.")
+                return generated_sub_q, source_info, kg_context_for_set_gap, chunk_context_for_set_gap # Success
+
+            # 4. If not successful and more iterations are allowed, ask LLM for new search terms
+            if current_iteration < max_search_iterations:
+                print(f"[QG_SERVICE ITERATIVE_SEARCH] Attempting to get alternative search terms for SET ID {set_q_to_cover['id']}.")
+                alternative_terms = await self._llm_suggest_alternative_search_terms(
+                    set_q_to_cover,
+                    initial_kg_context=kg_context_for_set_gap, # Pass current (insufficient) context
+                    initial_chunk_context=chunk_context_for_set_gap
+                )
+                if alternative_terms:
+                    current_search_keywords = ", ".join(alternative_terms) # Use new keywords for next iteration
+                    print(f"[QG_SERVICE ITERATIVE_SEARCH] New search terms for next iteration: {current_search_keywords}")
+                else:
+                    print(f"[QG_SERVICE ITERATIVE_SEARCH] LLM could not suggest alternative search terms. Ending search for SET ID {set_q_to_cover['id']}.")
+                    break # No new terms, stop iterating for this SET question
+            
+            current_iteration += 1
+
+        print(f"[QG_SERVICE ITERATIVE_SEARCH] Max iterations reached or no new terms. Could not generate meaningful sub-questions for SET ID {set_q_to_cover['id']}.")
+        return None, source_info, kg_context_for_set_gap, chunk_context_for_set_gap # Failure after all iterations
+    
+    def _add_existing_theme_to_api_response(self, existing_doc: ESGQuestion, api_response_list: List[GeneratedQuestion]):
+        """Adds questions from an existing active DB document to the API response list if not already present by theme."""
+        if any(q.theme == existing_doc.theme for q in api_response_list):
+            return # Already added or processed
+
+        api_response_list.append(GeneratedQuestion(
+            question_text_en=existing_doc.main_question_text_en,
+            question_text_th=existing_doc.main_question_text_th,
+            category=existing_doc.category,
+            theme=existing_doc.theme,
+            is_main_question=True
+        ))
+        if existing_doc.sub_questions_sets:
+            for sq_set_model in existing_doc.sub_questions_sets:
+                api_response_list.append(GeneratedQuestion(
+                    question_text_en=sq_set_model.sub_question_text_en,
+                    question_text_th=sq_set_model.sub_question_text_th,
+                    category=sq_set_model.category_dimension,
+                    theme=existing_doc.theme, # Belongs to the same Main Category
+                    sub_theme_name=sq_set_model.sub_theme_name,
+                    is_main_question=False,
+                    additional_info={"detailed_source_info_for_subquestions": sq_set_model.detailed_source_info}
+                ))
 
