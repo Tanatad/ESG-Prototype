@@ -156,7 +156,7 @@ class Neo4jService:
             print(f"Error creating constraint/index for StandardChunk: {e} (This might be fine if it already exists)")
             
         cohere_embedding_dimension = 1536
-        # For 'embed-v4.0' it's 1024 for input type "search_document" or "search_query"
+        # For 'embed-v4.0' it's 1536 for input type "search_document" or "search_query"
         # Check your specific Cohere model's output dimension if not 1024.
         # For 'embed-english-v3.0' it is 1024.
         # For 'embed-multilingual-light-v3.0' it is 384.
@@ -521,36 +521,39 @@ class Neo4jService:
             )
 
         if chunk_nodes_data_for_cypher:
-            create_chunks_query = f"""
-            UNWIND $chunks_data AS chunk_props
-            MATCH (d:StandardDocument {{doc_id: chunk_props.doc_id}})
-            MERGE (sc:{self.standard_chunk_node_label} {{chunk_id: chunk_props.chunk_id}})
-            ON CREATE SET 
-                sc.text = chunk_props.text,
-                sc.original_section_id = chunk_props.original_section_id,
-                sc.page_number = chunk_props.page_number,
-                sc.sequence_in_document = chunk_props.sequence_in_document,
-                sc.embedding = chunk_props.embedding,
-                sc.doc_id = chunk_props.doc_id,
-                sc.last_updated = timestamp()
-            ON MATCH SET
-                sc.text = chunk_props.text, 
-                sc.embedding = chunk_props.embedding,
-                sc.original_section_id = chunk_props.original_section_id,
-                sc.page_number = chunk_props.page_number,
-                sc.last_updated = timestamp()
-            MERGE (d)-[r:HAS_CHUNK {{order: chunk_props.sequence_in_document}}]->(sc)
-            RETURN count(sc) AS chunks_processed
-            """
-            result = await asyncio.to_thread(
-                self.graph.query, 
-                create_chunks_query, 
-                params={'chunks_data': chunk_nodes_data_for_cypher}
-            )
-            if result and result[0]:
-                 print(f"Processed {result[0].get('chunks_processed', 0)} StandardChunk nodes for document {created_doc_id}")
-            else:
-                 print(f"No chunk processing result for document {created_doc_id}")
+            total_processed_for_this_doc = 0
+            batch_size_for_cypher = 500
+            for i in range(0, len(chunk_nodes_data_for_cypher), batch_size_for_cypher):
+                batch_data = chunk_nodes_data_for_cypher[i:i + batch_size_for_cypher]
+                create_chunks_query = f"""
+                UNWIND $chunks_data AS chunk_props
+                MATCH (d:StandardDocument {{doc_id: chunk_props.doc_id}})
+                MERGE (sc:{self.standard_chunk_node_label} {{chunk_id: chunk_props.chunk_id}})
+                ON CREATE SET 
+                    sc.text = chunk_props.text,
+                    sc.original_section_id = chunk_props.original_section_id,
+                    sc.page_number = chunk_props.page_number,
+                    sc.sequence_in_document = chunk_props.sequence_in_document,
+                    sc.embedding = chunk_props.embedding,
+                    sc.doc_id = chunk_props.doc_id,
+                    sc.last_updated = timestamp()
+                ON MATCH SET
+                    sc.text = chunk_props.text, 
+                    sc.embedding = chunk_props.embedding,
+                    sc.original_section_id = chunk_props.original_section_id,
+                    sc.page_number = chunk_props.page_number,
+                    sc.last_updated = timestamp()
+                MERGE (d)-[r:HAS_CHUNK {{order: chunk_props.sequence_in_document}}]->(sc)
+                RETURN count(sc) AS chunks_processed
+                """
+                result = await asyncio.to_thread(
+                    self.graph.query, 
+                    create_chunks_query, 
+                    params={'chunks_data': batch_data}
+                )
+                if result and result[0]:
+                    total_processed_for_this_doc += result[0].get('chunks_processed', 0)
+            print(f"Processed {total_processed_for_this_doc} chunks for document {created_doc_id}.")
 
         return chunk_details_for_graph_transformer
 
@@ -720,39 +723,71 @@ class Neo4jService:
             prompt=custom_esg_graph_extraction_prompt # <--- ใช้ Prompt ที่ปรับแต่งเอง
         )
         
-        all_chunk_docs_for_llm_transformer = []
+        for i, file_content_io in enumerate(files):
+            current_file_name = file_names[i]
+            print(f"Processing file: {current_file_name}")
+            file_content_io.seek(0) # Reset stream position for each file
 
-        for original_file_name, chunks_for_this_file in docs_by_source_file.items():
-            print(f"Processing StandardDocument and StandardChunks for: {original_file_name}")
-            standard_title_from_filename = original_file_name.replace("_", " ").replace(".pdf", "") 
+            # 1. Load PDFs (Azure or Unstructured) for the current file
+            if self.document_intelligence_client:
+                print(f"Using Azure Document Intelligence for PDF processing: {current_file_name}")
+                # Pass as list of one item
+                initial_docs_for_this_file = await self.read_PDFs_and_create_documents_azure([file_content_io], [current_file_name])
+            else:
+                print(f"Azure client not available, using UnstructuredFileLoader for: {current_file_name}")
+                # Pass as list of one item
+                initial_docs_for_this_file = await loop.run_in_executor(None, self.read_PDFs_and_create_documents, [file_content_io], [current_file_name])
+            
+            print(f"Loaded {len(initial_docs_for_this_file)} initial document(s)/element(s) from {current_file_name}.")
+            if not initial_docs_for_this_file:
+                print(f"No documents were loaded from {current_file_name}. Skipping to next file.")
+                continue
 
-            # Create StandardDocument and StandardChunk nodes in Neo4j
-            # This returns Langchain Document objects with chunk_id in metadata, for the LLMTransformer
+            # 2. Split documents into chunks for the current file
+            split_chunks_for_this_file = await self.split_documents_into_chunks(initial_docs_for_this_file)
+            print(f"Split {current_file_name} into {len(split_chunks_for_this_file)} Langchain Document chunks.")
+            if not split_chunks_for_this_file:
+                print(f"No chunks were created for {current_file_name}. Skipping to next file.")
+                continue
+
+            # 3. Translate chunks for the current file
+            translated_chunks_for_this_file = await self.translate_documents_with_openai(split_chunks_for_this_file)
+            print(f"Translated {len(translated_chunks_for_this_file)} chunks for {current_file_name}.")
+
+            # 4. Create StandardDocument and StandardChunk nodes in Neo4j for the current file
+            #    This also prepares Langchain Documents for LLMGraphTransformer
+            print(f"Processing StandardDocument and StandardChunks for: {current_file_name}")
+            standard_title_from_filename = current_file_name.replace("_", " ").replace(".pdf", "")
+            
+            # _create_standard_document_and_chunks expects translated_chunks for one file
             chunk_docs_with_ids_for_transformer = await self._create_standard_document_and_chunks(
-                file_name=original_file_name,
-                translated_chunks=chunks_for_this_file, # These are already translated
-                standard_title=standard_title_from_filename 
+                file_name=current_file_name,
+                translated_chunks=translated_chunks_for_this_file,
+                standard_title=standard_title_from_filename
             )
-            all_chunk_docs_for_llm_transformer.extend(chunk_docs_with_ids_for_transformer)
-            print(f"Stored StandardDocument and StandardChunks for {original_file_name} in Neo4j.")
+            print(f"Stored StandardDocument and StandardChunks for {current_file_name} in Neo4j.")
 
-        # After all StandardDocument/StandardChunk nodes are created for all files:
-        # Apply LLMGraphTransformer to all collected chunk_documents (which now have chunk_id in metadata)
-        if all_chunk_docs_for_llm_transformer:
-            await self._apply_llm_graph_transformer_to_chunks(
-                all_chunk_docs_for_llm_transformer,
-                llm_transformer_for_kg
-            )
-            print("LLMGraphTransformer processing completed for all chunks.")
+            # 5. Apply LLMGraphTransformer to THIS FILE's chunks and add to Neo4j
+            if chunk_docs_with_ids_for_transformer:
+                print(f"Applying LLMGraphTransformer to chunks from {current_file_name}...")
+                await self._apply_llm_graph_transformer_to_chunks( # This method processes and adds to graph
+                    chunk_docs_with_ids_for_transformer,
+                    llm_transformer_for_kg
+                )
+            else:
+                print(f"No chunk documents from {current_file_name} prepared for LLMGraphTransformer.")
+            
+            print(f"Completed KG extraction for file: {current_file_name}\n--------------------")
+            # --- End of loop for one file ---
 
-            # The original add_description_embeddings_to_nodes worked on `__Entity__` nodes.
-            # If LLMGraphTransformer creates these, this step is still relevant.
-            print("Attempting to add description embeddings to __Entity__ nodes...")
-            # This is a synchronous function
-            await loop.run_in_executor(None, self.add_description_embeddings_to_nodes)
-        else:
-            print("No chunk documents prepared for LLMGraphTransformer.")
+        # After all files are processed individually:
+        print("All files have been processed for chunking and LLM graph extraction.")
         
+        # Add description embeddings ONCE for all __Entity__ nodes that might have been created/updated.
+        # This is generally okay to do once as it queries existing nodes.
+        print("Attempting to add description embeddings to all relevant __Entity__ nodes...")
+        await loop.run_in_executor(None, self.add_description_embeddings_to_nodes)
+
         print("PDF processing flow completed for all files.")
 
 
@@ -900,7 +935,7 @@ class Neo4jService:
         max_central_entities: int = 2,
         max_hops_for_central_entity: int = 1,
         max_relations_to_collect_per_central_entity: int = 5,
-        max_total_context_items_str_len: int = 3000
+        max_total_context_items_str_len: int = 1000000
     ) -> Optional[str]:
         if not theme_name and not theme_keywords:
             print("[NEO4J WARNING] Theme name or keywords required for get_graph_context_for_theme_chunks_v2.")
@@ -918,7 +953,7 @@ class Neo4jService:
                 score, 
                 {
                     id: node.id,
-                    name: node.name, // <-- ถ้ามี property name
+                    name:COALESCE(node.name, node.id), 
                     description: node.description,
                     labels: labels(node)
                 } AS metadata
