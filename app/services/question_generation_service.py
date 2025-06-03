@@ -1896,15 +1896,13 @@ class QuestionGenerationService:
         
     async def _generate_questions_for_set_gap_fill(
         self, set_question_to_cover: Dict[str, Any],
-        main_question_text_en: str, # This will be the SET question (EN) itself or a slight rephrase
+        main_question_text_en: str, 
         knowledge_graph_context: Optional[str],
         standard_document_excerpts: Optional[str],
         target_dimension: str
     ) -> Tuple[Optional[str], Optional[str]]: # (sub_questions_text_en, detailed_source_info)
         """
-        Generates 3-5 specific sub-questions to help answer a given SET benchmark question,
-        based on the provided KG and chunk context.
-        The main_question_text_en is essentially the SET question we are trying to cover.
+        Generates sub-questions for a SET benchmark. Emphasizes strict context adherence.
         """
         prompt_template_str = """
     You are an expert ESG consultant for an industrial packaging factory.
@@ -1913,7 +1911,7 @@ class QuestionGenerationService:
     The SET Benchmark Question to Cover:
     - Dimension: {set_dimension}
     - Theme: {set_theme}
-    - English Text: "{set_question_en}" 
+    - English Text: "{set_question_en}"
     - Thai Text: "{set_question_th}"
 
     This SET question serves as the Main Question we need to elaborate on. It is: "{main_question_text_en}"
@@ -1925,22 +1923,21 @@ class QuestionGenerationService:
     {standard_document_excerpts}
 
     Task:
-    Based ENTIRELY on the provided "Supporting Context" and the "SET Benchmark Question to Cover", formulate a set of 2-4 specific, actionable, and data-driven Sub-Questions.
+    Based STRICTLY AND SOLELY on the provided "Supporting Context" and the "SET Benchmark Question to Cover", formulate a set of 2-4 specific, actionable, and data-driven Sub-Questions.
     These Sub-Questions should:
-    1.  Directly help answer or provide detailed supporting information for the "SET Benchmark Question to Cover".
-    2.  Explore the MOST CRITICAL and REPRESENTATIVE aspects from the "Supporting Context" that relate to the SET question.
-    3.  If the "Supporting Context" is minimal or does not seem to directly address the SET question, try to formulate broader sub-questions that probe for the existence of policies, processes, or data related to the SET question's intent.
-    4.  Elicit a mix of (if context allows):
-        a. Policies & Commitments (e.g., "What is the company's formal policy on...?")
-        b. Strategies & Processes (e.g., "Describe the strategy/process for managing...")
-        c. Performance & Metrics (e.g., "What are the key performance indicators (KPIs) used for X relevant to the SET question?")
-        d. Governance & Oversight (e.g., "Who is responsible for overseeing X relevant to the SET question?")
-    5.  Be relevant to an industrial packaging factory.
-    6.  If the "Supporting Context" is truly insufficient to generate meaningful sub-questions for the SET benchmark, output "No specific sub-questions can be generated due to insufficient context." in the "rolled_up_sub_questions_text_en" field.
+    1.  Directly help answer or provide detailed supporting information for the "SET Benchmark Question to Cover" AND be grounded in the "Supporting Context".
+    2.  Explore the MOST CRITICAL and REPRESENTATIVE aspects from the "Supporting Context" that DIRECTLY relate to the SET question.
+    3.  CRITICAL INSTRUCTION: If the "Supporting Context" (Knowledge Graph Hints and Document Excerpts) does NOT contain specific, directly relevant information to formulate meaningful sub-questions for the SET benchmark, you MUST output the exact phrase "No specific sub-questions can be generated due to insufficient directly relevant context." in the "rolled_up_sub_questions_text_en" field. Do NOT generate generic questions or questions based on general knowledge if the provided context is lacking or irrelevant to the SET question.
+    4.  Elicit a mix of (if context allows and is relevant):
+        a. Policies & Commitments
+        b. Strategies & Processes
+        c. Performance & Metrics
+        d. Governance & Oversight
+    5.  Be relevant to an industrial packaging factory IF AND ONLY IF the context supports it.
 
     Output ONLY a single, valid JSON object with these exact keys:
-    - "rolled_up_sub_questions_text_en": A string containing ONLY 2-4 sub-questions, each numbered and on a new line, OR the insufficiency message.
-    - "detailed_source_info_for_subquestions": A brief textual summary of how the contexts were used, or specific sources if attributable. If context was insufficient, state that.
+    - "rolled_up_sub_questions_text_en": A string containing ONLY 2-4 sub-questions, each numbered and on a new line, OR the specific insufficiency message mentioned in instruction 3.
+    - "detailed_source_info_for_subquestions": A brief textual summary of how the contexts were used, or specific sources if attributable. If context was insufficient, state that clearly, referencing the lack of direct relevance in the provided context.
         """
         prompt = PromptTemplate.from_template(prompt_template_str)
         formatted_prompt = prompt.format(
@@ -1949,11 +1946,11 @@ class QuestionGenerationService:
             set_question_en=set_question_to_cover.get('question_text_en', main_question_text_en),
             set_question_th=set_question_to_cover['question_text_th'],
             main_question_text_en=main_question_text_en,
-            knowledge_graph_context=knowledge_graph_context or "No specific KG context available for this topic.",
-            standard_document_excerpts=standard_document_excerpts or "No specific document excerpts available for this topic."
+            knowledge_graph_context=knowledge_graph_context or "No specific KG context available.",
+            standard_document_excerpts=standard_document_excerpts or "No specific document excerpts available."
         )
 
-        default_source_info = f"Sub-questions generated to cover SET benchmark: {set_question_to_cover['id']}. Contextual information was used if available."
+        default_source_info = f"Attempted to generate sub-questions for SET benchmark: {set_question_to_cover['id']}. Contextual information was evaluated."
         try:
             response = await self.qg_llm.ainvoke(formatted_prompt)
             llm_output = response.content.strip()
@@ -1962,26 +1959,118 @@ class QuestionGenerationService:
             if json_output and "rolled_up_sub_questions_text_en" in json_output:
                 sub_q_text = json_output["rolled_up_sub_questions_text_en"]
                 source_info = json_output.get("detailed_source_info_for_subquestions", default_source_info)
-                
-                if "No specific sub-questions can be generated due to insufficient context." in sub_q_text:
-                    print(f"[QG_SERVICE SET_GAP_FILL] LLM indicated insufficient context for SET ID: {set_question_to_cover['id']}")
-                    return None, source_info # Return None for sub-questions if context is insufficient
-                
-                # Further check if the output is not just a placeholder or too short
-                if sub_q_text.strip() and len(sub_q_text.strip()) > 10:
-                    return sub_q_text, source_info
-                else:
-                    print(f"[QG_SERVICE SET_GAP_FILL] LLM returned empty or minimal sub-questions for SET ID: {set_question_to_cover['id']}. Output: {sub_q_text}")
-                    return None, f"LLM output for sub-questions was insufficient for SET ID {set_question_to_cover['id']}."
-
+                return sub_q_text, source_info # Return even if it's the insufficiency message
             else:
-                print(f"[QG_SERVICE SET_GAP_FILL] Failed to get valid JSON for SET ID: {set_question_to_cover['id']}. LLM output: {llm_output[:300]}...")
-                return None, f"JSON parsing failed for SET ID {set_question_to_cover['id']}."
+                print(f"[QG_SERVICE SET_GAP_FILL_GEN] Failed to get valid JSON for SET ID: {set_question_to_cover['id']}. LLM output: {llm_output[:300]}...")
+                return None, f"JSON parsing failed during generation for SET ID {set_question_to_cover['id']}."
         except Exception as e:
-            print(f"[QG_SERVICE SET_GAP_FILL] Error generating sub-questions for SET ID: {set_question_to_cover['id']}: {e}")
+            print(f"[QG_SERVICE SET_GAP_FILL_GEN] Error generating sub-questions for SET ID: {set_question_to_cover['id']}: {e}")
             traceback.print_exc()
             return None, f"Exception during sub-question generation for SET ID {set_question_to_cover['id']}."
 
+    async def _validate_generated_gap_fill_qs(
+        self,
+        set_question_to_cover: Dict[str, Any],
+        generated_sub_questions: Optional[str],
+        context_used_kg: Optional[str],
+        context_used_chunks: Optional[str]
+    ) -> Tuple[bool, str]: # (is_meaningful_and_grounded, justification)
+        """
+        Uses an LLM to validate the quality and relevance of generated gap-fill sub-questions.
+        """
+        if not generated_sub_questions or not generated_sub_questions.strip():
+            return False, "No sub-questions were provided for validation."
+
+        insufficiency_messages = [
+            "no specific sub-questions can be generated",
+            "insufficient context",
+            "not contain any information directly or indirectly related",
+            "context is entirely focused on", # Added from user log
+            "is irrelevant to the set benchmark question" # Added from user log
+        ]
+        if any(msg.lower() in generated_sub_questions.lower() for msg in insufficiency_messages):
+            return False, f"Generated text indicates insufficient context: '{generated_sub_questions}'"
+        
+        if len(generated_sub_questions.strip()) <= 10: # Arbitrary short length
+            return False, "Generated sub-questions are too short to be meaningful."
+
+        validation_prompt_str = """
+        You are an ESG Quality Assurance Analyst. Your task is to critically evaluate a set of auto-generated sub-questions.
+        These sub-questions were created to help answer a specific SET Benchmark Question, based ONLY on the "Available Supporting Context" from a company's documents.
+
+        SET Benchmark Question:
+        - ID: {set_id}
+        - Dimension: {set_dimension}
+        - Theme: {set_theme}
+        - English Text: "{set_question_en}"
+
+        Available Supporting Context (used for generating the sub-questions):
+        Knowledge Graph Hints:
+        {context_kg}
+        Relevant Document Excerpt Hints:
+        {context_chunks}
+
+        Generated Sub-Questions to Evaluate:
+        {generated_sub_questions}
+
+        Evaluation Criteria (Answer strictly based on the provided information):
+        1.  Grounded in Context: Are the "Generated Sub-Questions" CLEARLY and DIRECTLY answerable or derived from specific information present ONLY in the "Available Supporting Context"? They should NOT require external knowledge or make assumptions beyond this context.
+        2.  Relevance to SET Question: Do the "Generated Sub-Questions" directly help in answering or elaborating on the specific "SET Benchmark Question"?
+        3.  Quality & Specificity: Are the "Generated Sub-Questions" clear, specific, and actionable? Avoid overly generic questions, questions that are just rephrasing the SET question, or questions that are unanswerable from any reasonable company's perspective given typical ESG data.
+
+        Overall Assessment:
+        Based on ALL criteria above, are these "Generated Sub-Questions" of sufficiently high quality, well-grounded in the "Available Supporting Context", AND directly relevant to the "SET Benchmark Question" to be considered a "Meaningful and Valid" set?
+
+        Output ONLY a single, valid JSON object with the following exact keys:
+        - "is_meaningful_and_grounded": boolean (true if all criteria are met positively, otherwise false).
+        - "justification": A brief string (1-2 sentences) explaining your boolean choice. If false, clearly state which criteria were not met (e.g., "Not grounded in context", "Too generic", "Not relevant to SET Q").
+        
+        Example for good: {{"is_meaningful_and_grounded": true, "justification": "Questions are specific, based on the provided context, and directly address the SET benchmark."}}
+        Example for bad (not grounded): {{"is_meaningful_and_grounded": false, "justification": "Questions are too generic and not clearly supported by the limited KG/chunk context provided, which was about a different topic."}}
+        Example for bad (not relevant to SET Q): {{"is_meaningful_and_grounded": false, "justification": "Questions are based on context but do not help answer the specific SET benchmark question about SIA/EIA monitoring."}}
+        """
+        print("--- DEBUG: _validate_generated_gap_fill_qs ---")
+        print("Validation Prompt Template String:")
+        print(validation_prompt_str) # Log template string
+
+        prompt = PromptTemplate.from_template(validation_prompt_str)
+        print(f"Inferred input variables for validation prompt: {prompt.input_variables}") # Log inferred variables
+        
+        try:
+            formatted_prompt = prompt.format(
+                set_id=set_question_to_cover['id'],
+                set_dimension=set_question_to_cover['dimension'],
+                set_theme=set_question_to_cover['theme_set'],
+                set_question_en=set_question_to_cover.get('question_text_en', 'N/A'),
+                context_kg=context_used_kg or "Not available.",
+                context_chunks=context_used_chunks or "Not available.",
+                generated_sub_questions=generated_sub_questions or "No sub-questions provided for evaluation." # Ensure it's not None
+            )
+        except KeyError as e:
+            print(f"ERROR formatting validation prompt: {e}")
+            print(f"kwargs sent to format for validation: {{'set_id': ..., 'generated_sub_questions': '{generated_sub_questions}' ...}}") # Log some kwargs
+            raise  # Re-raise after logging
+
+        try:
+            # Use a different LLM or same with different settings if needed for QA
+            response = await self.qg_llm.ainvoke(formatted_prompt) 
+            llm_output = response.content.strip()
+            validation_data = self._extract_json_from_llm_output(llm_output)
+
+            if validation_data and isinstance(validation_data.get("is_meaningful_and_grounded"), bool):
+                is_valid = validation_data["is_meaningful_and_grounded"]
+                justification = validation_data.get("justification", "No justification provided.")
+                print(f"[QG_SERVICE GAP_FILL_VALIDATE] SET ID {set_question_to_cover['id']} - Valid: {is_valid}, Justification: {justification}")
+                return is_valid, justification
+            else:
+                error_msg = f"Failed to parse validation or missing 'is_meaningful_and_grounded' boolean. LLM output: {llm_output}"
+                print(f"[QG_SERVICE GAP_FILL_VALIDATE] SET ID {set_question_to_cover['id']} - Error: {error_msg}")
+                return False, error_msg
+        except Exception as e:
+            error_msg = f"Exception during gap-fill validation: {e}"
+            print(f"[QG_SERVICE GAP_FILL_VALIDATE] SET ID {set_question_to_cover['id']} - Error: {error_msg}")
+            traceback.print_exc()
+            return False, error_msg
 
     async def _llm_suggest_alternative_search_terms(
         self,
@@ -2049,49 +2138,48 @@ class QuestionGenerationService:
     async def _iterative_search_and_generate_for_set_gap(
         self,
         set_q_to_cover: Dict[str, Any],
-        max_search_iterations: int = 2 # Number of re-query attempts if first try fails (0 means only initial attempt)
-    ) -> Tuple[Optional[str], Optional[str], str, str]: # (sub_questions_text_en, detailed_source_info, final_kg_context_used, final_chunk_context_used)
-        """
-        Tries to find context and generate questions for a SET gap, with iterative re-querying
-        if initial attempts are insufficient, guided by LLM-suggested alternative search terms.
-        """
+        max_search_iterations: int = 1 # Default to 0 retries (1 attempt total for search)
+    ) -> Tuple[Optional[str], Optional[str], str, str]:
         print(f"[QG_SERVICE ITERATIVE_SEARCH] Starting for SET ID: {set_q_to_cover['id']}")
         current_iteration = 0
-        generated_sub_q = None
-        source_info = "Initial attempt did not yield results or was not attempted."
+        generated_sub_q: Optional[str] = None
+        source_info: Optional[str] = "Attempted generation, but no meaningful questions were ultimately validated."
         
-        # Initial search terms from the SET question itself
         current_search_keywords = f"{set_q_to_cover['theme_set']} {set_q_to_cover.get('question_text_en','')}"
         
-        # Context variables to be updated in the loop
-        kg_context_for_set_gap = "No specific KG context found yet."
-        chunk_context_for_set_gap = "No specific document excerpts found yet."
+        kg_context_for_set_gap = "Context not fetched or deemed irrelevant in initial attempts."
+        chunk_context_for_set_gap = "Context not fetched or deemed irrelevant in initial attempts."
 
         while current_iteration <= max_search_iterations:
-            print(f"[QG_SERVICE ITERATIVE_SEARCH] Iteration {current_iteration + 1} for SET ID: {set_q_to_cover['id']} using keywords: '{current_search_keywords[:100]}...'")
+            print(f"[QG_SERVICE ITERATIVE_SEARCH] Iteration {current_iteration + 1}/{max_search_iterations + 1} for SET ID: {set_q_to_cover['id']} using keywords: '{current_search_keywords[:100]}...'")
 
-            # 1. Fetch Context based on current_search_keywords
-            kg_context_for_set_gap = await self.neo4j_service.get_graph_context_for_theme_chunks_v2(
-                theme_name=set_q_to_cover['theme_set'], # Main theme for broader context
-                theme_keywords=current_search_keywords, # Specific keywords for this iteration
+            # 1. Fetch Context (Consider adding entity relevance filter here or in neo4j_service if feasible)
+            # For now, we rely on get_graph_context_for_theme_chunks_v2 using the SET theme/keywords.
+            # A more advanced step would be to get entities, filter them for relevance to SET Q, then build context.
+            current_kg_context = await self.neo4j_service.get_graph_context_for_theme_chunks_v2(
+                theme_name=set_q_to_cover['theme_set'],
+                theme_keywords=current_search_keywords,
                 max_central_entities=2, max_hops_for_central_entity=1,
                 max_relations_to_collect_per_central_entity=3,
-                max_total_context_items_str_len=800000 # Keep context reasonable
-            ) or "No specific KG context found for current search terms."
-
-            chunk_context_for_set_gap = "No specific document excerpts found for current search terms."
+                max_total_context_items_str_len=800000
+            )
+            current_chunk_context = "No specific document excerpts found for current search terms."
             try:
-                similar_chunks = await self.neo4j_service.get_relate(query=current_search_keywords, k=2)
+                similar_chunks = await self.neo4j_service.get_relate(query=current_search_keywords, k=1) # Reduced to k=1 for more focused context
                 if similar_chunks:
-                    chunk_texts_list = [f"Excerpt from '{sc.metadata.get('doc_id', 'Unknown Doc')}': \"{sc.page_content[:1000]}...\"" for sc in similar_chunks]
-                    chunk_context_for_set_gap = "\n---\n".join(chunk_texts_list)
+                    chunk_texts_list = [f"Excerpt from '{sc.metadata.get('doc_id', 'Unknown')}': \"{sc.page_content[:1500]}...\"" for sc in similar_chunks] # Increased preview
+                    current_chunk_context = "\n---\n".join(chunk_texts_list)
             except Exception as e_set_chunk_ctx:
                 print(f"[QG_SERVICE ITERATIVE_SEARCH] Error fetching chunk context for SET Q {set_q_to_cover['id']}: {e_set_chunk_ctx}")
+
+            # Store context used in this iteration for potential return if successful
+            kg_context_for_set_gap = current_kg_context or "No KG context found."
+            chunk_context_for_set_gap = current_chunk_context
 
             # 2. Attempt to generate questions with current context
             set_gap_main_q_text_en = set_q_to_cover.get('question_text_en', f"Regarding {set_q_to_cover['theme_set']}, what is the company's approach or disclosure?")
             
-            generated_sub_q, source_info = await self._generate_questions_for_set_gap_fill(
+            temp_generated_sub_q, temp_source_info = await self._generate_questions_for_set_gap_fill(
                 set_question_to_cover=set_q_to_cover,
                 main_question_text_en=set_gap_main_q_text_en,
                 knowledge_graph_context=kg_context_for_set_gap,
@@ -2099,39 +2187,45 @@ class QuestionGenerationService:
                 target_dimension=set_q_to_cover['dimension']
             )
 
-            # 3. Check if meaningful questions were generated
-            is_meaningful_sub_q_generated = False
-            if generated_sub_q and generated_sub_q.strip():
-                insufficiency_messages = [
-                    "no supporting context was found", "context is not relevant",
-                    "lacks sufficient specific details", "no specific sub-questions can be generated"
-                ]
-                if not any(msg.lower() in generated_sub_q.lower() for msg in insufficiency_messages) and len(generated_sub_q.strip()) > 10:
-                    is_meaningful_sub_q_generated = True
+            # 3. Validate the quality and relevance of generated questions
+            is_valid_and_grounded = False
+            validation_justification = "Generation did not produce output for validation."
+
+            if temp_generated_sub_q: # Only validate if something was generated
+                is_valid_and_grounded, validation_justification = await self._validate_generated_gap_fill_qs(
+                    set_question_to_cover=set_q_to_cover,
+                    generated_sub_questions=temp_generated_sub_q,
+                    context_used_kg=kg_context_for_set_gap,
+                    context_used_chunks=chunk_context_for_set_gap
+                )
             
-            if is_meaningful_sub_q_generated:
-                print(f"[QG_SERVICE ITERATIVE_SEARCH] Meaningful sub-questions generated for SET ID {set_q_to_cover['id']} in iteration {current_iteration + 1}.")
+            if is_valid_and_grounded and temp_generated_sub_q is not None: # Ensure temp_generated_sub_q is not None
+                generated_sub_q = temp_generated_sub_q
+                source_info = temp_source_info if temp_source_info else validation_justification
+                print(f"[QG_SERVICE ITERATIVE_SEARCH] Validated meaningful sub-questions generated for SET ID {set_q_to_cover['id']} in iteration {current_iteration + 1}.")
                 return generated_sub_q, source_info, kg_context_for_set_gap, chunk_context_for_set_gap # Success
 
             # 4. If not successful and more iterations are allowed, ask LLM for new search terms
+            source_info = validation_justification # Update source_info with the latest justification if not successful
             if current_iteration < max_search_iterations:
-                print(f"[QG_SERVICE ITERATIVE_SEARCH] Attempting to get alternative search terms for SET ID {set_q_to_cover['id']}.")
+                print(f"[QG_SERVICE ITERATIVE_SEARCH] Attempting to get alternative search terms for SET ID {set_q_to_cover['id']} due to: {validation_justification}")
                 alternative_terms = await self._llm_suggest_alternative_search_terms(
                     set_q_to_cover,
-                    initial_kg_context=kg_context_for_set_gap, # Pass current (insufficient) context
+                    initial_kg_context=kg_context_for_set_gap,
                     initial_chunk_context=chunk_context_for_set_gap
                 )
                 if alternative_terms:
-                    current_search_keywords = ", ".join(alternative_terms) # Use new keywords for next iteration
+                    current_search_keywords = ", ".join(alternative_terms)
                     print(f"[QG_SERVICE ITERATIVE_SEARCH] New search terms for next iteration: {current_search_keywords}")
                 else:
                     print(f"[QG_SERVICE ITERATIVE_SEARCH] LLM could not suggest alternative search terms. Ending search for SET ID {set_q_to_cover['id']}.")
-                    break # No new terms, stop iterating for this SET question
+                    break 
             
             current_iteration += 1
 
-        print(f"[QG_SERVICE ITERATIVE_SEARCH] Max iterations reached or no new terms. Could not generate meaningful sub-questions for SET ID {set_q_to_cover['id']}.")
-        return None, source_info, kg_context_for_set_gap, chunk_context_for_set_gap # Failure after all iterations
+        final_justification = source_info if source_info else "Max iterations reached, and no validated meaningful questions generated."
+        print(f"[QG_SERVICE ITERATIVE_SEARCH] Failed to generate validated meaningful sub-questions for SET ID {set_q_to_cover['id']} after all iterations. Last justification: {final_justification}")
+        return None, final_justification, kg_context_for_set_gap, chunk_context_for_set_gap
     
     def _add_existing_theme_to_api_response(self, existing_doc: ESGQuestion, api_response_list: List[GeneratedQuestion]):
         """Adds questions from an existing active DB document to the API response list if not already present by theme."""
