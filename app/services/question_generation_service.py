@@ -74,7 +74,9 @@ class QuestionGenerationService:
         self.similarity_llm_embedding = similarity_embedding_model # Used for are_questions_substantially_similar
         self.qg_llm = ChatGoogleGenerativeAI( # LLM for theme naming, question generation
             model=os.getenv("QUESTION_GENERATION_MODEL", "gemini-2.5-flash-preview-05-20"), # Updated model name
-            temperature=0.8, # Slightly lower for more deterministic theme naming/question gen
+            temperature=0.4, 
+            top_p=0.9,
+            top_k=40,
             max_retries=3,
         )
         self.translation_llm = ChatGoogleGenerativeAI(
@@ -324,8 +326,8 @@ class QuestionGenerationService:
     
     async def identify_hierarchical_themes_from_kg(
         self,
-        min_first_order_community_size: int = 2,
-        min_main_category_fo_community_count: int = 1, 
+        min_first_order_community_size: int = 3,
+        min_main_category_fo_community_count: int = 2, 
     ) -> List[Dict[str, Any]]:
         print("[QG_SERVICE LOG] Starting Hierarchical Theme Identification from KG...")
         entity_graph_data = await self._get_entity_graph_data()
@@ -831,7 +833,7 @@ class QuestionGenerationService:
         {chunk_context}
         --- Supporting Context from Standard Documents END ---
 
-        Task: Based on the Main Question and ALL provided context (sub-theme overview, knowledge graph, and standard documents), formulate a set of 3-5 specific, actionable, and data-driven Sub-Questions.
+        Task: Based on the Main Question and ALL provided context (sub-theme overview, knowledge graph, and standard documents), formulate a set of 1-3 concise and highly critical Sub-Questions.
         These Sub-Questions should:
         1. Directly help answer or provide detailed supporting information for the Main Question.
         2. Explore the MOST CRITICAL and REPRESENTATIVE aspects covered by the "Overview of Sub-Theme Details" and other contexts. Do NOT try to create questions for every single detail if it makes the list too long or redundant.
@@ -844,7 +846,7 @@ class QuestionGenerationService:
         5. If evident from context (especially Standard Documents or specific KG entities), specify source (Source: Document Name - Section/Page OR Source: KG - Entity Name).
 
         Output ONLY a single, valid JSON object with these exact keys:
-        - "rolled_up_sub_questions_text_en": A string containing ONLY 3-5 sub-questions, each numbered and on a new line.
+        - "rolled_up_sub_questions_text_en": A string containing ONLY 1-3 sub-questions, each numbered and on a new line.
         - "detailed_source_info_for_subquestions": A brief textual summary of how the contexts were used to formulate the sub-questions, or specific sources if attributable.
         """
         sub_q_prompt = PromptTemplate.from_template(sub_q_prompt_template_str)
@@ -1701,7 +1703,7 @@ class QuestionGenerationService:
             generated_main_q_text: str,
             generated_sub_q_text: str,
             all_set_benchmarks: List[Dict[str, Any]],
-            relevance_threshold: float = 0.70  # << NEW: Threshold สำหรับ semantic relevance
+            relevance_threshold: float = 0.65
         ) -> List[Dict[str, Any]]:
             """
             Finds relevant SET benchmark questions using a combination of keyword matching

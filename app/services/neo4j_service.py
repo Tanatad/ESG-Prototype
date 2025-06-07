@@ -82,7 +82,7 @@ class Neo4jService:
         self.graph = None
         self.environment = os.getenv("ENVIRONMENT", "development")
         self.llm = ChatGoogleGenerativeAI(
-            temperature=0.8,
+            temperature=0.2,
             model=os.getenv("NEO4J_MODEL", "gemini-2.5-flash-preview-05-20"), # Adjusted to a common Gemini model
             max_retries=10,
             rate_limiter=llm_rate_limiter # Assuming llm_rate_limiter is defined elsewhere
