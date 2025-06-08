@@ -1419,25 +1419,25 @@ class QuestionGenerationService:
         sub_q_text_th = await self.translate_text_to_thai(q_set.rolled_up_sub_questions_text_en, main_cat_name_for_translation, q_set.main_category_keywords)
         theme_desc_th = await self.translate_text_to_thai(q_set.main_category_description, main_cat_name_for_translation, q_set.main_category_keywords)
 
-        main_q_text_th = await self.translate_text_to_thai(q_set.main_question_text_en, main_cat_name, q_set.main_category_keywords)
-        sub_q_text_th = await self.translate_text_to_thai(q_set.rolled_up_sub_questions_text_en, main_cat_name, q_set.main_category_keywords)
-        theme_desc_th = await self.translate_text_to_thai(q_set.main_category_description, main_cat_name, q_set.main_category_keywords)
+        main_q_text_th = await self.translate_text_to_thai(q_set.main_question_text_en, q_set.main_category_name, q_set.main_category_keywords)
+        sub_q_text_th = await self.translate_text_to_thai(q_set.rolled_up_sub_questions_text_en, q_set.main_category_name, q_set.main_category_keywords)
+        theme_desc_th = await self.translate_text_to_thai(q_set.main_category_description, q_set.main_category_name, q_set.main_category_keywords)
 
         sub_q_detail_list_for_db = []
         if q_set.rolled_up_sub_questions_text_en and \
            "no specific sub-questions" not in q_set.rolled_up_sub_questions_text_en.lower() and \
            q_set.rolled_up_sub_questions_text_en.strip():
             
-            sub_theme_desc_en = f"Detailed inquiries related to {main_cat_name}."
+            sub_theme_desc_en = f"Detailed inquiries related to {q_set.main_category_name}."
             if q_set.detailed_source_info_for_subquestions and "generated to cover SET benchmark" in q_set.detailed_source_info_for_subquestions: # More specific for gap-fill
                  sub_theme_desc_en = q_set.detailed_source_info_for_subquestions
 
-            sub_theme_desc_th = await self.translate_text_to_thai(sub_theme_desc_en, main_cat_name, q_set.main_category_keywords)
+            sub_theme_desc_th = await self.translate_text_to_thai(sub_theme_desc_en, q_set.main_category_name, q_set.main_category_keywords)
             
             current_sub_q_detail = SubQuestionDetail(
                 sub_question_text_en=q_set.rolled_up_sub_questions_text_en,
                 sub_question_text_th=sub_q_text_th,
-                sub_theme_name=f"Overall Sub-Questions for {main_cat_name}", # Or more specific if available
+                sub_theme_name=f"Overall Sub-Questions for {q_set.main_category_name}", # Or more specific if available
                 category_dimension=q_set.main_category_dimension,
                 keywords=q_set.main_category_keywords,
                 theme_description_en=sub_theme_desc_en,
@@ -1449,7 +1449,7 @@ class QuestionGenerationService:
             sub_q_detail_list_for_db.append(current_sub_q_detail.model_dump(exclude_none=True))
 
         db_doc_data = {
-            "theme": main_cat_name, "category": q_set.main_category_dimension,
+            "theme": q_set.main_category_name, "category": q_set.main_category_dimension,
             "main_question_text_en": q_set.main_question_text_en, "main_question_text_th": main_q_text_th,
             "keywords": q_set.main_category_keywords,
             "theme_description_en": q_set.main_category_description, "theme_description_th": theme_desc_th,
@@ -1469,18 +1469,18 @@ class QuestionGenerationService:
             "validation_status": validation_status,
             "updated_at": current_time_utc, "is_active": True, # Mark as active
         }
-        await self._upsert_main_question_document_to_db(db_doc_data, all_historical_main_categories_map, current_time_utc)
+        await self._upsert_main_question_document_to_db(db_doc_data, all_historical_main_categories_map, current_time_utc, existing_theme_doc_to_update)
 
         # Add to API response
         api_response_questions_list.append(GeneratedQuestion(
             question_text_en=q_set.main_question_text_en, question_text_th=main_q_text_th,
-            category=q_set.main_category_dimension, theme=main_cat_name, is_main_question=True
+            category=q_set.main_category_dimension, theme=q_set.main_category_name, is_main_question=True
         ))
         if sub_q_detail_list_for_db:
             sq_api_data = sub_q_detail_list_for_db[0]
             api_response_questions_list.append(GeneratedQuestion(
                 question_text_en=sq_api_data["sub_question_text_en"], question_text_th=sq_api_data.get("sub_question_text_th"),
-                category=sq_api_data["category_dimension"], theme=main_cat_name,
+                category=sq_api_data["category_dimension"], theme=q_set.main_category_name,
                 sub_theme_name=sq_api_data["sub_theme_name"], is_main_question=False,
                 additional_info={"detailed_source_info_for_subquestions": sq_api_data.get("detailed_source_info")}
             ))    
@@ -1489,7 +1489,8 @@ class QuestionGenerationService:
         self, 
         main_category_db_data: Dict[str, Any], 
         all_historical_main_categories_map: Dict[str, List[ESGQuestion]], 
-        current_time_utc: datetime
+        current_time_utc: datetime,
+        existing_theme_doc_to_update: Optional[ESGQuestion] = None
     ):
         # ... (เหมือนโค้ดที่คุณให้มาล่าสุด, ตรวจสอบ content_changed โดยเทียบ main_question_text_en และ sub_questions_sets) ...
         
@@ -1537,7 +1538,7 @@ class QuestionGenerationService:
 
         upsert_data_for_document = main_category_db_data.copy()
         if latest_db_version_doc and not content_changed:
-            # print(f"[QG_SERVICE INFO DB_UPSERT] Main Category '{main_category_name}' content SIMILAR. Checking metadata/status.")
+            # print(f"[QG_SERVICE INFO DB_UPSERT] Main Category '{theme_name_for_history_lookup}' content SIMILAR. Checking metadata/status.")
             update_payload = {}; needs_db_update = not latest_db_version_doc.is_active
             if not latest_db_version_doc.is_active: update_payload["is_active"] = True
             fields_to_check = ["category", "keywords", "theme_description_en", "theme_description_th", 
@@ -1553,12 +1554,12 @@ class QuestionGenerationService:
             if needs_db_update:
                 update_payload["updated_at"] = current_time_utc
                 await ESGQuestion.find_one(ESGQuestion.id == latest_db_version_doc.id).update({"$set": update_payload})
-                # print(f"[QG_SERVICE INFO DB_UPSERT] Updated metadata/status for MC '{main_category_name}'.")
+                # print(f"[QG_SERVICE INFO DB_UPSERT] Updated metadata/status for MC '{theme_name_for_history_lookup}'.")
                 updated_doc = await ESGQuestion.get(latest_db_version_doc.id)
                 if updated_doc: # Update local cache
-                    idx = next((i for i,q in enumerate(all_historical_main_categories_map.get(main_category_name,[])) if q.id == updated_doc.id),-1)
-                    if idx != -1: all_historical_main_categories_map[main_category_name][idx] = updated_doc
-                    else: all_historical_main_categories_map.setdefault(main_category_name, []).insert(0, updated_doc); all_historical_main_categories_map[main_category_name].sort(key=lambda q:q.version, reverse=True)
+                    idx = next((i for i,q in enumerate(all_historical_main_categories_map.get(theme_name_for_history_lookup,[])) if q.id == updated_doc.id),-1)
+                    if idx != -1: all_historical_main_categories_map[theme_name_for_history_lookup][idx] = updated_doc
+                    else: all_historical_main_categories_map.setdefault(theme_name_for_history_lookup, []).insert(0, updated_doc); all_historical_main_categories_map[theme_name_for_history_lookup].sort(key=lambda q:q.version, reverse=True)
         else:
             if latest_db_version_doc:
                 # If existing_theme_doc_to_update is provided, we are updating it.
