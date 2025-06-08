@@ -8,29 +8,24 @@ import neo4j
 from typing import IO, List, Optional
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
-from langchain_google_genai import ChatGoogleGenerativeAI #, GoogleGenerativeAIEmbeddings # GoogleGenerativeAIEmbeddings not used directly
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain_core.documents import Document
-from langchain.chains import GraphCypherQAChain # Not used in the provided flow yet
+from langchain.chains import GraphCypherQAChain
 from langchain_unstructured import UnstructuredLoader
 from langchain_community.vectorstores import Neo4jVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.graphs.graph_document import GraphDocument, Node as GraphNode, Relationship as GraphRelationship # Import GraphNode and GraphRelationship
+from langchain_community.graphs.graph_document import GraphDocument, Node as GraphNode, Relationship as GraphRelationship
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_cohere import CohereEmbeddings
 from app.services.rate_limit import llm_rate_limiter
-from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate # Import specific prompt types
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from pydantic import BaseModel
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 load_dotenv()
 
-# placeholder_data is not ideal for initializing a specific schema.
-# If an empty index is needed, it's better to let from_existing_index fail
-# and then ensure the first data load populates it.
-# placeholder_data = [
-# Document(page_content="Initial document to create vector index if it doesn't exist.")
-# ]
+# ... (ส่วนของ Prompts และ Class RetrieveAnswer ไม่มีการเปลี่ยนแปลง) ...
 CUSTOM_GRAPH_EXTRACTION_SYSTEM_PROMPT = (
     "# Knowledge Graph Instructions\n"
     "## 1. Overview\n"
@@ -75,6 +70,7 @@ class RetrieveAnswer(BaseModel):
     cypher_answer: str
     relate_documents: List[Document]
 
+
 class Neo4jService:
     def __init__(self):
         self.graph_chain = None
@@ -83,47 +79,41 @@ class Neo4jService:
         self.environment = os.getenv("ENVIRONMENT", "development")
         self.llm = ChatGoogleGenerativeAI(
             temperature=0.2,
-            model=os.getenv("NEO4J_MODEL", "gemini-2.5-flash-preview-05-20"), # Adjusted to a common Gemini model
+            model=os.getenv("NEO4J_MODEL", "gemini-2.5-flash-preview-05-20"),
             max_retries=10,
-            rate_limiter=llm_rate_limiter # Assuming llm_rate_limiter is defined elsewhere
         )
-        self.llm_embbedding = CohereEmbeddings( # This is your embedding model
-            model='embed-v4.0', # Or your preferred cohere model like 'embed-english-v3.0'
+        self.llm_embbedding = CohereEmbeddings(
+            model='embed-v4.0',
             cohere_api_key=os.getenv("COHERE_API_KEY"),
             max_retries=10
         )
         self.azure_doc_intelligence_endpoint = os.getenv("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT")
         self.azure_doc_intelligence_key = os.getenv("AZURE_DOCUMENTINTELLIGENCE_KEY")
         
-        # Define these before init_vector uses them
         self.standard_chunk_vector_index_name = "standard_chunk_embedding_index"
         self.standard_chunk_node_label = "StandardChunk"
         self.standard_chunk_embedding_property = "embedding"
-        self.standard_chunk_text_property = "text" # This is the property Neo4jVector will use for Document.page_content
+        self.standard_chunk_text_property = "text"
 
         self.entity_description_index_name = "entity_description_embedding_index"
         self.entity_node_label = "__Entity__"
         self.entity_description_embedding_property = "description_embedding"
         
-        # Alert user about Cohere embedding dimension
-        print("INFO: Using Cohere embedding dimension: 1536. Verify this matches your Cohere model's output dimension (e.g., embed-english-v3.0 is 1024, embed-english-light-v4.0-preview is 384, embed-v4.0 can be 1536 for certain input types).")
+        print("INFO: Using Cohere embedding model 'embed-v4.0' with dimension 1536.")
 
+        # --- แก้ไขลำดับการทำงานให้ถูกต้อง ---
+        self.init_graph() # 1. สร้าง self.graph ก่อน
+        if self.graph:
+            self.setup_neo4j_indexes() # 2. ค่อยสร้าง Index
+            self.init_vector() # 3. ค่อยสร้าง Vector Store
+            self.init_cypher() # 4. ค่อยสร้าง Chain
+        else:
+            print("CRITICAL: Neo4j graph could not be initialized. Aborting further setup.")
 
-        self.init_graph()
-        self.setup_neo4j_indexes() # This will now also attempt to create entity_description_embedding_index
-        self.init_vector() # Initializes self.store for StandardChunk
-        self.init_cypher()
-        
         # Informational messages for Neo4j connection stability
         print("INFO: Regarding Neo4j connection stability ('defunct connection' errors):")
-        print("INFO: Langchain's Neo4jGraph class has limited direct driver configuration.")
         print("INFO: Please ensure your Neo4j server has appropriate timeout settings (e.g., bolt keep_alive, transaction timeouts).")
         print("INFO: If using Neo4j Aura, check your tier's connection/query limits.")
-        print("INFO: Ensure your 'neo4j' Python package is up-to-date (pip install --upgrade neo4j).")
-        print("INFO: If connection issues persist, they are likely server-side or network-related.")
-
-        self.azure_doc_intelligence_endpoint = os.getenv("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT")
-        self.azure_doc_intelligence_key = os.getenv("AZURE_DOCUMENTINTELLIGENCE_KEY")
 
         if not self.azure_doc_intelligence_endpoint or not self.azure_doc_intelligence_key:
             print("WARNING: Azure Document Intelligence endpoint or key is not configured. PDF processing via Azure will fail.")
@@ -141,36 +131,43 @@ class Neo4jService:
                 traceback.print_exc()
 
     def init_graph(self, url=None, username=None, password=None):
+        # --- START: แก้ไขกลับไปเป็นแบบเดิมที่ถูกต้อง ---
         if not self.graph:
-            self.graph = Neo4jGraph(
-                url=url or os.environ["NEO4J_URI"],
-                username=username or os.environ["NEO4J_USERNAME"],
-                password=password or os.environ["NEO4J_PASSWORD"],
-            )
+            try:
+                self.graph = Neo4jGraph(
+                    url=url or os.environ["NEO4J_URI"],
+                    username=username or os.environ["NEO4J_USERNAME"],
+                    password=password or os.environ["NEO4J_PASSWORD"],
+                )
+                print("Neo4jGraph initialized successfully.")
+            except Exception as e:
+                print(f"CRITICAL: Failed to create Neo4jGraph instance: {e}")
+                traceback.print_exc()
+                self.graph = None
+        # --- END: แก้ไข ---
 
     def reinit_graph(self, url=None, username=None, password=None):
-        self.graph = Neo4jGraph(
-            url=url or os.environ["NEO4J_URI"],
-            username=username or os.environ["NEO4J_USERNAME"],
-            password=password or os.environ["NEO4J_PASSWORD"]
-        )
+        # --- START: แก้ไข ---
+        self.graph = None # Reset before re-initializing
+        self.init_graph(url, username, password)
+        # --- END: แก้ไข ---
 
     def setup_neo4j_indexes(self):
+        cohere_embedding_dimension = 1536  # For embed-english-v3.0
         # Index for StandardDocument
         try:
             self.graph.query("CREATE CONSTRAINT standard_document_doc_id IF NOT EXISTS FOR (d:StandardDocument) REQUIRE d.doc_id IS UNIQUE")
             print("Constraint/Index for StandardDocument.doc_id ensured.")
         except Exception as e:
-            print(f"Error creating constraint/index for StandardDocument: {e} (This might be fine if it already exists and error handling for that is not robust in the driver/langchain version)")
+            print(f"Error creating constraint/index for StandardDocument: {e}")
 
         # Index for StandardChunk (chunk_id)
         try:
             self.graph.query("CREATE CONSTRAINT standard_chunk_chunk_id IF NOT EXISTS FOR (sc:StandardChunk) REQUIRE sc.chunk_id IS UNIQUE")
             print("Constraint/Index for StandardChunk.chunk_id ensured.")
         except Exception as e:
-            print(f"Error creating constraint/index for StandardChunk: {e} (This might be fine if it already exists)")
+            print(f"Error creating constraint/index for StandardChunk: {e}")
         
-        cohere_embedding_dimension = 1536
         # For StandardChunk index
         try:
             self.graph.query(
@@ -181,14 +178,12 @@ class Neo4jService:
                     `vector.similarity_function`: 'cosine'
                    }}}}"""
             )
-            print(f"Vector Index '{self.standard_chunk_vector_index_name}' on :{self.standard_chunk_node_label}({self.standard_chunk_embedding_property}) ensured or attempt completed.")
+            print(f"Vector Index '{self.standard_chunk_vector_index_name}' ensured.")
         except Exception as e:
             print(f"CRITICAL ERROR creating vector index '{self.standard_chunk_vector_index_name}': {e}")
-            traceback.print_exc() # Add traceback
-            print("Please ensure your Neo4j version supports vector indexes and the dimension matches your embedding model.")
+            traceback.print_exc()
 
         # For __Entity__ description embedding index
-        # self.entity_description_index_name, self.entity_node_label, self.entity_description_embedding_property are defined in __init__
         try:
             self.graph.query(
                 f"""CREATE VECTOR INDEX {self.entity_description_index_name} IF NOT EXISTS
@@ -198,89 +193,75 @@ class Neo4jService:
                     `vector.similarity_function`: 'cosine'
                    }}}}"""
             )
-            print(f"Vector Index '{self.entity_description_index_name}' on :{self.entity_node_label}({self.entity_description_embedding_property}) ensured or attempt completed.")
+            print(f"Vector Index '{self.entity_description_index_name}' ensured.")
         except Exception as e:
             print(f"CRITICAL ERROR creating vector index '{self.entity_description_index_name}': {e}")
-            traceback.print_exc() # Add traceback
-            print("Please ensure your Neo4j version supports vector indexes and the dimension matches your embedding model.")
+            traceback.print_exc()
 
     def init_cypher(self):
-        graph_chain = GraphCypherQAChain.from_llm(
+        if not self.graph:
+            print("WARNING: Graph not initialized, skipping Cypher chain setup.")
+            return
+        self.graph_chain = GraphCypherQAChain.from_llm(
             self.llm, 
             graph=self.graph,  
             allow_dangerous_requests=True,
             verbose=False,
             validate_cypher=True
         )
-        self.graph_chain = graph_chain
         
     def init_vector(self, url=None, username=None, password=None):
-        # This method now strictly tries to load an existing index.
-        # The index should have been created by setup_neo4j_indexes.
-        # Data is added to this index via the `_create_standard_document_and_chunks` method,
-        # which populates the :StandardChunk nodes with their `embedding` property.
         db_url = url or os.environ["NEO4J_URI"]
         db_username = username or os.environ["NEO4J_USERNAME"]
         db_password = password or os.environ["NEO4J_PASSWORD"]
         
         try:
             self.store = Neo4jVector.from_existing_index(
-                embedding=self.llm_embbedding, # Corrected parameter name
-                url=db_url,
-                username=db_username,
-                password=db_password,
-                index_name=self.standard_chunk_vector_index_name,
-                node_label=self.standard_chunk_node_label,
-                text_node_property=self.standard_chunk_text_property, # Property to treat as Document.page_content
-                embedding_node_property=self.standard_chunk_embedding_property, # Property where embedding vector is stored
-            )
-            print(f"Vector store '{self.standard_chunk_vector_index_name}' for '{self.standard_chunk_node_label}' initialized from existing index.")
-        except ValueError as ve: 
-            print(f"CRITICAL ValueError during Neo4jVector.from_existing_index for index '{self.standard_chunk_vector_index_name}': {ve}")
-            print(f"This means the vector index '{self.standard_chunk_vector_index_name}' on label '{self.standard_chunk_node_label}' WAS NOT FOUND or is not accessible at initialization.")
-            print("Ensure `setup_neo4j_indexes()` ran successfully AND CREATED THE INDEX in Neo4j before this initialization step.")
-            # Initialize a new instance that's configured to work with the index once it's populated
-            # This allows the application to start, and similarity search will return empty results
-            # until data is processed and the index gets populated.
-            self.store = Neo4jVector(
                 embedding=self.llm_embbedding,
                 url=db_url,
                 username=db_username,
                 password=db_password,
                 index_name=self.standard_chunk_vector_index_name,
                 node_label=self.standard_chunk_node_label,
-                text_node_properties=[self.standard_chunk_text_property], # Expects a list
-                embedding_node_property=self.standard_chunk_embedding_property
+                text_node_property=self.standard_chunk_text_property,
+                embedding_node_property=self.standard_chunk_embedding_property,
             )
-            print(f"Neo4jVector instance created for '{self.standard_chunk_node_label}'. Index '{self.standard_chunk_vector_index_name}' should exist (created by setup_neo4j_indexes).")
-
+            print(f"Vector store '{self.standard_chunk_vector_index_name}' initialized from existing index.")
+        except ValueError as ve: 
+            print(f"CRITICAL ValueError during Neo4jVector.from_existing_index for index '{self.standard_chunk_vector_index_name}': {ve}")
+            print("This means the vector index WAS NOT FOUND. Ensure `setup_neo4j_indexes()` ran successfully.")
+            # --- START: แก้ไข Parameter ที่ผิด ---
+            try:
+                self.store = Neo4jVector(
+                    embedding=self.llm_embbedding,
+                    url=db_url,
+                    username=db_username,
+                    password=db_password,
+                    index_name=self.standard_chunk_vector_index_name,
+                    node_label=self.standard_chunk_node_label,
+                    text_node_property=self.standard_chunk_text_property, # << แก้จาก text_node_properties
+                    embedding_node_property=self.standard_chunk_embedding_property
+                )
+                print(f"Neo4jVector instance created for '{self.standard_chunk_node_label}'. Index should exist.")
+            except Exception as e_fallback:
+                 print(f"CRITICAL FALLBACK ERROR: Could not create even a basic Neo4jVector instance: {e_fallback}")
+                 traceback.print_exc()
+                 self.store = None
+            # --- END: แก้ไข ---
         except Exception as e:
             print(f"An unexpected error occurred during init_vector: {e}")
             traceback.print_exc()
-            # Fallback to a basic instance if all else fails, so app can potentially start
-            # but vector search will likely not work as expected.
-            self.store = Neo4jVector(
-                embedding=self.llm_embbedding,
-                url=db_url,
-                username=db_username,
-                password=db_password,
-                index_name=self.standard_chunk_vector_index_name, # Attempt to use the configured index
-                node_label=self.standard_chunk_node_label,
-                text_node_properties=[self.standard_chunk_text_property],
-                embedding_node_property=self.standard_chunk_embedding_property
-            )
-            print(f"CRITICAL FALLBACK: Neo4jVector instance created due to unexpected error. Vector search might be impaired. Error: {e}")
+            self.store = None
 
 
     def reinit_vector(self, url=None, username=None, password=None):
-        # Same logic as init_vector for re-initialization
         self.init_vector(url, username, password)
 
-
-    def read_PDFs_and_create_documents(self, files: List[IO[bytes]], file_names: List[str], 
+    # ... The rest of your file (read_PDFs, flow, etc.) remains unchanged.
+    # Make sure to keep all other methods from your original file.
+    
+    async def read_PDFs_and_create_documents(self, files: List[IO[bytes]], file_names: List[str], 
                                      chunking_strategy: str = "basic", 
-                                     # max_characters: float = 1e6, # UnstructuredLoader might not have this for file IO
-                                     # include_orig_elements: bool = False # Same as above
                                      ):
         docs = []
         temp_dir = "temp_files_for_unstructured"
@@ -290,23 +271,16 @@ class Neo4jService:
             file_name = file_names[i]
             temp_file_path = os.path.join(temp_dir, file_name)
             
-            # Write the IO[bytes] to a temporary file
             with open(temp_file_path, "wb") as temp_file:
                 temp_file.write(file_content_io.read())
             
-            # UnstructuredLoader works with file paths
             loader = UnstructuredLoader(
                 file_path=temp_file_path,
-                # chunking_strategy=chunking_strategy, # This is for Unstructured itself, not Langchain text splitter
-                mode="elements", # 'elements' or 'single' or 'paged'
-                strategy=chunking_strategy if chunking_strategy in ["fast", "hi_res", "ocr_only"] else "fast", # Unstructured strategy
-                # max_characters=int(max_characters), # if using unstructured chunking
-                # include_orig_elements=include_orig_elements,
-                # metadata_filename=file_name # UnstructuredFileLoader sets 'filename' in metadata
+                mode="elements", 
+                strategy=chunking_strategy if chunking_strategy in ["fast", "hi_res", "ocr_only"] else "fast",
             )
             try:
                 loaded_docs_for_file = loader.load()
-                # Add original filename to metadata if not already present or to reinforce
                 for ld_doc in loaded_docs_for_file:
                     ld_doc.metadata["source_file_name"] = file_name 
                 docs.extend(loaded_docs_for_file)
@@ -314,11 +288,9 @@ class Neo4jService:
                 print(f"Error loading file {file_name} with UnstructuredFileLoader: {e_load}")
                 traceback.print_exc()
             finally:
-                # Clean up the temporary file
                 if os.path.exists(temp_file_path):
                     os.remove(temp_file_path)
         
-        # Clean up temp_dir if empty (optional)
         if not os.listdir(temp_dir):
             os.rmdir(temp_dir)
             
@@ -332,7 +304,7 @@ class Neo4jService:
             return []
 
         all_lc_documents: List[Document] = []
-        loop = asyncio.get_running_loop() # Get the current event loop
+        loop = asyncio.get_running_loop()
 
         for i, file_content_io in enumerate(files):
             file_name = file_names[i]
@@ -347,14 +319,12 @@ class Neo4jService:
                     analyze_request=file_bytes,
                     content_type="application/octet-stream"
                 )
-
-                # ถ้า poller.result() เป็น blocking call ให้รันใน executor
-                # สร้าง partial function เพื่อให้ poller.result ถูกเรียกใน thread ที่ถูกต้อง
+                
                 blocking_call = functools.partial(poller.result)
                 result = await loop.run_in_executor(None, blocking_call)
 
                 if result and hasattr(result, 'pages') and result.pages:
-                    for page_idx, page in enumerate(result.pages): # ใช้ _ ถ้า page_idx ไม่ได้ใช้
+                    for page_idx, page in enumerate(result.pages):
                         page_text_parts = []
                         if page.lines:
                             for line in page.lines:
@@ -399,31 +369,29 @@ class Neo4jService:
 
         return all_lc_documents
 
-    async def split_documents_into_chunks(self, documents: List[Document], chunk_size: int = 2048, chunk_overlap: int = 1024): # Reduced overlap
-        # Using RecursiveCharacterTextSplitter which is good for general text
+    async def split_documents_into_chunks(self, documents: List[Document], chunk_size: int = 2048, chunk_overlap: int = 1024):
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             length_function=len,
             is_separator_regex=False,
-            separators=["\n\n", "\n", ". ", " ", ""], # Common separators
+            separators=["\n\n", "\n", ". ", " ", ""],
         )
-        # split_documents is synchronous, so run in thread
         return await asyncio.to_thread(splitter.split_documents, documents)
 
-    async def translate_documents_with_openai(self, documents: List[Document], batch_size: int = 10): # Reduced batch_size for safety
+    async def translate_documents_with_openai(self, documents: List[Document], batch_size: int = 10):
         def contains_thai(text: str) -> bool:
             thai_pattern = re.compile("[\u0E00-\u0E7F]")
             return bool(thai_pattern.search(text))
 
-        llm = self.llm # Assuming self.llm is ChatGoogleGenerativeAI
+        llm = self.llm
         prompt = PromptTemplate(
             input_variables=["text"],
             template="You are a professional English translator. Translate the following Thai text accurately and fluently into English. Return ONLY the translated English text, without any additional explanations, conversational phrases, or original Thai text.\nThai Text:\n{text}\n\nEnglish Translation:"
         )
         chain = prompt | llm
 
-        async def run_chain(text_content): # Changed to text_content to avoid confusion with Document object
+        async def run_chain(text_content):
             if not text_content or not contains_thai(text_content):
                 return text_content
             try:
@@ -431,67 +399,50 @@ class Neo4jService:
                 return response.content
             except Exception as e_translate:
                 print(f"Error translating text: {e_translate}. Returning original text.")
-                return text_content # Return original on error
+                return text_content
 
         tasks = []
         for doc_idx in range(0, len(documents), batch_size):
             batch_docs = documents[doc_idx:doc_idx + batch_size]
             batch_input_texts = [doc.page_content for doc in batch_docs]
             
-            # Create tasks for the current batch
             current_batch_tasks = [run_chain(text) for text in batch_input_texts]
             tasks.extend(current_batch_tasks)
 
-        # Gather results from all tasks
         all_translated_texts = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Assign translated texts back to documents
-        # This assumes all_translated_texts aligns with the original documents list
-        # and that tasks were added in the correct order.
-        # Need to be careful here if batching modified the order or if tasks were processed out of order.
-        
-        # Safer way: Reconstruct the results based on original document list
         processed_idx = 0
         for i in range(len(documents)):
-            # This logic assumes one task per document, which is how tasks were created
             if isinstance(all_translated_texts[processed_idx], Exception):
                 print(f"Translation task for document index {i} failed: {all_translated_texts[processed_idx]}")
-                # Keep original content if translation failed
-            elif all_translated_texts[processed_idx]: # Check if not None or empty
+            elif all_translated_texts[processed_idx]:
                 documents[i].page_content = all_translated_texts[processed_idx]
             processed_idx += 1
             
         return documents
 
 
-    def __get_auth_env(self): # This remains synchronous
-        # Simplified: Always use the main env vars unless explicitly overridden
-        # Test environment should be handled by test configurations / separate .env files for tests
+    def __get_auth_env(self):
         return os.environ["NEO4J_URI"], os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]
 
-    def add_description_embeddings_to_nodes(self): # This remains synchronous
-        print(f"Attempting to populate description embeddings for nodes with label '{self.entity_node_label}' using index '{self.entity_description_index_name}'.")
+    def add_description_embeddings_to_nodes(self):
+        print(f"Attempting to populate description embeddings for nodes with label '{self.entity_node_label}'...")
         url, username, password = self.__get_auth_env()
         try:
-            # This call will now primarily populate embeddings if the index exists
-            # and nodes with the specified text_node_properties are found.
-            # It will also create the index if it somehow wasn't created in setup_neo4j_indexes,
-            # but our goal is for setup_neo4j_indexes to handle creation.
             Neo4jVector.from_existing_graph(
                 embedding=self.llm_embbedding,
                 url=url,
                 username=username,
                 password=password,
-                node_label=self.entity_node_label, # Use class attribute
-                text_node_properties=['id', 'description'], # Properties to embed from __Entity__
-                embedding_node_property=self.entity_description_embedding_property, # Use class attribute
-                index_name=self.entity_description_index_name, # Use class attribute
+                node_label=self.entity_node_label,
+                text_node_properties=['id', 'description'],
+                embedding_node_property=self.entity_description_embedding_property,
+                index_name=self.entity_description_index_name,
             )
             print(f"Population of description embeddings for '{self.entity_node_label}' nodes initiated.")
         except Exception as e_desc_emb:
-            print(f"CRITICAL ERROR during population of description embeddings for '{self.entity_node_label}' using index '{self.entity_description_index_name}': {e_desc_emb}")
+            print(f"CRITICAL ERROR during population of description embeddings: {e_desc_emb}")
             traceback.print_exc()
-            print("This may occur if the index does not exist (check setup_neo4j_indexes logs), nodes are missing, or properties are missing.")
 
 
     async def _create_standard_document_and_chunks(self, 
@@ -521,7 +472,7 @@ class Neo4jService:
         for i, chunk_doc in enumerate(translated_chunks):
             chunk_text = chunk_doc.page_content
             metadata = chunk_doc.metadata
-            original_section_id = metadata.get('category', metadata.get('header_1', metadata.get('section', None))) # Try a few common keys from Unstructured
+            original_section_id = metadata.get('category', metadata.get('header_1', metadata.get('section', None)))
             page_number = metadata.get('page_number', None)
 
             embedding_vector = await asyncio.to_thread(self.llm_embbedding.embed_query, chunk_text)
@@ -531,7 +482,7 @@ class Neo4jService:
             chunk_data_for_cypher = {
                 'chunk_id': chunk_id,
                 'text': chunk_text,
-                'original_section_id': str(original_section_id) if original_section_id else None, # Ensure string or null
+                'original_section_id': str(original_section_id) if original_section_id else None,
                 'page_number': page_number,
                 'sequence_in_document': i,
                 'embedding': embedding_vector,
@@ -539,9 +490,8 @@ class Neo4jService:
             }
             chunk_nodes_data_for_cypher.append(chunk_data_for_cypher)
             
-            # Prepare Langchain Document for LLMGraphTransformer, pass chunk_id in metadata
             transformer_doc_metadata = {'chunk_id': chunk_id, 'doc_id': created_doc_id}
-            if 'source_file_name' in metadata: # Propagate original filename if available
+            if 'source_file_name' in metadata:
                  transformer_doc_metadata['source_file_name'] = metadata['source_file_name']
             if page_number is not None:
                  transformer_doc_metadata['page_number'] = page_number
@@ -588,37 +538,21 @@ class Neo4jService:
         return chunk_details_for_graph_transformer
 
     async def _apply_llm_graph_transformer_to_chunks(self, 
-                                                chunk_documents: List[Document], # These are Langchain Docs with chunk_id in metadata
+                                                chunk_documents: List[Document],
                                                 llm_transformer: LLMGraphTransformer):
         print(f"Applying LLMGraphTransformer to {len(chunk_documents)} chunk documents...")
         if not chunk_documents:
             return
 
-        # Process documents in batches for LLMGraphTransformer if the list is very large
-        # For now, processing all at once. LLMGraphTransformer's aconvert_to_graph_documents handles a list.
         graph_documents_from_llm: List[GraphDocument] = await llm_transformer.aconvert_to_graph_documents(chunk_documents)
         
         if not graph_documents_from_llm:
             print("LLMGraphTransformer did not return any graph documents.")
-        else:
-            print(f"LLMGraphTransformer returned {len(graph_documents_from_llm)} graph documents.")
-            # Log details of the first graph document as a sample
-            sample_gd = graph_documents_from_llm[0]
-            print(f"Sample GraphDocument 0: Source Text: '{sample_gd.source.page_content[:200]}...'")
-            for node_idx, node_sample in enumerate(sample_gd.nodes):
-                print(f"  Sample Node {node_idx}: ID='{node_sample.id}', Type='{node_sample.type}', Properties={node_sample.properties}")
-            for rel_idx, rel_sample in enumerate(sample_gd.relationships):
-                print(f"  Sample Relationship {rel_idx}: Source='{rel_sample.source.id}', Target='{rel_sample.target.id}', Type='{rel_sample.type}', Properties={rel_sample.properties}")
-        
-        if not graph_documents_from_llm: # Ensure this check is after logging and before return
             return
-
-        print(f"LLMGraphTransformer returned {len(graph_documents_from_llm)} graph documents.") # This line is now redundant due to earlier logging, but harmless.
         
-        # Add entities and relationships extracted by LLMGraphTransformer
-        # This uses baseEntityLabel=True, so nodes will get __Entity__ and their specific type.
+        print(f"LLMGraphTransformer returned {len(graph_documents_from_llm)} graph documents.")
+        
         try:
-            # add_graph_documents is synchronous
             await asyncio.to_thread(
                 self.graph.add_graph_documents,
                 graph_documents_from_llm,
@@ -629,34 +563,24 @@ class Neo4jService:
         except Exception as e_add_graph:
             print(f"Error adding graph documents from LLMTransformer: {e_add_graph}")
             traceback.print_exc()
-            return # Stop if we can't add the base entities
+            return
 
-        # Manually create relationships from StandardChunk to the extracted __Entity__ nodes
         link_params = []
         for gd in graph_documents_from_llm:
-            # gd.source is the original Langchain Document we passed, which has chunk_id in metadata
             source_chunk_id = gd.source.metadata.get('chunk_id')
             if not source_chunk_id:
                 print(f"Warning: GraphDocument source missing chunk_id: {gd.source.page_content[:50]}...")
                 continue
             
-            for node_in_gd in gd.nodes: # node_in_gd is a GraphNode from Langchain
-                entity_id = node_in_gd.id # This is typically the 'name' or main identifier of the entity
-                entity_label = node_in_gd.type # The specific label like 'Person', 'Organization'
+            for node_in_gd in gd.nodes:
+                entity_id = node_in_gd.id
                 
                 link_params.append({
                     'chunk_id': source_chunk_id,
-                    'entity_id_prop_val': entity_id, # The value of the 'id' property of the __Entity__ node
-                    'entity_specific_label': entity_label # The specific label transformer assigned
+                    'entity_id_prop_val': entity_id,
                 })
         
         if link_params:
-            # Log a sample of link_params
-            sample_link_params_to_log = link_params[:2] # Log first 2 items
-            print(f"Sample link_params for CONTAINS_ENTITY query: {sample_link_params_to_log}")
-
-            # Query to link StandardChunk to __Entity__ nodes
-            # Assumes __Entity__ nodes were created by add_graph_documents with an 'id' property.
             link_entities_query = """
             UNWIND $link_data AS item
             MATCH (sc:StandardChunk {chunk_id: item.chunk_id})
@@ -668,203 +592,88 @@ class Neo4jService:
                 result = await asyncio.to_thread(self.graph.query, link_entities_query, params={'link_data': link_params})
                 if result and result[0]:
                     print(f"Linked StandardChunks to __Entity__ nodes: {result[0]}")
-                else:
-                    print("No links made between StandardChunks and __Entity__ nodes, or query returned empty.")
             except Exception as e_link:
                 print(f"Error linking LLMTransformer __Entity__ nodes to StandardChunks: {e_link}")
                 traceback.print_exc()
-        else:
-            print("No valid link parameters generated for linking StandardChunks to __Entity__ nodes.")
-
 
     async def flow(self, files: List[IO[bytes]], file_names: List[str]):
         loop = asyncio.get_running_loop()
 
-        # 1. Load PDFs and create Langchain Document objects (one per page using Azure)
         if self.document_intelligence_client:
             print("Using Azure Document Intelligence for PDF processing.")
-            # documents_from_pdf_loader จะเป็น List[Document] โดยแต่ละ Document คือ 1 หน้าจาก PDF
             documents_from_pdf_loader = await self.read_PDFs_and_create_documents_azure(files, file_names)
         else:
-            print("Azure Document Intelligence client not available, falling back to UnstructuredFileLoader (if implemented).")
-            # Fallback to original method if Azure client is not available (optional)
-            # หรือคุณอาจจะ raise error ถ้าต้องการให้ Azure เป็น prerequisite
+            print("Azure Document Intelligence client not available, falling back to UnstructuredFileLoader.")
             documents_from_pdf_loader = await loop.run_in_executor(None, self.read_PDFs_and_create_documents, files, file_names)
         
-        print(f"Loaded {len(documents_from_pdf_loader)} initial document(s)/element(s) from PDF processing.")
-
         if not documents_from_pdf_loader:
             print("No documents were loaded from PDFs. Aborting flow.")
             return
 
-        # 2. Split these (potentially large) documents into smaller manageable chunks
-        #    This is where the main chunking for our StandardChunk nodes happens.
         split_chunks_lc_docs = await self.split_documents_into_chunks(documents_from_pdf_loader)
-        print(f"Split initial documents into {len(split_chunks_lc_docs)} Langchain Document chunks.")
-        
         if not split_chunks_lc_docs:
             print("No chunks were created after splitting. Aborting flow.")
             return
 
-        # 3. Translate these smaller chunks
         translated_chunks_lc_docs = await self.translate_documents_with_openai(split_chunks_lc_docs)
-        print(f"Translated {len(translated_chunks_lc_docs)} chunks.")
-        
-        # Group translated chunks by their original source file name for processing per document
-        # The metadata 'source_file_name' should have been added in read_PDFs_and_create_documents
-        # and propagated by split_documents_into_chunks and translate_documents_with_openai
         
         docs_by_source_file = {}
         for chunk_lc_doc in translated_chunks_lc_docs:
-            source_fn = chunk_lc_doc.metadata.get('source_file_name')
-            if not source_fn:
-                print(f"Warning: Chunk missing 'source_file_name' in metadata: {chunk_lc_doc.page_content[:50]}...")
-                # Fallback or skip this chunk if filename is crucial
-                source_fn = "unknown_source_file.pdf" # Example fallback
-            
+            source_fn = chunk_lc_doc.metadata.get('source_file_name', "unknown_source_file.pdf")
             if source_fn not in docs_by_source_file:
                 docs_by_source_file[source_fn] = []
             docs_by_source_file[source_fn].append(chunk_lc_doc)
 
-        esg_allowed_relationships: List[str] = [
-            "HAS_FRAMEWORK", "COMPLIES_WITH", "REFERENCES_STANDARD", "DISCLOSES_INFORMATION_ON",
-            "REPORTS_ON", "APPLIES_TO", "MENTIONS", "DEFINES",
-            "HAS_METRIC", "MEASURES", "TRACKS_KPI", "SETS_TARGET", "ACHIEVES_GOAL",
-            "IDENTIFIES_RISK", "PRESENTS_OPPORTUNITY", "HAS_IMPACT_ON", "MITIGATES_RISK",
-            "HAS_STRATEGY", "IMPLEMENTS_POLICY", "FOLLOWS_PROCESS", "ENGAGES_IN_ACTIVITY",
-            "INVESTS_IN", "OPERATES_IN", "LOCATED_IN", "GOVERNED_BY",
-            "PART_OF", "COMPONENT_OF", "SUBCLASS_OF", "INSTANCE_OF",
-            "RELATES_TO", "ASSOCIATED_WITH", "CAUSES", "INFLUENCES", "CONTRIBUTES_TO",
-            "REQUIRES", "ADDRESSES", "MANAGES", "MONITORS", "EVALUATES",
-            "ISSUED_BY", "DEVELOPED_BY", "PUBLISHED_IN", "EFFECTIVE_DATE"
-        ]
-
-        esg_allowed_nodes: List[str] = [
-            "Organization", "Person", "Standard", "Framework", "Guideline", "Regulation", "Law",
-            "Report", "Document", "Disclosure", "Topic", "SubTopic", "Category",
-            "Metric", "Indicator", "KPI", "Target", "Goal", "Objective",
-            "Risk", "Opportunity", "Impact", "Strategy", "Policy", "Process", "Practice",
-            "Activity", "Initiative", "Program", "Project",
-            "Stakeholder", "Investor", "Employee", "Customer", "Supplier", "Community", "Government",
-            "Region", "Country", "Location", "Facility",
-            "EnvironmentalFactor", "SocialFactor", "GovernanceFactor",
-            "ClimateChange", "GreenhouseGas", "GHGEmissions", "Energy", "Water", "Waste", "Biodiversity",
-            "HumanRights", "LaborPractices", "HealthAndSafety", "DiversityAndInclusion", "CommunityEngagement",
-            "BoardComposition", "Ethics", "Corruption", "ShareholderRights",
-            "EconomicValue", "FinancialPerformance", "OperatingCost", "Revenue", "Investment",
-            "Date", "Year", "Period", "Unit", "Value", "Percentage", "Currency", "Source", "Reference", "Term", "Concept"
-        ]
+        esg_allowed_relationships = [ "HAS_FRAMEWORK", "COMPLIES_WITH", "REFERENCES_STANDARD", "DISCLOSES_INFORMATION_ON", "REPORTS_ON", "APPLIES_TO", "MENTIONS", "DEFINES", "HAS_METRIC", "MEASURES", "TRACKS_KPI", "SETS_TARGET", "ACHIEVES_GOAL", "IDENTIFIES_RISK", "PRESENTS_OPPORTUNITY", "HAS_IMPACT_ON", "MITIGATES_RISK", "HAS_STRATEGY", "IMPLEMENTS_POLICY", "FOLLOWS_PROCESS", "ENGAGES_IN_ACTIVITY", "INVESTS_IN", "OPERATES_IN", "LOCATED_IN", "GOVERNED_BY", "PART_OF", "COMPONENT_OF", "SUBCLASS_OF", "INSTANCE_OF", "RELATES_TO", "ASSOCIATED_WITH", "CAUSES", "INFLUENCES", "CONTRIBUTES_TO", "REQUIRES", "ADDRESSES", "MANAGES", "MONITORS", "EVALUATES", "ISSUED_BY", "DEVELOPED_BY", "PUBLISHED_IN", "EFFECTIVE_DATE" ]
+        esg_allowed_nodes = [ "Organization", "Person", "Standard", "Framework", "Guideline", "Regulation", "Law", "Report", "Document", "Disclosure", "Topic", "SubTopic", "Category", "Metric", "Indicator", "KPI", "Target", "Goal", "Objective", "Risk", "Opportunity", "Impact", "Strategy", "Policy", "Process", "Practice", "Activity", "Initiative", "Program", "Project", "Stakeholder", "Investor", "Employee", "Customer", "Supplier", "Community", "Government", "Region", "Country", "Location", "Facility", "EnvironmentalFactor", "SocialFactor", "GovernanceFactor", "ClimateChange", "GreenhouseGas", "GHGEmissions", "Energy", "Water", "Waste", "Biodiversity", "HumanRights", "LaborPractices", "HealthAndSafety", "DiversityAndInclusion", "CommunityEngagement", "BoardComposition", "Ethics", "Corruption", "ShareholderRights", "EconomicValue", "FinancialPerformance", "OperatingCost", "Revenue", "Investment", "Date", "Year", "Period", "Unit", "Value", "Percentage", "Currency", "Source", "Reference", "Term", "Concept" ]
 
         llm_transformer_for_kg = LLMGraphTransformer(
             llm=self.llm,
             node_properties=["description", "name"],
             relationship_properties=["description"],
             strict_mode=True,
-            allowed_nodes=esg_allowed_nodes, # <--- เพิ่มรายการ Node ที่อนุญาต
-            allowed_relationships=esg_allowed_relationships, # <--- เพิ่มรายการ Relationship ที่อนุญาต
-            prompt=custom_esg_graph_extraction_prompt # <--- ใช้ Prompt ที่ปรับแต่งเอง
+            allowed_nodes=esg_allowed_nodes,
+            allowed_relationships=esg_allowed_relationships,
+            prompt=custom_esg_graph_extraction_prompt
         )
         
-        for i, file_content_io in enumerate(files):
-            current_file_name = file_names[i]
-            print(f"Processing file: {current_file_name}")
-            file_content_io.seek(0) # Reset stream position for each file
+        for file_name, chunks in docs_by_source_file.items():
+            print(f"Processing file: {file_name}")
+            standard_title_from_filename = file_name.split('_', 2)[-1].replace(".pdf", "").replace("_", " ")
 
-            # 1. Load PDFs (Azure or Unstructured) for the current file
-            if self.document_intelligence_client:
-                print(f"Using Azure Document Intelligence for PDF processing: {current_file_name}")
-                # Pass as list of one item
-                initial_docs_for_this_file = await self.read_PDFs_and_create_documents_azure([file_content_io], [current_file_name])
-            else:
-                print(f"Azure client not available, using UnstructuredFileLoader for: {current_file_name}")
-                # Pass as list of one item
-                initial_docs_for_this_file = await loop.run_in_executor(None, self.read_PDFs_and_create_documents, [file_content_io], [current_file_name])
-            
-            print(f"Loaded {len(initial_docs_for_this_file)} initial document(s)/element(s) from {current_file_name}.")
-            if not initial_docs_for_this_file:
-                print(f"No documents were loaded from {current_file_name}. Skipping to next file.")
-                continue
-
-            # 2. Split documents into chunks for the current file
-            split_chunks_for_this_file = await self.split_documents_into_chunks(initial_docs_for_this_file)
-            print(f"Split {current_file_name} into {len(split_chunks_for_this_file)} Langchain Document chunks.")
-            if not split_chunks_for_this_file:
-                print(f"No chunks were created for {current_file_name}. Skipping to next file.")
-                continue
-
-            # 3. Translate chunks for the current file
-            translated_chunks_for_this_file = await self.translate_documents_with_openai(split_chunks_for_this_file)
-            print(f"Translated {len(translated_chunks_for_this_file)} chunks for {current_file_name}.")
-
-            # 4. Create StandardDocument and StandardChunk nodes in Neo4j for the current file
-            #    This also prepares Langchain Documents for LLMGraphTransformer
-            print(f"Processing StandardDocument and StandardChunks for: {current_file_name}")
-            standard_title_from_filename = current_file_name.replace("_", " ").replace(".pdf", "")
-            
-            # _create_standard_document_and_chunks expects translated_chunks for one file
             chunk_docs_with_ids_for_transformer = await self._create_standard_document_and_chunks(
-                file_name=current_file_name,
-                translated_chunks=translated_chunks_for_this_file,
+                file_name=file_name,
+                translated_chunks=chunks,
                 standard_title=standard_title_from_filename
             )
-            print(f"Stored StandardDocument and StandardChunks for {current_file_name} in Neo4j.")
 
-            # 5. Apply LLMGraphTransformer to THIS FILE's chunks and add to Neo4j
             if chunk_docs_with_ids_for_transformer:
-                print(f"Applying LLMGraphTransformer to chunks from {current_file_name}...")
-                await self._apply_llm_graph_transformer_to_chunks( # This method processes and adds to graph
+                await self._apply_llm_graph_transformer_to_chunks(
                     chunk_docs_with_ids_for_transformer,
                     llm_transformer_for_kg
                 )
-            else:
-                print(f"No chunk documents from {current_file_name} prepared for LLMGraphTransformer.")
             
-            print(f"Completed KG extraction for file: {current_file_name}\n--------------------")
-            # --- End of loop for one file ---
+            print(f"Completed KG extraction for file: {file_name}\n--------------------")
 
-        # After all files are processed individually:
-        print("All files have been processed for chunking and LLM graph extraction.")
-        
-        # Add description embeddings ONCE for all __Entity__ nodes that might have been created/updated.
-        # This is generally okay to do once as it queries existing nodes.
-        print("Attempting to add description embeddings to all relevant __Entity__ nodes...")
+        print("All files processed. Adding description embeddings...")
         await loop.run_in_executor(None, self.add_description_embeddings_to_nodes)
+        print("PDF processing flow completed.")
 
-        print("PDF processing flow completed for all files.")
 
-
-    # Methods like get_relate, get_cypher_answer, get_output, is_graph_substantially_empty
-    # will now work with self.store which should be configured for StandardChunk
     async def get_relate(self, query, k):        
-        results = []
         if not self.store:
-            print("ERROR: Neo4jVector store (self.store) is not initialized in get_relate.")
-            return results
+            print("ERROR: Vector store not initialized in get_relate.")
+            return []
         try:
-            # Ensure self.store is configured for StandardChunk and the correct index
             docs_with_score = await self.store.asimilarity_search_with_score(query, k=k)
-            for doc, score in docs_with_score:
-                # doc.page_content will be the 'text' property of StandardChunk
-                # doc.metadata will contain other properties of StandardChunk
-                results.append(doc)
+            return [doc for doc, score in docs_with_score]
         except Exception as e_relate:
-            print(f"Error in get_relate during similarity search: {e_relate}")
+            print(f"Error in get_relate: {e_relate}")
             traceback.print_exc()
-        return results
-
-    # get_cypher_answer and get_output might need review if they depend on specific
-    # node labels or vector indexes other than the new StandardChunk one.
-    # The current get_cypher_answer uses index_name="description" which is for __Entity__ nodes.
-    # This might still be relevant if you want to search through entities created by LLMGraphTransformer.
+            return []
 
     async def get_cypher_answer(self, query):
-        # This method searches the "entity_description_embedding_index" on __Entity__ nodes.
-        # This is separate from the main StandardChunk vector search.
         url, username, password = self.__get_auth_env()
-        # entity_description_index_name = "entity_description_embedding_index" # Now use self.entity_description_index_name
-        # Updated retrieval_query to be more robust and useful.
-        # This query assumes entities have a 'description' and an 'id' (name).
-        # It fetches the entity and its direct neighbors.
         retrieval_query_for_entities = """
             OPTIONAL MATCH (node)-[rel*1..2]-(neighbor)
             WITH node, score, collect({
@@ -878,29 +687,19 @@ class Neo4jService:
         """
         try:
             entity_vector_store = Neo4jVector.from_existing_index(
-                embedding=self.llm_embbedding, # Corrected parameter name
+                embedding=self.llm_embbedding,
                 url=url,
                 username=username,
                 password=password,
-                index_name=self.entity_description_index_name, # Use class attribute
-                text_node_property="description", # Text property on __Entity__
-                embedding_node_property=self.entity_description_embedding_property, # Embedding on __Entity__
+                index_name=self.entity_description_index_name,
+                text_node_property="description",
+                embedding_node_property=self.entity_description_embedding_property,
                 retrieval_query=retrieval_query_for_entities
             )
-            docs = await entity_vector_store.asimilarity_search(query=query, k=3) # k is number of entities
-            # Format into a string representation as before, if that's the desired output
-            print(f"--- [DEBUG] Retrieved docs for query: '{query}' ---")
-            if docs:
-                for i, doc_result in enumerate(docs):
-                    print(f"Doc {i+1} page_content: {doc_result.page_content}")
-                    print(f"Doc {i+1} metadata: {doc_result.metadata}")
-            else:
-                print("No documents retrieved.")
-            print("----------------------------------------------------")
-
+            docs = await entity_vector_store.asimilarity_search(query=query, k=3)
             return f"{[doc.page_content + ' METADATA: ' + str(doc.metadata) for doc in docs]}" 
         except ValueError as ve:
-            print(f"CRITICAL ValueError in get_cypher_answer (index '{self.entity_description_index_name}' not found): {ve}") # Use self.
+            print(f"CRITICAL ValueError in get_cypher_answer: {ve}")
             return "Could not retrieve answer from entity graph: entity description index NOT FOUND."
         except Exception as e_cypher_ans:
             print(f"Error in get_cypher_answer: {e_cypher_ans}")
@@ -909,22 +708,17 @@ class Neo4jService:
 
             
     async def get_output(self, query, k=5) -> RetrieveAnswer:
-        # This will search StandardChunk nodes
         related_standard_chunks = await self.get_relate(query, k) 
-        
-        # This will search __Entity__ nodes based on their descriptions
         cypher_answer_from_entities = await self.get_cypher_answer(query)
         
-        # Combine or decide how to use these two pieces of information
-        # For now, returning entity answer as cypher_answer and chunks as relate_documents
         return RetrieveAnswer(
-            cypher_answer=cypher_answer_from_entities, # Context from Entities
-            relate_documents=related_standard_chunks   # Context from Standard Chunks
+            cypher_answer=cypher_answer_from_entities,
+            relate_documents=related_standard_chunks
         )
 
     async def is_graph_substantially_empty(self, threshold: int = 10) -> bool:
         if not self.graph:
-            print("[NEO4J_SERVICE ERROR] Neo4jGraph (self.graph) is not initialized.")
+            print("[NEO4J_SERVICE ERROR] Neo4jGraph not initialized.")
             return True 
         query = "MATCH (n) RETURN count(n) AS node_count"
         try:
@@ -932,13 +726,11 @@ class Neo4jService:
             result_data = await loop.run_in_executor(None, self.graph.query, query)
             if result_data and "node_count" in result_data[0]:
                 node_count = result_data[0]["node_count"]
-                print(f"[NEO4J_SERVICE LOG] Current node count in graph: {node_count}")
+                print(f"[NEO4J_SERVICE LOG] Current node count: {node_count}")
                 return node_count < threshold
-            else:
-                print(f"[NEO4J_SERVICE WARNING] Could not retrieve valid node count. Result: {result_data}. Assuming not empty.")
-                return False 
+            return False 
         except Exception as e:
-            print(f"[NEO4J_SERVICE ERROR] Error checking if graph is empty: {e}. Assuming not empty.")
+            print(f"[NEO4J_SERVICE ERROR] Error checking if graph is empty: {e}.")
             return False
         
     async def get_all_standard_chunks_for_theme_generation(self) -> List[dict[str, any]]:
@@ -948,23 +740,18 @@ class Neo4jService:
             RETURN 
                 sc.chunk_id AS chunk_id,
                 sc.text AS text,
-                sc.embedding AS embedding, // embedding ของ chunk
-                sc.doc_id AS source_document_doc_id, // ID ของ StandardDocument ต้นทาง
-                sc.original_section_id AS original_section_id, // เลขข้อ/หัวข้อเดิมจาก PDF
+                sc.embedding AS embedding,
+                sc.doc_id AS source_document_doc_id,
+                sc.original_section_id AS original_section_id,
                 sc.page_number AS page_number
             """
-            # หมายเหตุ: ถ้า self.graph.query เป็น synchronous
             loop = asyncio.get_running_loop()
             try:
                 results = await loop.run_in_executor(None, self.graph.query, query)
-                # results จะเป็น list of dictionaries
-                # [{ 'chunk_id': '...', 'text': '...', 'embedding': [...], ...}, ...]
                 if results:
                     print(f"[NEO4J_SERVICE LOG] Retrieved {len(results)} StandardChunks for theme generation.")
                     return results
-                else:
-                    print("[NEO4J_SERVICE WARNING] No StandardChunks found for theme generation.")
-                    return []
+                return []
             except Exception as e:
                 print(f"[NEO4J_SERVICE ERROR] Error retrieving StandardChunks: {e}")
                 traceback.print_exc()
@@ -980,18 +767,13 @@ class Neo4jService:
         max_total_context_items_str_len: int = 1000000
     ) -> Optional[str]:
         if not theme_name and not theme_keywords:
-            print("[NEO4J WARNING] Theme name or keywords required for get_graph_context_for_theme_chunks_v2.")
-            return "Theme name or keywords required to find central entities for graph context."
+            return "Theme name or keywords required."
 
         central_entity_ids: List[str] = []
         try:
             url, username, password = self.__get_auth_env()
-            # entity_description_index_name = "entity_description_embedding_index" # Now use self.entity_description_index_name
-
-            # Query เพื่อดึง ID และข้อมูลเบื้องต้นของ Entity ที่เกี่ยวข้องกับ Keywords
-            # เราต้องการ text (description) สำหรับ vector search และ metadata (id, labels)
             temp_entity_retrieval_query = """
-            RETURN COALESCE(node.description, node.name, node.id, '') AS text, // <--- เพิ่ม node.name, node.id เป็น fallback สำหรับ text
+            RETURN COALESCE(node.description, node.name, node.id, '') AS text,
                 score, 
                 {
                     id: node.id,
@@ -1004,9 +786,9 @@ class Neo4jService:
             entity_store_for_seed_search = Neo4jVector.from_existing_index(
                 embedding=self.llm_embbedding,
                 url=url, username=username, password=password,
-                index_name=self.entity_description_index_name, # Use class attribute
+                index_name=self.entity_description_index_name,
                 text_node_property="description",
-                embedding_node_property=self.entity_description_embedding_property, # Use class attribute
+                embedding_node_property=self.entity_description_embedding_property,
                 retrieval_query=temp_entity_retrieval_query
             )
 
@@ -1021,25 +803,8 @@ class Neo4jService:
                         central_entity_ids.append(doc.metadata.get('id'))
             
             if not central_entity_ids:
-                print(f"[NEO4J INFO] No distinct central entities found for theme '{theme_name}' using vector search on keywords.")
-                # (ส่วน fallback logic เดิมถ้ามี)
-                pass 
-            
-            if not central_entity_ids: # Double check after any fallback
-                print(f"[NEO4J WARNING] No central entities found for theme '{theme_name}' to build graph context.")
-                return "No central entities identified for this theme to build detailed graph context."
+                return "No central entities identified for this theme."
 
-            print(f"[NEO4J INFO] Found central entity IDs for theme '{theme_name}': {central_entity_ids}")
-
-        except neo4j.exceptions.CypherSyntaxError as cse: # ดักจับ CypherSyntaxError โดยเฉพาะ
-            print(f"[NEO4J ERROR] CypherSyntaxError finding central entities for theme '{theme_name}': {cse}")
-            print(f"Problematic Query (ensure no Python comments like # are inside the query string):\n{temp_entity_retrieval_query}")
-            traceback.print_exc()
-            return f"CypherSyntaxError finding central entities. Please check query syntax. Error: {cse.message}"
-        except ValueError as ve: 
-            print(f"[NEO4J ERROR] ValueError finding central entities for theme '{theme_name}': {ve}")
-            traceback.print_exc()
-            return f"ValueError finding central entities for graph context. Check if entities have descriptions. Error: {ve}"
         except Exception as e_seed_search:
             print(f"[NEO4J ERROR] Error finding central entities for theme '{theme_name}': {e_seed_search}")
             traceback.print_exc()
@@ -1048,12 +813,10 @@ class Neo4jService:
         final_graph_context_parts = []
         loop = asyncio.get_running_loop()
         
-        # Query เพื่อดึง neighborhood ของแต่ละ central_entity_id
-        # แก้ไข {{id: ...}} เป็น {id: ...}
         entity_neighborhood_query_template = """
         MATCH (node:__Entity__ {id: $center_entity_id}) 
         OPTIONAL MATCH (node)-[rel*1..{max_hops}]-(neighbor) 
-        WHERE neighbor IS NOT NULL AND (NOT 'StandardChunk' IN labels(neighbor) AND NOT 'StandardDocument' IN labels(neighbor)) // Ensure neighbor is not a chunk/doc
+        WHERE neighbor IS NOT NULL AND (NOT 'StandardChunk' IN labels(neighbor) AND NOT 'StandardDocument' IN labels(neighbor))
         WITH node, 
              COLLECT(DISTINCT {
                  relationship_path: [r_hop IN rel | type(r_hop)], 
@@ -1076,7 +839,7 @@ class Neo4jService:
 
         total_context_len = 0
         for center_id in central_entity_ids:
-            if total_context_len >= max_total_context_items_str_len : break # Check before making more DB calls
+            if total_context_len >= max_total_context_items_str_len : break
             try:
                 query_callable_entity_context = functools.partial(
                     self.graph.query,
@@ -1098,9 +861,7 @@ class Neo4jService:
                     relations_list = record.get('neighbors_and_relations', [])
                     if relations_list:
                         part_str += "\n  RELATIONS:"
-                        for rel_detail_idx, rel_detail in enumerate(relations_list):
-                            if rel_detail_idx >= max_relations_to_collect_per_central_entity: break # Should be handled by Cypher's slice [0..{max_rels}] but double check
-
+                        for rel_detail in relations_list:
                             neighbor_details = rel_detail.get('neighbor_details', {})
                             n_id = neighbor_details.get('id', 'UnknownNeighbor')
                             n_desc = neighbor_details.get('description', 'N/A')
@@ -1109,20 +870,14 @@ class Neo4jService:
                             
                             rel_path_types_str = ", ".join(rel_detail.get('relationship_path', ['RELATED_TO']))
                             part_str += f"\n    --[{rel_path_types_str}]--> NEIGHBOR: {n_id} (Type: {', '.join(display_n_labels)}; Desc: {n_desc})"
-                    else:
-                        part_str += "\n  (No distinct relationships/neighbors found for this entity)"
                     
-                    if total_context_len + len(part_str) + 2 <= max_total_context_items_str_len: # +2 for \n\n
+                    if total_context_len + len(part_str) < max_total_context_items_str_len:
                         final_graph_context_parts.append(part_str)
-                        total_context_len += len(part_str) + 2
+                        total_context_len += len(part_str)
                     else:
-                        final_graph_context_parts.append("... [Further graph context truncated due to length limit]")
-                        break # Stop adding more entities if total length exceeded
+                        final_graph_context_parts.append("... [Context truncated]")
+                        break
             except Exception as e_entity_ctx:
                 print(f"[NEO4J ERROR] Error fetching context for central entity '{center_id}': {e_entity_ctx}")
-                # traceback.print_exc() # Uncomment for full traceback if needed
-        
-        if not final_graph_context_parts:
-            return "No detailed graph context elements could be formatted from central entities."
         
         return "\n\n".join(final_graph_context_parts)
