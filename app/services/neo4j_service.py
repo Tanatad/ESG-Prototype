@@ -101,11 +101,26 @@ class Neo4jService:
         self.standard_chunk_embedding_property = "embedding"
         self.standard_chunk_text_property = "text" # This is the property Neo4jVector will use for Document.page_content
 
+        self.entity_description_index_name = "entity_description_embedding_index"
+        self.entity_node_label = "__Entity__"
+        self.entity_description_embedding_property = "description_embedding"
+        
+        # Alert user about Cohere embedding dimension
+        print("INFO: Using Cohere embedding dimension: 1536. Verify this matches your Cohere model's output dimension (e.g., embed-english-v3.0 is 1024, embed-english-light-v4.0-preview is 384, embed-v4.0 can be 1536 for certain input types).")
+
 
         self.init_graph()
-        self.setup_neo4j_indexes()
-        self.init_vector()
+        self.setup_neo4j_indexes() # This will now also attempt to create entity_description_embedding_index
+        self.init_vector() # Initializes self.store for StandardChunk
         self.init_cypher()
+        
+        # Informational messages for Neo4j connection stability
+        print("INFO: Regarding Neo4j connection stability ('defunct connection' errors):")
+        print("INFO: Langchain's Neo4jGraph class has limited direct driver configuration.")
+        print("INFO: Please ensure your Neo4j server has appropriate timeout settings (e.g., bolt keep_alive, transaction timeouts).")
+        print("INFO: If using Neo4j Aura, check your tier's connection/query limits.")
+        print("INFO: Ensure your 'neo4j' Python package is up-to-date (pip install --upgrade neo4j).")
+        print("INFO: If connection issues persist, they are likely server-side or network-related.")
 
         self.azure_doc_intelligence_endpoint = os.getenv("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT")
         self.azure_doc_intelligence_key = os.getenv("AZURE_DOCUMENTINTELLIGENCE_KEY")
@@ -154,13 +169,9 @@ class Neo4jService:
             print("Constraint/Index for StandardChunk.chunk_id ensured.")
         except Exception as e:
             print(f"Error creating constraint/index for StandardChunk: {e} (This might be fine if it already exists)")
-            
+        
         cohere_embedding_dimension = 1536
-        # For 'embed-v4.0' it's 1536 for input type "search_document" or "search_query"
-        # Check your specific Cohere model's output dimension if not 1024.
-        # For 'embed-english-v3.0' it is 1024.
-        # For 'embed-multilingual-light-v3.0' it is 384.
-
+        # For StandardChunk index
         try:
             self.graph.query(
                 f"""CREATE VECTOR INDEX {self.standard_chunk_vector_index_name} IF NOT EXISTS 
@@ -170,10 +181,28 @@ class Neo4jService:
                     `vector.similarity_function`: 'cosine'
                    }}}}"""
             )
-            print(f"Vector Index '{self.standard_chunk_vector_index_name}' on :{self.standard_chunk_node_label}({self.standard_chunk_embedding_property}) ensured.")
+            print(f"Vector Index '{self.standard_chunk_vector_index_name}' on :{self.standard_chunk_node_label}({self.standard_chunk_embedding_property}) ensured or attempt completed.")
         except Exception as e:
-            print(f"Error creating vector index '{self.standard_chunk_vector_index_name}': {e}")
-            print("Please ensure your Neo4j version supports vector indexes (e.g., Aura or Enterprise 5.11+ with appropriate APOC for vector functions if needed by Langchain). Community Edition might have limitations.")
+            print(f"CRITICAL ERROR creating vector index '{self.standard_chunk_vector_index_name}': {e}")
+            traceback.print_exc() # Add traceback
+            print("Please ensure your Neo4j version supports vector indexes and the dimension matches your embedding model.")
+
+        # For __Entity__ description embedding index
+        # self.entity_description_index_name, self.entity_node_label, self.entity_description_embedding_property are defined in __init__
+        try:
+            self.graph.query(
+                f"""CREATE VECTOR INDEX {self.entity_description_index_name} IF NOT EXISTS
+                   FOR (e:{self.entity_node_label}) ON (e.{self.entity_description_embedding_property})
+                   OPTIONS {{indexConfig: {{
+                    `vector.dimensions`: {cohere_embedding_dimension},
+                    `vector.similarity_function`: 'cosine'
+                   }}}}"""
+            )
+            print(f"Vector Index '{self.entity_description_index_name}' on :{self.entity_node_label}({self.entity_description_embedding_property}) ensured or attempt completed.")
+        except Exception as e:
+            print(f"CRITICAL ERROR creating vector index '{self.entity_description_index_name}': {e}")
+            traceback.print_exc() # Add traceback
+            print("Please ensure your Neo4j version supports vector indexes and the dimension matches your embedding model.")
 
     def init_cypher(self):
         graph_chain = GraphCypherQAChain.from_llm(
@@ -206,11 +235,10 @@ class Neo4jService:
                 embedding_node_property=self.standard_chunk_embedding_property, # Property where embedding vector is stored
             )
             print(f"Vector store '{self.standard_chunk_vector_index_name}' for '{self.standard_chunk_node_label}' initialized from existing index.")
-        except ValueError as ve: # Catch specific ValueError for "index does not exist"
-            print(f"ValueError during Neo4jVector.from_existing_index: {ve}")
-            print(f"This means the vector index '{self.standard_chunk_vector_index_name}' on label '{self.standard_chunk_node_label}' might not exist or is not accessible.")
-            print("Please ensure `setup_neo4j_indexes()` ran successfully and created the index in Neo4j.")
-            print("If this is the first run, the index will be empty and populated as documents are processed by the `flow` method.")
+        except ValueError as ve: 
+            print(f"CRITICAL ValueError during Neo4jVector.from_existing_index for index '{self.standard_chunk_vector_index_name}': {ve}")
+            print(f"This means the vector index '{self.standard_chunk_vector_index_name}' on label '{self.standard_chunk_node_label}' WAS NOT FOUND or is not accessible at initialization.")
+            print("Ensure `setup_neo4j_indexes()` ran successfully AND CREATED THE INDEX in Neo4j before this initialization step.")
             # Initialize a new instance that's configured to work with the index once it's populated
             # This allows the application to start, and similarity search will return empty results
             # until data is processed and the index gets populated.
@@ -442,26 +470,28 @@ class Neo4jService:
         return os.environ["NEO4J_URI"], os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]
 
     def add_description_embeddings_to_nodes(self): # This remains synchronous
-        print("Adding description embeddings to specified nodes (e.g., __Entity__)...")
+        print(f"Attempting to populate description embeddings for nodes with label '{self.entity_node_label}' using index '{self.entity_description_index_name}'.")
         url, username, password = self.__get_auth_env()
         try:
-            # This creates a new vector index named "description" for nodes with label "__Entity__"
-            # Make sure these nodes and properties exist.
+            # This call will now primarily populate embeddings if the index exists
+            # and nodes with the specified text_node_properties are found.
+            # It will also create the index if it somehow wasn't created in setup_neo4j_indexes,
+            # but our goal is for setup_neo4j_indexes to handle creation.
             Neo4jVector.from_existing_graph(
-                embedding=self.llm_embbedding, # Corrected parameter name
+                embedding=self.llm_embbedding,
                 url=url,
                 username=username,
                 password=password,
-                node_label='__Entity__', # Only for nodes created by LLMGraphTransformer with this label
+                node_label=self.entity_node_label, # Use class attribute
                 text_node_properties=['id', 'description'], # Properties to embed from __Entity__
-                embedding_node_property="description_embedding", # Where to store this new embedding
-                index_name="entity_description_embedding_index", # Give it a unique name
+                embedding_node_property=self.entity_description_embedding_property, # Use class attribute
+                index_name=self.entity_description_index_name, # Use class attribute
             )
-            print("Description embeddings potentially added/updated for __Entity__ nodes.")
+            print(f"Population of description embeddings for '{self.entity_node_label}' nodes initiated.")
         except Exception as e_desc_emb:
-            print(f"Error in add_description_embeddings_to_nodes: {e_desc_emb}")
-            print("This might happen if no '__Entity__' nodes with 'id' or 'description' exist yet.")
+            print(f"CRITICAL ERROR during population of description embeddings for '{self.entity_node_label}' using index '{self.entity_description_index_name}': {e_desc_emb}")
             traceback.print_exc()
+            print("This may occur if the index does not exist (check setup_neo4j_indexes logs), nodes are missing, or properties are missing.")
 
 
     async def _create_standard_document_and_chunks(self, 
@@ -570,9 +600,20 @@ class Neo4jService:
         
         if not graph_documents_from_llm:
             print("LLMGraphTransformer did not return any graph documents.")
+        else:
+            print(f"LLMGraphTransformer returned {len(graph_documents_from_llm)} graph documents.")
+            # Log details of the first graph document as a sample
+            sample_gd = graph_documents_from_llm[0]
+            print(f"Sample GraphDocument 0: Source Text: '{sample_gd.source.page_content[:200]}...'")
+            for node_idx, node_sample in enumerate(sample_gd.nodes):
+                print(f"  Sample Node {node_idx}: ID='{node_sample.id}', Type='{node_sample.type}', Properties={node_sample.properties}")
+            for rel_idx, rel_sample in enumerate(sample_gd.relationships):
+                print(f"  Sample Relationship {rel_idx}: Source='{rel_sample.source.id}', Target='{rel_sample.target.id}', Type='{rel_sample.type}', Properties={rel_sample.properties}")
+        
+        if not graph_documents_from_llm: # Ensure this check is after logging and before return
             return
 
-        print(f"LLMGraphTransformer returned {len(graph_documents_from_llm)} graph documents.")
+        print(f"LLMGraphTransformer returned {len(graph_documents_from_llm)} graph documents.") # This line is now redundant due to earlier logging, but harmless.
         
         # Add entities and relationships extracted by LLMGraphTransformer
         # This uses baseEntityLabel=True, so nodes will get __Entity__ and their specific type.
@@ -610,16 +651,17 @@ class Neo4jService:
                 })
         
         if link_params:
+            # Log a sample of link_params
+            sample_link_params_to_log = link_params[:2] # Log first 2 items
+            print(f"Sample link_params for CONTAINS_ENTITY query: {sample_link_params_to_log}")
+
             # Query to link StandardChunk to __Entity__ nodes
             # Assumes __Entity__ nodes were created by add_graph_documents with an 'id' property.
             link_entities_query = """
             UNWIND $link_data AS item
             MATCH (sc:StandardChunk {chunk_id: item.chunk_id})
             MATCH (e:__Entity__ {id: item.entity_id_prop_val}) 
-            // Optionally, ensure the specific label exists if LLMGraphTransformer is inconsistent,
-            // though baseEntityLabel=True should make it add both __Entity__ and the specific type.
-            // CALL apoc.create.addLabels(e, [item.entity_specific_label]) YIELD node AS entityWithCorrectLabel
-            MERGE (sc)-[:CONTAINS_ENTITY]->(e) // Link to 'e' which is the __Entity__ node
+            MERGE (sc)-[:CONTAINS_ENTITY]->(e)
             RETURN count(DISTINCT sc) AS linked_chunks, count(DISTINCT e) as linked_entities
             """
             try:
@@ -819,7 +861,7 @@ class Neo4jService:
         # This method searches the "entity_description_embedding_index" on __Entity__ nodes.
         # This is separate from the main StandardChunk vector search.
         url, username, password = self.__get_auth_env()
-        entity_description_index_name = "entity_description_embedding_index" # As defined in add_description_embeddings_to_nodes
+        # entity_description_index_name = "entity_description_embedding_index" # Now use self.entity_description_index_name
         # Updated retrieval_query to be more robust and useful.
         # This query assumes entities have a 'description' and an 'id' (name).
         # It fetches the entity and its direct neighbors.
@@ -840,9 +882,9 @@ class Neo4jService:
                 url=url,
                 username=username,
                 password=password,
-                index_name=entity_description_index_name,
+                index_name=self.entity_description_index_name, # Use class attribute
                 text_node_property="description", # Text property on __Entity__
-                embedding_node_property="description_embedding", # Embedding on __Entity__
+                embedding_node_property=self.entity_description_embedding_property, # Embedding on __Entity__
                 retrieval_query=retrieval_query_for_entities
             )
             docs = await entity_vector_store.asimilarity_search(query=query, k=3) # k is number of entities
@@ -858,8 +900,8 @@ class Neo4jService:
 
             return f"{[doc.page_content + ' METADATA: ' + str(doc.metadata) for doc in docs]}" 
         except ValueError as ve:
-            print(f"ValueError in get_cypher_answer (likely index '{entity_description_index_name}' not found): {ve}")
-            return "Could not retrieve answer from entity graph: entity description index not found or not populated."
+            print(f"CRITICAL ValueError in get_cypher_answer (index '{self.entity_description_index_name}' not found): {ve}") # Use self.
+            return "Could not retrieve answer from entity graph: entity description index NOT FOUND."
         except Exception as e_cypher_ans:
             print(f"Error in get_cypher_answer: {e_cypher_ans}")
             traceback.print_exc()
@@ -944,7 +986,7 @@ class Neo4jService:
         central_entity_ids: List[str] = []
         try:
             url, username, password = self.__get_auth_env()
-            entity_description_index_name = "entity_description_embedding_index"
+            # entity_description_index_name = "entity_description_embedding_index" # Now use self.entity_description_index_name
 
             # Query เพื่อดึง ID และข้อมูลเบื้องต้นของ Entity ที่เกี่ยวข้องกับ Keywords
             # เราต้องการ text (description) สำหรับ vector search และ metadata (id, labels)
@@ -962,9 +1004,9 @@ class Neo4jService:
             entity_store_for_seed_search = Neo4jVector.from_existing_index(
                 embedding=self.llm_embbedding,
                 url=url, username=username, password=password,
-                index_name=entity_description_index_name,
+                index_name=self.entity_description_index_name, # Use class attribute
                 text_node_property="description",
-                embedding_node_property="description_embedding",
+                embedding_node_property=self.entity_description_embedding_property, # Use class attribute
                 retrieval_query=temp_entity_retrieval_query
             )
 

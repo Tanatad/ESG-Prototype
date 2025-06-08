@@ -26,6 +26,8 @@ from app.services.neo4j_service import Neo4jService # Neo4jService is imported
 
 load_dotenv()
 
+SIMILARITY_THRESHOLD_KG_THEME_UPDATE = 0.85
+
 # PROCESS_SCOPE constants remain the same
 PROCESS_SCOPE_PDF_SPECIFIC_IMPACT = "pdf_specific_impact" # Not directly used by new theme logic, but analyze_pdf_impact might still be
 PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT = "KG_INITIAL_FULL_SCAN_FROM_CONTENT"
@@ -66,6 +68,8 @@ class GeneratedQuestionSet(BaseModel):
     detailed_source_info_for_subquestions: Optional[str] = None
 
 class QuestionGenerationService:
+    SIMILARITY_THRESHOLD_KG_THEME_UPDATE = 0.85 # Threshold for considering a new KG theme an update to an old one
+
     def __init__(self,
                  neo4j_service: Neo4jService,
                  similarity_embedding_model: Embeddings
@@ -1134,9 +1138,29 @@ class QuestionGenerationService:
 
             if uncovered_set_qs:
                 print(f"[QG_SERVICE AGENT GAP-FILL] Found {len(uncovered_set_qs)} SET questions for direct gap-filling.")
+                
+                # Initialize a counter for periodic re-initialization
+                set_processing_counter = 0
+                REINIT_CONNECTION_INTERVAL = 10 # Re-initialize every 10 SET questions, adjust as needed
+                loop = asyncio.get_running_loop() # Get loop for executor calls
+
                 for set_q_to_cover in uncovered_set_qs:
-                    print(f"[QG_SERVICE AGENT GAP-FILL] Attempting for SET ID: {set_q_to_cover['id']} - {set_q_to_cover['theme_set']}")
+                    set_processing_counter += 1
+                    print(f"[QG_SERVICE AGENT GAP-FILL] Attempting for SET ID: {set_q_to_cover['id']} - {set_q_to_cover['theme_set']} ({set_processing_counter}/{len(uncovered_set_qs)})")
                     
+                    # --- Periodic Re-initialization Logic ---
+                    if set_processing_counter > 1 and (set_processing_counter -1) % REINIT_CONNECTION_INTERVAL == 0:
+                        print(f"[QG_SERVICE NEO4J_REINIT] Periodically re-initializing Neo4j connection before processing SET ID: {set_q_to_cover['id']}")
+                        try:
+                            await loop.run_in_executor(None, self.neo4j_service.reinit_graph)
+                            await loop.run_in_executor(None, self.neo4j_service.reinit_vector)
+                            print("[QG_SERVICE NEO4J_REINIT] Neo4j connection re-initialized successfully.")
+                            await asyncio.sleep(1) # Brief pause after re-init
+                        except Exception as e_reinit:
+                            print(f"[QG_SERVICE NEO4J_REINIT_ERROR] Error during periodic Neo4j re-initialization: {e_reinit}")
+                            # Decide if you want to continue or stop if re-init fails. For now, log and continue.
+                    # --- End Periodic Re-initialization Logic ---
+
                     gap_fill_theme_name = f"SET Coverage: {set_q_to_cover['theme_set']} (ID: {set_q_to_cover['id']})"
                     
                     # Check if this gap-fill theme already exists and is active from a previous successful run
@@ -1209,7 +1233,155 @@ class QuestionGenerationService:
                 print("[QG_SERVICE AGENT GAP-FILL] No uncovered SET questions to process or benchmarks not loaded.")
         # --- END GAP-FILLING LOOP ---
 
-        # --- Final Deactivation Logic ---
+
+        # --- Phase 2: Intelligent Evolution for KG-Derived Themes ---
+        # A. Initialization & Preparation
+        previously_active_kg_themes_map: Dict[str, ESGQuestion] = {}
+        for theme_name, versions_docs in all_historical_main_categories_map.items():
+            if not theme_name.startswith("SET Coverage:") and versions_docs and versions_docs[0].is_active:
+                previously_active_kg_themes_map[theme_name] = versions_docs[0]
+        print(f"[QG_SERVICE KG_EVOLUTION] Found {len(previously_active_kg_themes_map)} previously active KG-derived themes.")
+
+        # B. Processing Newly Generated KG-Derived Themes (potential_new_kg_theme_infos is hierarchical_themes_structure)
+        potential_new_kg_theme_infos = hierarchical_themes_structure # Renaming for clarity in this section
+        
+        genuinely_new_kg_themes_to_add: List[Tuple[GeneratedQuestionSet, Dict[str, Any]]] = [] 
+        # Stores (GeneratedQuestionSet, original_theme_info_dict)
+        
+        updated_kg_themes_to_upsert: List[Tuple[ESGQuestion, GeneratedQuestionSet, Dict[str, Any]]] = []
+        # Stores (existing_doc_to_update, new_q_set_as_content, original_new_theme_info)
+
+        processed_old_kg_theme_names: Set[str] = set()
+        
+        loop = asyncio.get_running_loop() # For embedding calls
+
+        print(f"[QG_SERVICE KG_EVOLUTION] Processing {len(potential_new_kg_theme_infos)} potential new/updated KG themes.")
+        for new_theme_info_dict in potential_new_kg_theme_infos:
+            current_new_q_set: Optional[GeneratedQuestionSet] = await self.generate_question_for_theme_level(theme_info=new_theme_info_dict)
+            if not current_new_q_set:
+                print(f"[QG_SERVICE KG_EVOLUTION] Failed to generate question set for new KG theme info: {new_theme_info_dict.get('main_category_name_en')}. Skipping.")
+                continue
+
+            best_match_old_theme_doc: Optional[ESGQuestion] = None
+            highest_similarity_score = 0.0
+
+            if self.similarity_llm_embedding and current_new_q_set.main_category_description:
+                try:
+                    new_theme_desc_embedding_list = await loop.run_in_executor(None, self.similarity_llm_embedding.embed_documents, [current_new_q_set.main_category_description])
+                    if new_theme_desc_embedding_list and new_theme_desc_embedding_list[0]:
+                        new_theme_embedding = np.array(new_theme_desc_embedding_list[0]).reshape(1, -1)
+                        
+                        for old_theme_name, old_theme_doc in previously_active_kg_themes_map.items():
+                            if old_theme_name in processed_old_kg_theme_names: # Already matched with a better new theme
+                                continue
+                            if old_theme_doc.theme_description_en:
+                                old_theme_desc_embedding_list = await loop.run_in_executor(None, self.similarity_llm_embedding.embed_documents, [old_theme_doc.theme_description_en])
+                                if old_theme_desc_embedding_list and old_theme_desc_embedding_list[0]:
+                                    old_theme_embedding = np.array(old_theme_desc_embedding_list[0]).reshape(1, -1)
+                                    score = cosine_similarity(new_theme_embedding, old_theme_embedding)[0][0]
+                                    if score > highest_similarity_score:
+                                        highest_similarity_score = score
+                                        best_match_old_theme_doc = old_theme_doc
+                except Exception as e_sim:
+                    print(f"[QG_SERVICE KG_EVOLUTION] Error during semantic similarity for new theme '{current_new_q_set.main_category_name}': {e_sim}")
+            
+            if best_match_old_theme_doc and highest_similarity_score >= self.SIMILARITY_THRESHOLD_KG_THEME_UPDATE:
+                print(f"[QG_SERVICE KG_EVOLUTION] Potential semantic match for new theme '{current_new_q_set.main_category_name}' with old theme '{best_match_old_theme_doc.theme}' (Score: {highest_similarity_score:.4f}). Checking quality...")
+                new_is_better, is_same_topic = await self._is_new_theme_better(best_match_old_theme_doc, current_new_q_set)
+                
+                if is_same_topic and new_is_better:
+                    print(f"[QG_SERVICE KG_EVOLUTION] New theme '{current_new_q_set.main_category_name}' IS better and same topic as old '{best_match_old_theme_doc.theme}'. Marking for update.")
+                    updated_kg_themes_to_upsert.append((best_match_old_theme_doc, current_new_q_set, new_theme_info_dict))
+                    processed_old_kg_theme_names.add(best_match_old_theme_doc.theme) 
+                else:
+                    reason = "not better" if is_same_topic else "different topic"
+                    print(f"[QG_SERVICE KG_EVOLUTION] New theme '{current_new_q_set.main_category_name}' is {reason} than old '{best_match_old_theme_doc.theme}'. Treating as new.")
+                    genuinely_new_kg_themes_to_add.append((current_new_q_set, new_theme_info_dict))
+            else:
+                print(f"[QG_SERVICE KG_EVOLUTION] New theme '{current_new_q_set.main_category_name}' is distinct (Highest score: {highest_similarity_score:.4f} to any old KG theme). Adding as new.")
+                genuinely_new_kg_themes_to_add.append((current_new_q_set, new_theme_info_dict))
+
+        # C. Processing Genuinely New KG Themes and Upserting Updates
+        print(f"[QG_SERVICE KG_EVOLUTION] Adding {len(genuinely_new_kg_themes_to_add)} genuinely new KG themes.")
+        for q_set, original_info in genuinely_new_kg_themes_to_add:
+            themes_to_be_active_this_run.add(q_set.main_category_name) # New themes are active
+            await self._prepare_and_upsert_theme_to_db(
+                q_set=q_set,
+                original_theme_info_from_source=original_info,
+                validation_status="Validated_KG_Generated", # Or some other appropriate status
+                validation_feedback_list=[], # No direct SET validation here yet
+                set_benchmark_ids_covered_list=[],
+                all_historical_main_categories_map=all_historical_main_categories_map,
+                current_time_utc=current_time_utc,
+                api_response_questions_list=api_response_questions
+            )
+        
+        print(f"[QG_SERVICE KG_EVOLUTION] Updating {len(updated_kg_themes_to_upsert)} existing KG themes with new content.")
+        for old_doc, new_q_set_content, original_new_theme_info in updated_kg_themes_to_upsert:
+            themes_to_be_active_this_run.add(old_doc.theme) # The *old* theme name remains active, but with new content
+            await self._prepare_and_upsert_theme_to_db(
+                q_set=new_q_set_content, # This GeneratedQuestionSet contains the new content
+                original_theme_info_from_source=original_new_theme_info, # This is the original dict for the new theme
+                validation_status="Validated_KG_Updated", # Mark as updated
+                validation_feedback_list=[], # Or carry over feedback if applicable
+                set_benchmark_ids_covered_list=[], # Or carry over if applicable
+                all_historical_main_categories_map=all_historical_main_categories_map,
+                current_time_utc=current_time_utc,
+                api_response_questions_list=api_response_questions,
+                existing_theme_doc_to_update=old_doc # Pass the old document to guide update
+            )
+
+        # D. Preserving Untouched Old KG Themes
+        print(f"[QG_SERVICE KG_EVOLUTION] Preserving untouched active KG themes.")
+        preserved_old_kg_theme_count = 0
+        for old_theme_name, old_theme_doc in previously_active_kg_themes_map.items():
+            if old_theme_name not in processed_old_kg_theme_names:
+                if old_theme_name not in themes_to_be_active_this_run: # Avoid double-adding if SET preservation already handled it
+                    print(f"[QG_SERVICE KG_EVOLUTION] Preserving existing active KG-derived theme: '{old_theme_name}'")
+                    themes_to_be_active_this_run.add(old_theme_name)
+                    if not any(q.theme == old_theme_name for q in api_response_questions):
+                         self._add_existing_theme_to_api_response(old_theme_doc, api_response_questions)
+                    preserved_old_kg_theme_count +=1
+        if preserved_old_kg_theme_count > 0:
+             print(f"[QG_SERVICE KG_EVOLUTION] Preserved {preserved_old_kg_theme_count} previously active and untouched KG themes.")
+        # --- END Phase 2 ---
+
+
+        # --- Existing SET Theme Preservation Logic (from Step 5) ---
+        print("[QG_SERVICE PRESERVATION] Checking for previously validated active SET themes to preserve...")
+        preserved_set_theme_count = 0
+        for theme_name_to_preserve, historical_versions in all_historical_main_categories_map.items():
+            if theme_name_to_preserve.startswith("SET Coverage:") and historical_versions:
+                latest_db_version_doc = historical_versions[0] # Already sorted by version desc
+                
+                # Check if it was active and had a strong validation status
+                is_positively_validated = (
+                    latest_db_version_doc.validation_status == "Validated_SET_Targeted" or
+                    latest_db_version_doc.validation_status == "Validated_SET_Targeted_No_SubQs"
+                )
+                # Alternative/additional check using metadata_extras if validation_status isn't solely relied upon
+                # For example, if coverage_assessment from validation_feedback is stored and reliable:
+                # validation_feedback = latest_db_version_doc.metadata_extras.get("validation_feedback", [])
+                # if validation_feedback and validation_feedback[0].get("coverage_assessment", "").startswith("Full"):
+                #     is_positively_validated = True
+
+                if latest_db_version_doc.is_active and is_positively_validated:
+                    if theme_name_to_preserve not in themes_to_be_active_this_run:
+                        print(f"[QG_SERVICE PRESERVATION] Preserving previously validated SET theme: '{theme_name_to_preserve}'")
+                        themes_to_be_active_this_run.add(theme_name_to_preserve)
+                        # Ensure it's in the API response if not already added by current run's processing
+                        if not any(q.theme == theme_name_to_preserve for q in api_response_questions):
+                            self._add_existing_theme_to_api_response(latest_db_version_doc, api_response_questions)
+                        preserved_set_theme_count += 1
+                    # If it IS in themes_to_be_active_this_run, it means the current run successfully
+                    # re-processed/updated it, which is fine. No special action needed here.
+
+        if preserved_set_theme_count > 0:
+            print(f"[QG_SERVICE PRESERVATION] Preserved {preserved_set_theme_count} previously active and validated SET themes.")
+        # --- END NEW LOGIC ---
+
+
+        # --- Final Deactivation Logic (existing) ---
         if process_scope in [PROCESS_SCOPE_KG_INITIAL_FULL_SCAN_FROM_CONTENT, PROCESS_SCOPE_KG_UPDATED_FULL_SCAN_FROM_CONTENT, PROCESS_SCOPE_KG_FULL_SCAN_DB_EMPTY_FROM_CONTENT, PROCESS_SCOPE_KG_SCHEDULED_REFRESH_FROM_CONTENT]:
             for theme_name_to_check_deact in active_theme_names_at_start_of_run:
                 if theme_name_to_check_deact not in themes_to_be_active_this_run:
@@ -1231,10 +1403,21 @@ class QuestionGenerationService:
         set_benchmark_ids_covered_list: List[str],
         all_historical_main_categories_map: Dict[str, List[ESGQuestion]],
         current_time_utc: datetime,
-        api_response_questions_list: List[GeneratedQuestion] # To append for API response
+        api_response_questions_list: List[GeneratedQuestion], # To append for API response
+        existing_theme_doc_to_update: Optional[ESGQuestion] = None # For KG theme evolution
     ):
         """Helper to translate, build DB model, and upsert, then add to API response."""
-        main_cat_name = q_set.main_category_name
+        
+        # If updating, the theme name for DB lookup should be the old theme's name.
+        # The content (q_set.main_category_name) might be new if the LLM rephrased it.
+        db_lookup_theme_name = existing_theme_doc_to_update.theme if existing_theme_doc_to_update else q_set.main_category_name
+        # The theme name stored in the new/updated document will be from q_set.main_category_name
+        
+        main_cat_name_for_translation = q_set.main_category_name # Use the new name for translation context
+        
+        main_q_text_th = await self.translate_text_to_thai(q_set.main_question_text_en, main_cat_name_for_translation, q_set.main_category_keywords)
+        sub_q_text_th = await self.translate_text_to_thai(q_set.rolled_up_sub_questions_text_en, main_cat_name_for_translation, q_set.main_category_keywords)
+        theme_desc_th = await self.translate_text_to_thai(q_set.main_category_description, main_cat_name_for_translation, q_set.main_category_keywords)
 
         main_q_text_th = await self.translate_text_to_thai(q_set.main_question_text_en, main_cat_name, q_set.main_category_keywords)
         sub_q_text_th = await self.translate_text_to_thai(q_set.rolled_up_sub_questions_text_en, main_cat_name, q_set.main_category_keywords)
@@ -1309,9 +1492,20 @@ class QuestionGenerationService:
         current_time_utc: datetime
     ):
         # ... (เหมือนโค้ดที่คุณให้มาล่าสุด, ตรวจสอบ content_changed โดยเทียบ main_question_text_en และ sub_questions_sets) ...
-        main_category_name = main_category_db_data["theme"]
-        historical_versions = all_historical_main_categories_map.get(main_category_name, [])
-        latest_db_version_doc: Optional[ESGQuestion] = historical_versions[0] if historical_versions else None
+        
+        # Use db_lookup_theme_name for fetching history and potentially deactivating old versions
+        # The actual theme name to be saved in the document is main_category_db_data["theme"] (which comes from q_set.main_category_name)
+        theme_name_for_history_lookup = existing_theme_doc_to_update.theme if existing_theme_doc_to_update else main_category_db_data["theme"]
+        
+        historical_versions = all_historical_main_categories_map.get(theme_name_for_history_lookup, [])
+        
+        # latest_db_version_doc is the one we might be updating OR the one that is being superseded by a name change
+        latest_db_version_doc: Optional[ESGQuestion] = None
+        if existing_theme_doc_to_update:
+            latest_db_version_doc = existing_theme_doc_to_update
+        elif historical_versions: # This case is for new themes or SET themes where name doesn't change
+            latest_db_version_doc = historical_versions[0]
+
         content_changed = False
         if latest_db_version_doc:
             if not await self.are_questions_substantially_similar(main_category_db_data["main_question_text_en"], latest_db_version_doc.main_question_text_en):
@@ -1367,19 +1561,100 @@ class QuestionGenerationService:
                     else: all_historical_main_categories_map.setdefault(main_category_name, []).insert(0, updated_doc); all_historical_main_categories_map[main_category_name].sort(key=lambda q:q.version, reverse=True)
         else:
             if latest_db_version_doc:
-                print(f"[QG_SERVICE INFO DB_UPSERT] MC '{main_category_name}' content CHANGED. New version.")
-                if latest_db_version_doc.is_active: await ESGQuestion.find_one(ESGQuestion.id == latest_db_version_doc.id).update({"$set": {"is_active": False, "updated_at": current_time_utc}})
+                # If existing_theme_doc_to_update is provided, we are updating it.
+                # The theme name in main_category_db_data["theme"] might be different if LLM rephrased it.
+                # We need to deactivate the old doc (identified by existing_theme_doc_to_update.id)
+                # and then insert the new one with potentially a new theme name but incremented version from the old one.
+                if existing_theme_doc_to_update and existing_theme_doc_to_update.is_active:
+                     print(f"[QG_SERVICE INFO DB_UPSERT] Deactivating old version of theme '{existing_theme_doc_to_update.theme}' (ID: {existing_theme_doc_to_update.id}) before update.")
+                     await ESGQuestion.find_one(ESGQuestion.id == existing_theme_doc_to_update.id).update({"$set": {"is_active": False, "updated_at": current_time_utc}})
+                
+                # If it's not an explicit update of an existing doc (e.g. new theme or SET theme matching by name)
+                # and the content is different from the latest active version of that name.
+                elif latest_db_version_doc.is_active and latest_db_version_doc.theme == main_category_db_data["theme"]: # Ensure we are deactivating the correct named theme
+                    print(f"[QG_SERVICE INFO DB_UPSERT] Theme '{main_category_db_data['theme']}' content CHANGED. Deactivating old version.")
+                    await ESGQuestion.find_one(ESGQuestion.id == latest_db_version_doc.id).update({"$set": {"is_active": False, "updated_at": current_time_utc}})
+                
                 upsert_data_for_document["version"] = latest_db_version_doc.version + 1
-            else:
-                print(f"[QG_SERVICE INFO DB_UPSERT] MC '{main_category_name}' is NEW. Inserting v1.")
+                print(f"[QG_SERVICE INFO DB_UPSERT] Creating new version {upsert_data_for_document['version']} for theme '{main_category_db_data['theme']}'.")
+
+            else: # Absolutely new theme name
+                print(f"[QG_SERVICE INFO DB_UPSERT] Theme '{main_category_db_data['theme']}' is NEW. Inserting v1.")
                 upsert_data_for_document["version"] = 1
+            
             upsert_data_for_document["generated_at"] = current_time_utc; upsert_data_for_document["updated_at"] = current_time_utc; upsert_data_for_document["is_active"] = True
-            new_doc = ESGQuestion(**upsert_data_for_document)
+            new_doc_to_insert = ESGQuestion(**upsert_data_for_document)
             try:
-                inserted = await new_doc.insert()
-                all_historical_main_categories_map.setdefault(main_category_name, []).insert(0, inserted)
-                all_historical_main_categories_map[main_category_name].sort(key=lambda q: q.version, reverse=True)
-            except Exception as e: print(f"[QG_SERVICE ERROR DB_UPSERT] Insert MC '{main_category_name}': {e}"); print(f"Data: {upsert_data_for_document}"); traceback.print_exc()
+                inserted_doc = await new_doc_to_insert.insert()
+                # Add to the map using the theme name that was actually saved.
+                all_historical_main_categories_map.setdefault(inserted_doc.theme, []).insert(0, inserted_doc)
+                all_historical_main_categories_map[inserted_doc.theme].sort(key=lambda q: q.version, reverse=True)
+                print(f"[QG_SERVICE INFO DB_UPSERT] Successfully inserted/updated theme '{inserted_doc.theme}' as version {inserted_doc.version}.")
+            except Exception as e: 
+                print(f"[QG_SERVICE ERROR DB_UPSERT] Insert/Update for theme '{new_doc_to_insert.theme}': {e}"); 
+                print(f"Data: {upsert_data_for_document}"); 
+                traceback.print_exc()
+
+    async def _is_new_theme_better(self, old_q_set: ESGQuestion, new_q_set: GeneratedQuestionSet) -> Tuple[bool, bool]:
+        """
+        Determines if the new theme is substantially about the same topic and better than the old theme.
+        Returns: (is_better, is_same_topic)
+        """
+        old_main_q = old_q_set.main_question_text_en
+        old_sub_q_parts = []
+        for sub_set in old_q_set.sub_questions_sets:
+            old_sub_q_parts.append(f"- {sub_set.sub_theme_name}: {sub_set.sub_question_text_en}")
+        old_sub_q = "\n".join(old_sub_q_parts)
+        old_desc = old_q_set.theme_description_en or ""
+
+        new_main_q = new_q_set.main_question_text_en
+        new_sub_q = new_q_set.rolled_up_sub_questions_text_en # This is already a formatted string
+        new_desc = new_q_set.main_category_description or ""
+
+        prompt_template_str = """
+        You are an ESG Theme Analyst. Compare two themes based on their main question, sub-questions, and descriptions.
+
+        Theme A (Old):
+        Description: "{old_desc}"
+        Main Question: "{old_main_q}"
+        Sub-Questions: 
+        {old_sub_q}
+
+        Theme B (New):
+        Description: "{new_desc}"
+        Main Question: "{new_main_q}"
+        Sub-Questions: 
+        {new_sub_q}
+
+        Tasks:
+        1. Topic Equivalence: Is Theme B substantially addressing the same core ESG topic as Theme A? Consider the descriptions, main questions, and the overall scope implied by the sub-questions. (Respond True/False)
+        2. Comprehensiveness/Quality: If Topic Equivalence is True, is Theme B significantly more comprehensive, detailed, specific, or of higher quality in its questions (especially sub-questions) than Theme A? Minor rephrasing or very slight additions do not count as 'significantly more'. Theme B should offer a clear advantage. (Respond True/False. If Topic Equivalence was False, this must also be False).
+
+        Output ONLY a single, valid JSON object with these exact keys: "is_same_topic" (boolean) and "new_is_better" (boolean).
+        """
+        prompt = PromptTemplate.from_template(prompt_template_str)
+        formatted_prompt = prompt.format(
+            old_desc=old_desc, old_main_q=old_main_q, old_sub_q=old_sub_q,
+            new_desc=new_desc, new_main_q=new_main_q, new_sub_q=new_sub_q
+        )
+
+        try:
+            response = await self.qg_llm.ainvoke(formatted_prompt)
+            llm_output = response.content.strip()
+            parsed_json = self._extract_json_from_llm_output(llm_output)
+            
+            if parsed_json and "is_same_topic" in parsed_json and "new_is_better" in parsed_json:
+                is_same = bool(parsed_json["is_same_topic"])
+                is_better = bool(parsed_json["new_is_better"])
+                if not is_same: # If not same topic, new cannot be better in this context
+                    return False, False 
+                return is_better, is_same
+            else:
+                print(f"[QG_SERVICE KG_EVOLUTION_COMPARE_ERROR] LLM output parsing failed for theme comparison. Output: {llm_output}")
+                return False, False # Default to not better, not same topic on error
+        except Exception as e:
+            print(f"[QG_SERVICE KG_EVOLUTION_COMPARE_ERROR] Exception during LLM theme comparison: {e}")
+            return False, False
 
     async def cluster_consolidated_themes_with_llm(self, consolidated_themes: List[Dict[str, Any]], num_main_categories_target: int = 5) -> Optional[Dict[str, Any]]:
         # ... (เหมือนเดิม)

@@ -40,6 +40,7 @@ class ESGQuestion(Document): # Document นี้จะแทน Main Category/M
     main_category_source_document_references: List[str] = Field(default_factory=list)
     
     # --- Versioning and Status for the Main Category/Question document ---
+    validation_status: Optional[str] = None
     version: int = 1
     is_active: bool = True
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
