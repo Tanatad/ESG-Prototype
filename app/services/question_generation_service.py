@@ -330,104 +330,98 @@ class QuestionGenerationService:
     
     async def identify_hierarchical_themes_from_kg(
         self,
-        min_first_order_community_size: int = 3,
-        min_main_category_fo_community_count: int = 2, 
+        min_first_order_community_size: int, # รับค่าจากภายนอก
+        min_main_category_fo_community_count: int, # รับค่าจากภายนอก
     ) -> List[Dict[str, Any]]:
-        print("[QG_SERVICE LOG] Starting Hierarchical Theme Identification from KG...")
+        """
+        Orchestrates the hierarchical theme identification process.
+        This function is now simpler as the adaptive logic is handled by the caller.
+        """
+        print(f"[QG_SERVICE LOG] Identifying themes with settings: min_fo_comm_size={min_first_order_community_size}, min_mc_fo_comm_count={min_main_category_fo_community_count}")
         entity_graph_data = await self._get_entity_graph_data()
         if not entity_graph_data or not entity_graph_data.get("nodes_map"):
-            print("[QG_SERVICE WARNING] Could not retrieve entity graph data. Aborting."); return []
-        all_entity_data_map = entity_graph_data["nodes_map"]
+            print("[QG_SERVICE WARNING] Could not retrieve entity graph data. Aborting theme identification."); return []
 
+        # Step 1: Detect first-order communities (sub-themes)
         first_order_communities_map = await self._detect_first_order_communities(entity_graph_data, min_community_size=min_first_order_community_size)
         if not first_order_communities_map:
-            print("[QG_SERVICE WARNING] No first-order communities found. Aborting."); return []
+            print("[QG_SERVICE WARNING] No first-order communities found with current settings. Aborting."); return []
 
-        consolidated_themes_tasks = []
-        for fo_comm_id, entity_ids_in_fo_comm in first_order_communities_map.items():
-            context_for_llm_ct, constituent_ids_ct, source_docs_ct = self._prepare_context_for_consolidated_theme(fo_comm_id, entity_ids_in_fo_comm, all_entity_data_map)
-            if not context_for_llm_ct.strip(): continue
-            prompt_template_str_ct = """
-            You are an expert ESG analyst. A group of semantically related entities and concepts has been identified from an ESG knowledge graph. 
-            Your task is to define a consolidated ESG reporting theme based on these entities, specifically for the **industrial packaging sector**.
-            The following are representative entities/concepts and their descriptions from this group:
+        # Step 2: Generate consolidated theme details for each first-order community
+        all_consolidated_themes, all_entity_data_map = await self._generate_all_consolidated_themes(first_order_communities_map, entity_graph_data)
+        if not all_consolidated_themes:
+            print("[QG_SERVICE WARNING] No consolidated themes (sub-themes) generated from first-order communities."); return []
+
+        # Step 3: Create meta-graph and detect main categories
+        meta_graph = await self._create_community_meta_graph(first_order_communities_map, entity_graph_data)
+        main_category_groupings = await self._detect_main_categories_from_meta_graph(
+            meta_graph, 
+            min_main_category_fo_community_count=min_main_category_fo_community_count
+        )
+
+        # Step 4: Fallback and Final Assembly
+        if not main_category_groupings:
+            print("[QG_SERVICE WARNING] No main category groupings from meta-graph. Structuring flat themes as main categories.")
+            return [self._structure_flat_theme_as_main_category(ct, idx) for idx, ct in enumerate(all_consolidated_themes)]
+
+        main_categories_final = await self._assemble_main_categories(main_category_groupings, all_consolidated_themes)
+        
+        print(f"[QG_SERVICE LOG] Identified {len(main_categories_final)} hierarchical main categories.")
+        return main_categories_final
+
+    async def _generate_all_consolidated_themes(self, first_order_communities_map, entity_graph_data):
+        """Helper to generate details for all first-order communities."""
+        all_consolidated_themes = []
+        all_entity_data_map = entity_graph_data["nodes_map"]
+        tasks = []
+        for fo_comm_id, entity_ids in first_order_communities_map.items():
+            context, constituent_ids, source_docs = self._prepare_context_for_consolidated_theme(fo_comm_id, entity_ids, all_entity_data_map)
+            if not context.strip(): continue
+            
+            prompt_str = """
+            You are an expert ESG analyst. A group of semantically related entities has been identified.
+            Your task is to define a consolidated ESG reporting theme for this group for the industrial packaging sector.
             --- REPRESENTATIVE ENTITIES/CONCEPTS START ---
             {representative_entity_content}
             --- REPRESENTATIVE ENTITIES/CONCEPTS END ---
-            These entities and concepts primarily originate from or relate to standards document(s) such as: {source_standards_list_str}
             Based on this information:
-            1.  Propose a concise and descriptive **Theme Name** (in English) for this group of entities/concepts.
-            2.  Provide a brief **Theme Description** (in English, 1-2 sentences).
-            3.  Determine the most relevant primary **ESG Dimension** ('E', 'S', or 'G').
-            4.  Suggest 3-5 relevant and specific **Keywords** (in English, comma-separated).
-            Output ONLY a single, valid JSON object with the following exact keys: "theme_name_en", "description_en", "dimension", "keywords_en".
+            1. Propose a concise **Theme Name** (in English).
+            2. Provide a brief **Theme Description** (in English, 1-2 sentences).
+            3. Determine the most relevant primary **ESG Dimension** ('E', 'S', or 'G').
+            4. Suggest 3-5 relevant **Keywords** (in English, comma-separated).
+            Output ONLY a single, valid JSON object with keys: "theme_name_en", "description_en", "dimension", "keywords_en".
             """
-            prompt_ct = PromptTemplate.from_template(prompt_template_str_ct)
-            formatted_prompt_ct = prompt_ct.format(
-                representative_entity_content=context_for_llm_ct,
-                source_standards_list_str=", ".join(sorted(list(source_docs_ct))[:3]) if source_docs_ct else "various ESG standards"
-            )
-            consolidated_themes_tasks.append(self._process_first_order_community_for_consolidated_theme(formatted_prompt_ct, constituent_ids_ct, sorted(list(source_docs_ct)), fo_comm_id))
-        
-        all_consolidated_themes: List[Dict[str, Any]] = []
-        if consolidated_themes_tasks:
-            results = await asyncio.gather(*consolidated_themes_tasks, return_exceptions=True)
+            prompt = PromptTemplate.from_template(prompt_str)
+            formatted_prompt = prompt.format(representative_entity_content=context)
+            tasks.append(self._process_first_order_community_for_consolidated_theme(formatted_prompt, constituent_ids, sorted(list(source_docs)), fo_comm_id))
+            
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in results:
-                if isinstance(res, dict) and res.get("theme_name"): all_consolidated_themes.append(res)
-        
-        if not all_consolidated_themes:
-            print("[QG_SERVICE WARNING] No consolidated themes (sub-themes) generated."); return []
-        print(f"[QG_SERVICE INFO] Generated {len(all_consolidated_themes)} consolidated themes (sub-themes).")
+                if isinstance(res, dict): all_consolidated_themes.append(res)
+        return all_consolidated_themes, all_entity_data_map
 
-        meta_graph = await self._create_community_meta_graph(first_order_communities_map, entity_graph_data, min_inter_community_edges_for_link=1)
-        
-        main_category_groupings = await self._detect_main_categories_from_meta_graph(
-            meta_graph, 
-            min_main_category_fo_community_count=min_main_category_fo_community_count # *** CORRECTED HERE ***
-        )
-        
-        if not main_category_groupings:
-            print("[QG_SERVICE WARNING] No main category groupings from meta-graph. Fallback strategy.")
-            if 0 < len(all_consolidated_themes) <= 25:
-                 hierarchical_output_fallback = await self.cluster_consolidated_themes_with_llm(all_consolidated_themes, num_main_categories_target=max(1, int(len(all_consolidated_themes) / 4) + 1))
-                 if hierarchical_output_fallback and hierarchical_output_fallback.get("main_theme_categories"):
-                     print("[QG_SERVICE INFO] Fallback to LLM clustering of consolidated themes succeeded.")
-                     return [
-                         {
-                             **mc_data, 
-                             "_constituent_entity_ids_in_mc": list(set(eid for tn in mc_data.get("consolidated_theme_names_in_category", []) for ct in all_consolidated_themes if ct.get("theme_name") == tn for eid in ct.get("constituent_entity_ids",[]))),
-                             "_source_document_ids_for_mc": list(set(sid for tn in mc_data.get("consolidated_theme_names_in_category", []) for ct in all_consolidated_themes if ct.get("theme_name") == tn for sid in ct.get("source_standard_document_ids",[]))),
-                             "consolidated_themes": [ct for tn in mc_data.get("consolidated_theme_names_in_category", []) for ct in all_consolidated_themes if ct.get("theme_name") == tn]
-                         } for mc_data in hierarchical_output_fallback.get("main_theme_categories",[])
-                     ]
-            print("[QG_SERVICE WARNING] Fallback to LLM clustering failed or too many themes. Structuring flat themes as main categories.")
-            return [self._structure_flat_theme_as_main_category(ct, idx) for idx, ct in enumerate(all_consolidated_themes)]
+    # --- ฟังก์ชัน Helper ใหม่ (ไม่ได้แก้ไข แต่เพิ่มเข้ามา) ---
+    async def _assemble_main_categories(self, main_category_groupings, all_consolidated_themes):
+        """Helper to assemble final main category structures."""
+        main_categories_final = []
+        tasks = []
+        original_fo_comm_id_to_theme = {ct.get("_first_order_community_id_source"): ct for ct in all_consolidated_themes if ct.get("_first_order_community_id_source") is not None}
 
-        main_categories_final: List[Dict[str, Any]] = []
-        llm_main_category_tasks = []
-        original_fo_comm_id_to_consolidated_theme: Dict[int, Dict[str, Any]] = {}
-        for ct_theme in all_consolidated_themes:
-            original_id = ct_theme.get("_first_order_community_id_source")
-            if isinstance(original_id, int): original_fo_comm_id_to_consolidated_theme[original_id] = ct_theme
-
-        for mc_raw_id, original_fo_community_ids_in_mc_group in main_category_groupings.items():
-            consolidated_themes_for_this_mc: List[Dict[str, Any]] = []
-            current_mc_entities: Set[str] = set(); current_mc_source_docs: Set[str] = set()
-            for fo_comm_id in original_fo_community_ids_in_mc_group:
-                consolidated_theme = original_fo_comm_id_to_consolidated_theme.get(fo_comm_id)
-                if consolidated_theme:
-                    consolidated_themes_for_this_mc.append(consolidated_theme)
-                    current_mc_entities.update(consolidated_theme.get("constituent_entity_ids", []))
-                    current_mc_source_docs.update(consolidated_theme.get("source_standard_document_ids", []))
-            if not consolidated_themes_for_this_mc: continue
-            llm_main_category_tasks.append(self._generate_main_category_details_with_llm(mc_raw_id, consolidated_themes_for_this_mc, current_mc_source_docs, current_mc_entities))
+        for mc_raw_id, fo_comm_ids in main_category_groupings.items():
+            consolidated_themes_for_mc = [original_fo_comm_id_to_theme.get(fo_id) for fo_id in fo_comm_ids if original_fo_comm_id_to_theme.get(fo_id)]
+            if not consolidated_themes_for_mc: continue
+            
+            all_entities = set(eid for theme in consolidated_themes_for_mc for eid in theme.get("constituent_entity_ids", []))
+            all_docs = set(doc for theme in consolidated_themes_for_mc for doc in theme.get("source_standard_document_ids", []))
+            
+            tasks.append(self._generate_main_category_details_with_llm(mc_raw_id, consolidated_themes_for_mc, all_docs, all_entities))
         
-        if llm_main_category_tasks:
-            main_category_llm_results = await asyncio.gather(*llm_main_category_tasks, return_exceptions=True)
-            for mc_result_item in main_category_llm_results:
-                if isinstance(mc_result_item, dict) and mc_result_item.get("main_category_name_en"):
-                    main_categories_final.append(mc_result_item)
-        print(f"[QG_SERVICE LOG] Identified {len(main_categories_final)} hierarchical main categories after LLM processing.")
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, dict): main_categories_final.append(res)
+        
         return main_categories_final
 
     def _prepare_context_for_consolidated_theme(self, fo_comm_id: int, entity_ids_in_fo_comm: List[str], all_entity_data_map: Dict[str, Any]):
@@ -943,321 +937,249 @@ class QuestionGenerationService:
             traceback.print_exc()
             return False
     
-    # REPLACE your entire existing evolve_and_store_questions function with this one.
+    # --- ฟังก์ชันนี้คือเวอร์ชันสมบูรณ์ที่เติมโค้ดส่วนที่ขาดไปแล้ว ---
     async def evolve_and_store_questions(self, is_baseline_upload: bool = False) -> List[GeneratedQuestion]:
         """
-        Orchestrates the entire question generation and evolution process.
-        - If `is_baseline_upload` is True, all generated themes are added as new V1 questions without comparison or deactivation.
-        - If `is_baseline_upload` is False, it performs a full update, including theme comparison, evolution, and deactivation of obsolete themes.
+        Orchestrates question generation with the "Absorb and Refine" strategy.
+        It prioritizes the organic structure of the KG, absorbs SET concepts into the most
+        relevant KG themes, and only creates separate SET themes as a last resort.
         """
-        print(f"[QG_SERVICE LOG] Orchestrating Question Evolution. BASELINE MODE: {is_baseline_upload}")
+        print(f"[QG_SERVICE LOG] Orchestrating KG-First Question Evolution with Absorb & Refine. BASELINE: {is_baseline_upload}")
         current_time_utc = datetime.now(timezone.utc)
-        loop = asyncio.get_running_loop()
 
-        # --- Initial Setup (runs for both modes) ---
+        # --- Setup ---
         benchmark_set_questions = self.load_set_benchmark_questions()
-        hierarchical_themes_structure = await self.identify_hierarchical_themes_from_kg()
-
-        if not hierarchical_themes_structure and not benchmark_set_questions:
-            print("[QG_SERVICE WARNING] No KG themes found and no SET benchmarks loaded. Aborting.")
-            return []
-
         all_db_main_category_docs: List[ESGQuestion] = await ESGQuestion.find_all().to_list()
         all_historical_main_categories_map: Dict[str, List[ESGQuestion]] = {
-            doc.theme: [d for d in all_db_main_category_docs if d.theme == doc.theme]
+            doc.theme: sorted([d for d in all_db_main_category_docs if d.theme == doc.theme], key=lambda q: q.version, reverse=True)
             for doc in all_db_main_category_docs
         }
-        for theme_key in all_historical_main_categories_map:
-            all_historical_main_categories_map[theme_key].sort(key=lambda q: q.version, reverse=True)
-
+        active_theme_names_at_start: Set[str] = {name for name, versions in all_historical_main_categories_map.items() if versions and versions[0].is_active}
         api_response_questions: List[GeneratedQuestion] = []
         themes_to_be_active_this_run: Set[str] = set()
-        successfully_covered_set_question_ids_this_run: Set[str] = set()
 
-        # --- LOGIC BRANCHING: BASELINE vs. UPDATE ---
-        if is_baseline_upload:
-            # --- BASELINE UPLOAD LOGIC ---
-            print("[QG_SERVICE LOG] Executing in BASELINE UPLOAD mode.")
-            # 1. Process KG themes as new
-            if hierarchical_themes_structure:
-                print(f"[QG_SERVICE BASELINE] Processing {len(hierarchical_themes_structure)} themes from KG as new.")
-                for main_category_info_from_kg in hierarchical_themes_structure:
-                    q_set = await self.generate_question_for_theme_level(theme_info=main_category_info_from_kg)
-                    if q_set:
-                        themes_to_be_active_this_run.add(q_set.main_category_name)
-                        await self._prepare_and_upsert_theme_to_db(
-                            q_set=q_set,
-                            original_theme_info_from_source=main_category_info_from_kg,
-                            validation_status="Validated_KG_Generated_Baseline",
-                            validation_feedback_list=[],
-                            set_benchmark_ids_covered_list=[],
-                            all_historical_main_categories_map=all_historical_main_categories_map,
-                            current_time_utc=current_time_utc,
-                            api_response_questions_list=api_response_questions,
-                            existing_theme_doc_to_update=None
-                        )
+        # --- Phase 1: Adaptive Hierarchical Theme Identification ---
+        print("\n--- PHASE 1: ADAPTIVE HIERARCHICAL THEME IDENTIFICATION ---")
+        hierarchical_themes_structure = await self._run_adaptive_theme_identification()
+        if not hierarchical_themes_structure:
+            print("[QG_SERVICE CRITICAL] No themes could be generated. Aborting.")
+            return []
+        
+        # --- Phase 2: Generate Initial Question Sets from KG ---
+        print("\n--- PHASE 2: GENERATING INITIAL QUESTION SETS FROM KG ---")
+        generated_kg_q_sets, original_kg_theme_info_map = await self._generate_qsets_from_theme_structures(hierarchical_themes_structure)
 
-            # 2. Process all SET gap-filling as new
-            if benchmark_set_questions:
-                print(f"[QG_SERVICE BASELINE GAP-FILL] Starting SET gap-filling for baseline.")
-                uncovered_set_qs = [bq for bq in benchmark_set_questions if bq['id'] not in successfully_covered_set_question_ids_this_run]
+        # --- Phase 3: Initial SET Mapping ---
+        print("\n--- PHASE 3: INITIAL MAPPING OF SET BENCHMARKS ---")
+        set_coverage_map, uncovered_set_qs = await self._map_set_coverage(generated_kg_q_sets, benchmark_set_questions)
+
+        # --- Phase 4: Absorb & Refine Uncovered SET Questions ---
+        print("\n--- PHASE 4: ABSORBING AND REFINING FOR UNCOVERED SET QUESTIONS ---")
+        generated_kg_q_sets, set_coverage_map = await self._absorb_and_refine_uncovered_set_qs(
+            uncovered_set_qs, generated_kg_q_sets, set_coverage_map, original_kg_theme_info_map
+        )
+        
+        # --- Phase 5: Process and Store Final KG Themes ---
+        print("\n--- PHASE 5: STORING FINAL KG THEMES ---")
+        for q_set in generated_kg_q_sets:
+            set_ids_covered = [set_id for set_id, theme_name in set_coverage_map.items() if theme_name == q_set.main_category_name]
+            await self._prepare_and_upsert_theme_to_db(
+                q_set=q_set,
+                original_theme_info_from_source=original_kg_theme_info_map.get(q_set.main_category_name, {}),
+                validation_status="Validated_SET_Absorbed" if set_ids_covered else "Validated_Extended_Coverage",
+                validation_feedback_list=[{"benchmark_id_evaluated": sid, "coverage_assessment": "Covered_Via_KG_Theme_Absorption"} for sid in set_ids_covered],
+                set_benchmark_ids_covered_list=set_ids_covered,
+                all_historical_main_categories_map=all_historical_main_categories_map,
+                current_time_utc=current_time_utc,
+                api_response_questions_list=api_response_questions,
+                existing_theme_doc_to_update=None
+            )
+            themes_to_be_active_this_run.add(q_set.main_category_name)
+        
+        # --- Phase 6: True Gap-Filling (Last Resort) ---
+        print("\n--- PHASE 6: TRUE GAP-FILLING (LAST RESORT) ---")
+        final_uncovered_set_qs = [bq for bq in benchmark_set_questions if bq['id'] not in set_coverage_map]
+        if final_uncovered_set_qs:
+            print(f"[QG_SERVICE GAP-FILL] Found {len(final_uncovered_set_qs)} truly isolated SET questions. Creating specific themes...")
+            for set_q_to_cover in final_uncovered_set_qs:
+                gap_fill_theme_name = f"SET Coverage: {set_q_to_cover['theme_set']} (ID: {set_q_to_cover['id']})"
+                max_search_iter_for_gap = int(os.getenv("QG_MAX_SEARCH_ITERATIONS_GAP_FILL", "1"))
                 
-                if uncovered_set_qs:
-                    print(f"[QG_SERVICE BASELINE GAP-FILL] Found {len(uncovered_set_qs)} SET questions for direct gap-filling.")
-                    for set_q_to_cover in uncovered_set_qs:
-                        gap_fill_theme_name = f"SET Coverage: {set_q_to_cover['theme_set']} (ID: {set_q_to_cover['id']})"
-                        max_search_iter_for_gap = int(os.getenv("QG_MAX_SEARCH_ITERATIONS_GAP_FILL", "1"))
-                        generated_sub_q_for_gap, source_info_for_gap, final_kg_ctx_gap, final_chunk_ctx_gap = \
-                            await self._iterative_search_and_generate_for_set_gap(set_q_to_cover, max_search_iterations=max_search_iter_for_gap)
+                generated_sub_q_for_gap, source_info_for_gap, final_kg_ctx_gap, final_chunk_ctx_gap = \
+                    await self._iterative_search_and_generate_for_set_gap(set_q_to_cover, max_search_iterations=max_search_iter_for_gap)
 
-                        if generated_sub_q_for_gap:
-                            gap_main_q_en = set_q_to_cover.get('question_text_en', f"What is the company's approach regarding {set_q_to_cover['theme_set']}?")
-                            gap_fill_q_set = GeneratedQuestionSet(
-                                main_question_text_en=gap_main_q_en,
-                                rolled_up_sub_questions_text_en=generated_sub_q_for_gap,
-                                main_category_name=gap_fill_theme_name,
-                                main_category_dimension=set_q_to_cover['dimension'],
-                                main_category_keywords=f"{set_q_to_cover['theme_set']}, {set_q_to_cover.get('question_text_en','')}",
-                                main_category_description=f"Questions for SET benchmark ID: {set_q_to_cover['id']}",
-                                detailed_source_info_for_subquestions=source_info_for_gap
-                            )
-                            original_info_for_gap_fill = {
-                                "main_category_name_en": gap_fill_theme_name,
-                                "generation_method": "set_gap_filling_agentic_loop",
-                                "_main_category_raw_id": f"set_gap_{set_q_to_cover['id']}",
-                                "_final_kg_context_used": final_kg_ctx_gap,
-                                "_final_chunk_context_used": final_chunk_ctx_gap
-                            }
-                            
-                            await self._prepare_and_upsert_theme_to_db(
-                                q_set=gap_fill_q_set,
-                                original_theme_info_from_source=original_info_for_gap_fill,
-                                validation_status="Validated_SET_Targeted",
-                                validation_feedback_list=[{"benchmark_id_evaluated": set_q_to_cover['id'], "coverage_assessment": "Full_Via_Gap_Fill"}],
-                                set_benchmark_ids_covered_list=[set_q_to_cover['id']],
-                                all_historical_main_categories_map=all_historical_main_categories_map,
-                                current_time_utc=current_time_utc,
-                                api_response_questions_list=api_response_questions,
-                                existing_theme_doc_to_update=None
-                            )
-                            successfully_covered_set_question_ids_this_run.add(set_q_to_cover['id'])
-                            themes_to_be_active_this_run.add(gap_fill_theme_name)
-                        else:
-                            print(f"[QG_SERVICE BASELINE GAP-FILL] Could not generate questions for SET ID: {set_q_to_cover['id']}.")
-
-        else:
-            # --- STANDARD UPDATE LOGIC (Corrected Structure) ---
-            print("[QG_SERVICE LOG] Executing in STANDARD UPDATE mode.")
-            active_theme_names_at_start_of_run: Set[str] = {
-                theme_name for theme_name, docs in all_historical_main_categories_map.items() if docs and docs[0].is_active
-            }
-
-            # --- Phase 1: KG THEME EVOLUTION & REFINEMENT (Single Integrated Loop) ---
-            if hierarchical_themes_structure:
-                print(f"[QG_SERVICE UPDATE] Starting integrated processing for {len(hierarchical_themes_structure)} KG-derived themes.")
-                previously_active_kg_themes_map: Dict[str, ESGQuestion] = {
-                    name: versions[0] for name, versions in all_historical_main_categories_map.items() 
-                    if not name.startswith("SET Coverage:") and versions and versions[0].is_active
-                }
-                processed_old_kg_theme_names: Set[str] = set()
-
-                for new_theme_info_dict in hierarchical_themes_structure:
-                    # Step 1.1: Generate initial question set
-                    current_q_set_for_kg_theme = await self.generate_question_for_theme_level(theme_info=new_theme_info_dict)
-                    if not current_q_set_for_kg_theme:
-                        print(f"[QG_SERVICE WARNING] Initial QSet generation failed for KG theme. Skipping.")
-                        continue
-                    
-                    mc_name_kg = current_q_set_for_kg_theme.main_category_name
-
-                    # Step 1.2: Evolve - Compare with old themes to find a potential match for update
-                    best_match_old_theme_doc: Optional[ESGQuestion] = None
-                    highest_similarity_score = 0.0
-                    if self.similarity_llm_embedding and current_q_set_for_kg_theme.main_category_description:
-                        try:
-                            new_theme_desc_embedding_list = await loop.run_in_executor(None, self.similarity_llm_embedding.embed_documents, [current_q_set_for_kg_theme.main_category_description])
-                            if new_theme_desc_embedding_list and new_theme_desc_embedding_list[0]:
-                                new_theme_embedding = np.array(new_theme_desc_embedding_list[0]).reshape(1, -1)
-                                for old_theme_name, old_theme_doc in previously_active_kg_themes_map.items():
-                                    if old_theme_name in processed_old_kg_theme_names: continue
-                                    if old_theme_doc.theme_description_en:
-                                        old_theme_desc_embedding_list = await loop.run_in_executor(None, self.similarity_llm_embedding.embed_documents, [old_theme_doc.theme_description_en])
-                                        if old_theme_desc_embedding_list and old_theme_desc_embedding_list[0]:
-                                            old_theme_embedding = np.array(old_theme_desc_embedding_list[0]).reshape(1, -1)
-                                            score = cosine_similarity(new_theme_embedding, old_theme_embedding)[0][0]
-                                            if score > highest_similarity_score:
-                                                highest_similarity_score = score
-                                                best_match_old_theme_doc = old_theme_doc
-                        except Exception as e_sim:
-                            print(f"[QG_SERVICE KG_EVOLUTION] Error during semantic similarity: {e_sim}")
-                    
-                    existing_doc_to_update: Optional[ESGQuestion] = None
-                    if best_match_old_theme_doc and highest_similarity_score >= self.SIMILARITY_THRESHOLD_KG_THEME_UPDATE:
-                        new_is_better, is_same_topic = await self._is_new_theme_better(best_match_old_theme_doc, current_q_set_for_kg_theme)
-                        if is_same_topic and new_is_better:
-                            print(f"[QG_SERVICE KG_EVOLUTION] Marking theme '{best_match_old_theme_doc.theme}' for update with new content from '{mc_name_kg}'.")
-                            existing_doc_to_update = best_match_old_theme_doc
-                            processed_old_kg_theme_names.add(best_match_old_theme_doc.theme)
-
-                    # Step 1.3: Refine - Improve quality against SET benchmarks
-                    current_main_q_text = current_q_set_for_kg_theme.main_question_text_en
-                    current_sub_q_text = current_q_set_for_kg_theme.rolled_up_sub_questions_text_en
-                    current_sub_q_source_info = current_q_set_for_kg_theme.detailed_source_info_for_subquestions
-                    
-                    validation_status_for_this_kg_theme = "Validated_KG_Updated" 
-                    all_feedback_for_this_kg_theme: List[Dict[str, Any]] = []
-                    set_ids_covered_by_this_kg_theme: Set[str] = set()
-
-                    if benchmark_set_questions:
-                        relevant_set_benchmarks_for_kg_theme = await self._find_relevant_set_benchmark_questions(
-                            mc_dimension=current_q_set_for_kg_theme.main_category_dimension, mc_name=mc_name_kg,
-                            mc_keywords=current_q_set_for_kg_theme.main_category_keywords, generated_main_q_text=current_main_q_text,
-                            generated_sub_q_text=current_sub_q_text, all_set_benchmarks=benchmark_set_questions,
-                            relevance_threshold=0.65
-                        )
-
-                        is_fully_validated = not relevant_set_benchmarks_for_kg_theme
-                        if is_fully_validated:
-                            validation_status_for_this_kg_theme = "Validated_Extended_Coverage"
-
-                        current_iteration = 0
-                        max_refinement_iterations = int(os.getenv("QG_MAX_REFINEMENT_ITERATIONS", "1"))
-                        while current_iteration < max_refinement_iterations and not is_fully_validated:
-                            all_benchmarks_covered_this_iteration_pass = True 
-                            temp_set_ids_covered_this_iteration_pass: Set[str] = set()
-
-                            for benchmark_q in relevant_set_benchmarks_for_kg_theme:
-                                if benchmark_q['id'] in set_ids_covered_by_this_kg_theme:
-                                    temp_set_ids_covered_this_iteration_pass.add(benchmark_q['id'])
-                                    continue
-
-                                eval_result = await self._llm_as_evaluator(
-                                    benchmark_question_detail=benchmark_q, generated_main_category_name=mc_name_kg,
-                                    generated_main_question_en=current_main_q_text, generated_sub_questions_en=current_sub_q_text,
-                                    generated_dimension=current_q_set_for_kg_theme.main_category_dimension,
-                                    knowledge_graph_context="N/A", standard_document_excerpts="N/A" # Simplified context for refinement
-                                )
-                                all_feedback_for_this_kg_theme.append({**eval_result, "benchmark_id_evaluated": benchmark_q['id']})
-
-                                if eval_result.get("coverage_assessment", "None").lower() == "full":
-                                    temp_set_ids_covered_this_iteration_pass.add(benchmark_q['id'])
-                                else:
-                                    all_benchmarks_covered_this_iteration_pass = False
-                                    current_sub_q_text, current_sub_q_source_info = await self._refine_sub_questions_based_on_feedback(
-                                        main_category_name=mc_name_kg, main_question_text=current_main_q_text,
-                                        existing_sub_questions=current_sub_q_text,
-                                        feedback_suggestions=eval_result.get("suggested_improvements"),
-                                        missing_aspects=eval_result.get("missing_aspects"),
-                                        original_main_category_info=new_theme_info_dict,
-                                        knowledge_graph_context="N/A", standard_document_excerpts="N/A",
-                                        main_category_dimension=current_q_set_for_kg_theme.main_category_dimension
-                                    )
-                                    break
-                            
-                            set_ids_covered_by_this_kg_theme.update(temp_set_ids_covered_this_iteration_pass)
-                            
-                            if all_benchmarks_covered_this_iteration_pass and len(set_ids_covered_by_this_kg_theme) == len(relevant_set_benchmarks_for_kg_theme):
-                                is_fully_validated = True
-                                validation_status_for_this_kg_theme = "Validated_SET_Covered"
-                            
-                            current_iteration += 1
-
-                        if not is_fully_validated and relevant_set_benchmarks_for_kg_theme:
-                            validation_status_for_this_kg_theme = "Validated_Partial_SET_Coverage"
-
-                    successfully_covered_set_question_ids_this_run.update(set_ids_covered_by_this_kg_theme)
-                    
-                    # Step 1.4: Assemble final QuestionSet and Upsert
-                    final_kg_theme_q_set = GeneratedQuestionSet(
-                        main_question_text_en=current_main_q_text,
-                        rolled_up_sub_questions_text_en=current_sub_q_text,
-                        main_category_name=mc_name_kg,
-                        main_category_dimension=current_q_set_for_kg_theme.main_category_dimension,
-                        main_category_keywords=current_q_set_for_kg_theme.main_category_keywords,
-                        main_category_description=current_q_set_for_kg_theme.main_category_description,
-                        detailed_source_info_for_subquestions=current_sub_q_source_info
+                if generated_sub_q_for_gap:
+                    gap_main_q_en = set_q_to_cover.get('question_text_en', f"What is the company's approach regarding {set_q_to_cover['theme_set']}?")
+                    gap_fill_q_set = GeneratedQuestionSet(
+                        main_question_text_en=gap_main_q_en,
+                        rolled_up_sub_questions_text_en=generated_sub_q_for_gap,
+                        main_category_name=gap_fill_theme_name,
+                        main_category_dimension=set_q_to_cover['dimension'],
+                        main_category_keywords=f"{set_q_to_cover['theme_set']}, {set_q_to_cover.get('question_text_en','')}",
+                        main_category_description=f"Questions for SET benchmark ID: {set_q_to_cover['id']}",
+                        detailed_source_info_for_subquestions=source_info_for_gap
                     )
-                    
-                    theme_name_to_activate = existing_doc_to_update.theme if existing_doc_to_update else final_kg_theme_q_set.main_category_name
-                    themes_to_be_active_this_run.add(theme_name_to_activate)
+                    original_info_for_gap_fill = {
+                        "generation_method": "set_gap_filling_agentic_loop",
+                        "_main_category_raw_id": f"set_gap_{set_q_to_cover['id']}",
+                        "_final_kg_context_used": final_kg_ctx_gap,
+                        "_final_chunk_context_used": final_chunk_ctx_gap
+                    }
                     
                     await self._prepare_and_upsert_theme_to_db(
-                        q_set=final_kg_theme_q_set,
-                        original_theme_info_from_source=new_theme_info_dict,
-                        validation_status=validation_status_for_this_kg_theme,
-                        validation_feedback_list=all_feedback_for_this_kg_theme,
-                        set_benchmark_ids_covered_list=list(set_ids_covered_by_this_kg_theme),
+                        q_set=gap_fill_q_set,
+                        original_theme_info_from_source=original_info_for_gap_fill,
+                        validation_status="Validated_SET_Targeted",
+                        validation_feedback_list=[{"benchmark_id_evaluated": set_q_to_cover['id'], "coverage_assessment": "Full_Via_Gap_Fill"}],
+                        set_benchmark_ids_covered_list=[set_q_to_cover['id']],
                         all_historical_main_categories_map=all_historical_main_categories_map,
                         current_time_utc=current_time_utc,
                         api_response_questions_list=api_response_questions,
-                        existing_theme_doc_to_update=existing_doc_to_update
+                        existing_theme_doc_to_update=None
                     )
+                    themes_to_be_active_this_run.add(gap_fill_theme_name)
+                else:
+                    print(f"[QG_SERVICE GAP-FILL] Could not generate questions for truly isolated SET ID: {set_q_to_cover['id']}.")
 
-            # --- Phase 2: SET QUESTION GAP-FILLING (runs once after KG themes) ---
-            if benchmark_set_questions:
-                print(f"[QG_SERVICE UPDATE GAP-FILL] Checking for SET questions not covered by KG themes.")
-                uncovered_set_qs = [bq for bq in benchmark_set_questions if bq['id'] not in successfully_covered_set_question_ids_this_run]
-                if uncovered_set_qs:
-                    print(f"[QG_SERVICE UPDATE GAP-FILL] Found {len(uncovered_set_qs)} SET questions for gap-filling.")
-                    for set_q_to_cover in uncovered_set_qs:
-                        gap_fill_theme_name = f"SET Coverage: {set_q_to_cover['theme_set']} (ID: {set_q_to_cover['id']})"
-                        max_search_iter_for_gap = int(os.getenv("QG_MAX_SEARCH_ITERATIONS_GAP_FILL", "1"))
-                        generated_sub_q_for_gap, source_info_for_gap, final_kg_ctx_gap, final_chunk_ctx_gap = \
-                            await self._iterative_search_and_generate_for_set_gap(set_q_to_cover, max_search_iterations=max_search_iter_for_gap)
-
-                        if generated_sub_q_for_gap:
-                            gap_main_q_en = set_q_to_cover.get('question_text_en', f"What is the company's approach regarding {set_q_to_cover['theme_set']}?")
-                            gap_fill_q_set = GeneratedQuestionSet(
-                                main_question_text_en=gap_main_q_en,
-                                rolled_up_sub_questions_text_en=generated_sub_q_for_gap,
-                                main_category_name=gap_fill_theme_name,
-                                main_category_dimension=set_q_to_cover['dimension'],
-                                main_category_keywords=f"{set_q_to_cover['theme_set']}, {set_q_to_cover.get('question_text_en','')}",
-                                main_category_description=f"Questions for SET benchmark ID: {set_q_to_cover['id']}",
-                                detailed_source_info_for_subquestions=source_info_for_gap
-                            )
-                            original_info_for_gap_fill = {
-                                "main_category_name_en": gap_fill_theme_name, "generation_method": "set_gap_filling_agentic_loop",
-                                "_main_category_raw_id": f"set_gap_{set_q_to_cover['id']}", "_final_kg_context_used": final_kg_ctx_gap,
-                                "_final_chunk_context_used": final_chunk_ctx_gap
-                            }
-                            
-                            await self._prepare_and_upsert_theme_to_db(
-                                q_set=gap_fill_q_set,
-                                original_theme_info_from_source=original_info_for_gap_fill,
-                                validation_status="Validated_SET_Targeted",
-                                validation_feedback_list=[{"benchmark_id_evaluated": set_q_to_cover['id'], "coverage_assessment": "Full_Via_Gap_Fill"}],
-                                set_benchmark_ids_covered_list=[set_q_to_cover['id']],
-                                all_historical_main_categories_map=all_historical_main_categories_map,
-                                current_time_utc=current_time_utc,
-                                api_response_questions_list=api_response_questions,
-                                existing_theme_doc_to_update=None
-                            )
-                            successfully_covered_set_question_ids_this_run.add(set_q_to_cover['id'])
-                            themes_to_be_active_this_run.add(gap_fill_theme_name)
-                        else:
-                            print(f"[QG_SERVICE UPDATE GAP-FILL] Could not generate questions for SET ID: {set_q_to_cover['id']}.")
-
-            # --- Phase 3: PRESERVATION & DEACTIVATION ---
-            print(f"[QG_SERVICE PRESERVATION & DEACTIVATION] Finalizing theme states.")
-            # Preserve untouched old themes by ensuring they remain in the active set
-            for old_theme_name, old_theme_doc in previously_active_kg_themes_map.items():
-                if old_theme_name not in processed_old_kg_theme_names:
-                    themes_to_be_active_this_run.add(old_theme_name)
-                    if not any(q.theme == old_theme_name for q in api_response_questions):
-                        self._add_existing_theme_to_api_response(old_theme_doc, api_response_questions)
+        else:
+            print("[QG_SERVICE GAP-FILL] No truly isolated SET questions found. All covered or absorbed by KG themes.")
             
-            # Deactivate obsolete themes
-            for theme_to_check in active_theme_names_at_start_of_run:
-                if theme_to_check not in themes_to_be_active_this_run:
-                    print(f"[QG_SERVICE DEACTIVATION] Deactivating obsolete theme: '{theme_to_check}'")
+        # --- Phase 7: Deactivation ---
+        print("\n--- PHASE 7: DEACTIVATING OBSOLETE THEMES ---")
+        if not is_baseline_upload:
+            themes_to_deactivate = active_theme_names_at_start - themes_to_be_active_this_run
+            if themes_to_deactivate:
+                print(f"[QG_SERVICE DEACTIVATION] Deactivating {len(themes_to_deactivate)} obsolete themes: {themes_to_deactivate}")
+                for theme_name in themes_to_deactivate:
                     await ESGQuestion.find(
-                        ESGQuestion.theme == theme_to_check,
+                        ESGQuestion.theme == theme_name,
                         ESGQuestion.is_active == True
                     ).update({"$set": {"is_active": False, "updated_at": current_time_utc}})
-
-        print(f"[QG_SERVICE LOG] Evolution complete. API response questions: {len(api_response_questions)}. Total unique SET Qs covered: {len(successfully_covered_set_question_ids_this_run)}")
+            else:
+                print("[QG_SERVICE DEACTIVATION] No themes need to be deactivated in this run.")
+        else:
+            print("[QG_SERVICE DEACTIVATION] Skipping deactivation in baseline mode.")
+                
+        print(f"\n[QG_SERVICE LOG] Evolution complete. Final active themes: {len(themes_to_be_active_this_run)}. Total API questions: {len(api_response_questions)}.")
         return api_response_questions
+
+    async def _run_adaptive_theme_identification(self) -> List[Dict[str, Any]]:
+        """Runs theme identification with adaptive settings."""
+        MINIMUM_DESIRED_THEMES = 15
+        
+        print("[QG_SERVICE INFO] Attempt 1: Identifying themes with HIGH quality settings (4, 2)...")
+        themes = await self.identify_hierarchical_themes_from_kg(min_first_order_community_size=4, min_main_category_fo_community_count=2)
+
+        if len(themes) < MINIMUM_DESIRED_THEMES:
+            print(f"[QG_SERVICE WARNING] High-quality settings yielded only {len(themes)} themes. Retrying with MEDIUM settings (3, 1)...")
+            themes = await self.identify_hierarchical_themes_from_kg(min_first_order_community_size=3, min_main_category_fo_community_count=1)
+        
+        if not themes:
+            print("[QG_SERVICE CRITICAL] No themes could be generated from any graph-based method.")
+            return []
+            
+        return themes
+
+    async def _generate_qsets_from_theme_structures(self, theme_structures: List[Dict[str, Any]]) -> Tuple[List[GeneratedQuestionSet], Dict[str, Dict[str, Any]]]:
+        """Generates GeneratedQuestionSet objects from theme structure dictionaries."""
+        q_sets, info_map = [], {}
+        tasks = [self.generate_question_for_theme_level(info) for info in theme_structures]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, res in enumerate(results):
+            if isinstance(res, GeneratedQuestionSet) and res.main_category_name:
+                q_sets.append(res)
+                info_map[res.main_category_name] = theme_structures[i]
+        return q_sets, info_map
+
+    async def _map_set_coverage(self, kg_q_sets: List[GeneratedQuestionSet], benchmarks: List[Dict[str, Any]]) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+        """Maps SET benchmarks to KG themes and returns the coverage map and a list of uncovered questions."""
+        coverage_map = {}
+        for q_set in kg_q_sets:
+            relevant_qs = await self._find_relevant_set_benchmark_questions(
+                mc_dimension=q_set.main_category_dimension, mc_name=q_set.main_category_name,
+                mc_keywords=q_set.main_category_keywords, generated_main_q_text=q_set.main_question_text_en,
+                generated_sub_q_text=q_set.rolled_up_sub_questions_text_en, all_set_benchmarks=benchmarks)
+            for set_q in relevant_qs:
+                coverage_map[set_q['id']] = q_set.main_category_name
+        
+        uncovered_qs = [bq for bq in benchmarks if bq['id'] not in coverage_map]
+        print(f"[QG_SERVICE INFO] Initial SET mapping: {len(coverage_map)} covered, {len(uncovered_qs)} uncovered.")
+        return coverage_map, uncovered_qs
+
+    # --- ฟังก์ชัน Helper ใหม่สำหรับ `evolve_and_store_questions` ---
+    async def _absorb_and_refine_uncovered_set_qs(self, uncovered_qs: List[Dict[str, Any]], kg_q_sets: List[GeneratedQuestionSet], coverage_map: Dict[str, str], info_map: Dict[str, Dict[str, Any]]) -> Tuple[List[GeneratedQuestionSet], Dict[str, str]]:
+        """Absorbs uncovered SET questions by refining the best-fit KG theme."""
+        q_set_dict = {q.main_category_name: q for q in kg_q_sets}
+        for set_q in uncovered_qs:
+            best_fit_theme = await self._find_best_fit_kg_theme_for_set_q(set_q, list(q_set_dict.values()))
+            if best_fit_theme:
+                print(f"[QG_SERVICE REFINE] Refining theme '{best_fit_theme.main_category_name}' to absorb SET ID '{set_q['id']}'...")
+                feedback = f"Please revise or add sub-questions to specifically cover: '{set_q.get('question_text_en')}'"
+                
+                refined_sub_q, refined_info = await self._refine_sub_questions_based_on_feedback(
+                    main_category_name=best_fit_theme.main_category_name,
+                    main_question_text=best_fit_theme.main_question_text_en,
+                    existing_sub_questions=best_fit_theme.rolled_up_sub_questions_text_en,
+                    feedback_suggestions=feedback, missing_aspects=f"Specifics of SET Question: {set_q.get('question_text_en')}",
+                    original_main_category_info=info_map[best_fit_theme.main_category_name],
+                    knowledge_graph_context="N/A", standard_document_excerpts="N/A",
+                    main_category_dimension=best_fit_theme.main_category_dimension)
+
+                # Update the QSet object in our dictionary
+                best_fit_theme.rolled_up_sub_questions_text_en = refined_sub_q
+                best_fit_theme.detailed_source_info_for_subquestions = refined_info
+                q_set_dict[best_fit_theme.main_category_name] = best_fit_theme
+                
+                coverage_map[set_q['id']] = best_fit_theme.main_category_name
+
+        return list(q_set_dict.values()), coverage_map
+    
+    async def _find_best_fit_kg_theme_for_set_q(
+        self,
+        set_question: Dict[str, Any],
+        generated_kg_q_sets: List[GeneratedQuestionSet]
+    ) -> Optional[GeneratedQuestionSet]:
+        """Finds the most semantically similar KG-generated theme for an uncovered SET question."""
+        if not self.similarity_llm_embedding or not generated_kg_q_sets:
+            return None
+
+        set_q_text = set_question.get('question_text_en', '')
+        if not set_q_text:
+            return None
+
+        # สร้าง Embedding ของ SET Question
+        set_q_embedding_list = await asyncio.get_running_loop().run_in_executor(
+            None, self.similarity_llm_embedding.embed_documents, [set_q_text]
+        )
+        if not set_q_embedding_list or not set_q_embedding_list[0]:
+            return None
+        set_q_embedding = np.array(set_q_embedding_list[0]).reshape(1, -1)
+
+        # สร้าง Embeddings ของ KG Themes ทั้งหมด
+        kg_q_set_texts = [f"{q.main_category_name} {q.main_category_description}" for q in generated_kg_q_sets]
+        kg_embeddings_list = await asyncio.get_running_loop().run_in_executor(
+            None, self.similarity_llm_embedding.embed_documents, kg_q_set_texts
+        )
+        
+        best_match_q_set = None
+        highest_score = -1.0
+
+        for i, kg_embedding in enumerate(kg_embeddings_list):
+            if kg_embedding:
+                current_embedding = np.array(kg_embedding).reshape(1, -1)
+                score = cosine_similarity(set_q_embedding, current_embedding)[0][0]
+                if score > highest_score:
+                    highest_score = score
+                    best_match_q_set = generated_kg_q_sets[i]
+
+        # เราอาจจะตั้ง Threshold ขั้นต่ำไว้ที่นี่ เพื่อไม่ให้จับคู่กับธีมที่ไม่เกี่ยวข้องกันเลย
+        SIMILARITY_THRESHOLD_FOR_ABSORPTION = 0.5 
+        if highest_score >= SIMILARITY_THRESHOLD_FOR_ABSORPTION:
+            print(f"[QG_SERVICE ABSORB] Found best-fit KG theme '{best_match_q_set.main_category_name}' for SET ID '{set_question['id']}' with score {highest_score:.2f}")
+            return best_match_q_set
+        
+        print(f"[QG_SERVICE ABSORB] No suitable KG theme found for SET ID '{set_question['id']}'. Max score was {highest_score:.2f}.")
+        return None
 
     async def _prepare_and_upsert_theme_to_db(
         self,

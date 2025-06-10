@@ -676,13 +676,26 @@ class Neo4jService:
         print("PDF processing flow completed.")
 
 
-    async def get_relate(self, query, k):        
+    async def get_relate(self, query, k):     
         if not self.store:
             print("ERROR: Vector store not initialized in get_relate.")
             return []
         try:
             docs_with_score = await self.store.asimilarity_search_with_score(query, k=k)
-            return [doc for doc, score in docs_with_score]
+            
+            # --- ส่วนที่เพิ่มเข้ามาเพื่อลบ Embedding ---
+            cleaned_docs = []
+            for doc, score in docs_with_score:
+                # ตรวจสอบและลบ key 'embedding' ออกจาก metadata
+                if 'embedding' in doc.metadata:
+                    del doc.metadata['embedding']
+                if 'description_embedding' in doc.metadata:
+                    del doc.metadata['description_embedding']
+                cleaned_docs.append(doc)
+            # -----------------------------------------
+                
+            return cleaned_docs
+            
         except Exception as e_relate:
             print(f"Error in get_relate: {e_relate}")
             traceback.print_exc()
@@ -690,17 +703,32 @@ class Neo4jService:
 
     async def get_cypher_answer(self, query):
         url, username, password = self.__get_auth_env()
+        
+        # --- แก้ไข Cypher Query ตรงนี้ ---
         retrieval_query_for_entities = """
             OPTIONAL MATCH (node)-[rel*1..2]-(neighbor)
             WITH node, score, collect({
                 relationship: [r IN rel | type(r)], 
                 relationship_properties: [r IN rel | properties(r)], 
-                neighbor: neighbor {.*, description_embedding: Null}
+                neighbor: neighbor { 
+                    id: neighbor.id, 
+                    name: neighbor.name, 
+                    description: neighbor.description,
+                    labels: labels(neighbor)
+                }
             })[0..50] AS neighbors_and_relations
             RETURN coalesce(node.description, "No description available") AS text,
                 score,
-                node {.*, description_embedding: Null, neighbors_and_relations: neighbors_and_relations} AS metadata
+                {
+                    id: node.id,
+                    name: node.name,
+                    description: node.description,
+                    labels: labels(node),
+                    neighbors_and_relations: neighbors_and_relations
+                } AS metadata
         """
+        # ----------------------------------
+
         try:
             entity_vector_store = Neo4jVector.from_existing_index(
                 embedding=self.llm_embbedding,
@@ -713,7 +741,17 @@ class Neo4jService:
                 retrieval_query=retrieval_query_for_entities
             )
             docs = await entity_vector_store.asimilarity_search(query=query, k=3)
-            return f"{[doc.page_content + ' METADATA: ' + str(doc.metadata) for doc in docs]}" 
+            
+            # จัดรูปแบบผลลัพธ์ให้สวยงามขึ้น
+            context_parts = []
+            for doc in docs:
+                # ลบ embedding ที่อาจจะยังหลงเหลืออยู่ออกจาก metadata อีกชั้นหนึ่ง
+                if 'description_embedding' in doc.metadata:
+                    del doc.metadata['description_embedding']
+                context_parts.append(f"Entity Info: {doc.page_content}\nMETADATA: {str(doc.metadata)}")
+
+            return "\n---\n".join(context_parts)
+
         except ValueError as ve:
             print(f"CRITICAL ValueError in get_cypher_answer: {ve}")
             return "Could not retrieve answer from entity graph: entity description index NOT FOUND."
