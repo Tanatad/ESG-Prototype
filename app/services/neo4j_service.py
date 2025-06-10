@@ -23,6 +23,7 @@ from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTempla
 from pydantic import BaseModel
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
+from google.api_core.exceptions import InternalServerError, ServiceUnavailable
 load_dotenv()
 
 # ... (ส่วนของ Prompts และ Class RetrieveAnswer ไม่มีการเปลี่ยนแปลง) ...
@@ -446,9 +447,9 @@ class Neo4jService:
 
 
     async def _create_standard_document_and_chunks(self, 
-                                               file_name: str, 
-                                               translated_chunks: List[Document], 
-                                               standard_title: str = None):
+                                                file_name: str, 
+                                                translated_chunks: List[Document], 
+                                                standard_title: str = None):
         doc_id = file_name 
         doc_title = standard_title if standard_title else file_name
         
@@ -475,8 +476,17 @@ class Neo4jService:
             original_section_id = metadata.get('category', metadata.get('header_1', metadata.get('section', None)))
             page_number = metadata.get('page_number', None)
 
-            embedding_vector = await asyncio.to_thread(self.llm_embbedding.embed_query, chunk_text)
+            embedding_vector = None # <--- 1. กำหนดค่าเริ่มต้นเป็น None
+            try:
+                # --- 2. นี่คือจุดที่เรียก Google AI ---
+                embedding_vector = await asyncio.to_thread(self.llm_embbedding.embed_query, chunk_text)
             
+            except (InternalServerError, ServiceUnavailable) as e:
+                # --- 3. ถ้า Google มีปัญหา ให้ข้าม Chunk นี้ไป ---
+                print(f"WARNING: Google AI embedding failed for a chunk in doc '{created_doc_id}'. Skipping this chunk. Error: {e}")
+                continue # <-- คำสั่งให้ข้ามไปทำงานกับ chunk ต่อไปใน loop
+
+            # โค้ดส่วนที่เหลือจะทำงานก็ต่อเมื่อการสร้าง embedding สำเร็จ
             chunk_id = f"{created_doc_id}_chunk_{i:04d}"
 
             chunk_data_for_cypher = {
@@ -492,9 +502,9 @@ class Neo4jService:
             
             transformer_doc_metadata = {'chunk_id': chunk_id, 'doc_id': created_doc_id}
             if 'source_file_name' in metadata:
-                 transformer_doc_metadata['source_file_name'] = metadata['source_file_name']
+                    transformer_doc_metadata['source_file_name'] = metadata['source_file_name']
             if page_number is not None:
-                 transformer_doc_metadata['page_number'] = page_number
+                    transformer_doc_metadata['page_number'] = page_number
 
             chunk_details_for_graph_transformer.append(
                 Document(page_content=chunk_text, metadata=transformer_doc_metadata)
@@ -538,8 +548,8 @@ class Neo4jService:
         return chunk_details_for_graph_transformer
 
     async def _apply_llm_graph_transformer_to_chunks(self, 
-                                                chunk_documents: List[Document],
-                                                llm_transformer: LLMGraphTransformer):
+                                                    chunk_documents: List[Document],
+                                                    llm_transformer: LLMGraphTransformer):
         print(f"Applying LLMGraphTransformer to {len(chunk_documents)} chunk documents...")
         if not chunk_documents:
             return
@@ -573,6 +583,12 @@ class Neo4jService:
                 continue
             
             for node_in_gd in gd.nodes:
+                # --- START: เพิ่มการตรวจสอบ ID ตรงนี้ ---
+                if not node_in_gd.id or not node_in_gd.id.strip():
+                    print(f"WARNING: Skipping a node because it has a missing or empty ID. Node Type: {node_in_gd.type}, Source Chunk: {source_chunk_id}")
+                    continue # ข้ามไปยัง Node ถัดไป
+                # --- END: เพิ่มการตรวจสอบ ---
+
                 entity_id = node_in_gd.id
                 
                 link_params.append({

@@ -848,6 +848,7 @@ class QuestionGenerationService:
             d. **Governance & Oversight:** (e.g., "Who is responsible for overseeing...?", "How frequently is performance on this topic reviewed by management/board?")
         4. Be relevant to an industrial packaging factory.
         5. If evident from context (especially Standard Documents or specific KG entities), specify source (Source: Document Name - Section/Page OR Source: KG - Entity Name).
+        6.  **VERY IMPORTANT: Each sub-question MUST be a single, distinct question. DO NOT combine multiple questions into one sentence using "and" or by listing different topics.**
 
         Output ONLY a single, valid JSON object with these exact keys:
         - "rolled_up_sub_questions_text_en": A string containing ONLY 1-3 sub-questions, each numbered and on a new line.
@@ -2076,6 +2077,8 @@ class QuestionGenerationService:
         c. Performance & Metrics
         d. Governance & Oversight
     5.  Be relevant to an industrial packaging factory IF AND ONLY IF the context supports it.
+    6.  **VERY IMPORTANT: Each sub-question MUST be a single, distinct question. DO NOT combine multiple questions into one sentence using "and" or by listing different topics.**
+
 
     Output ONLY a single, valid JSON object with these exact keys:
     - "rolled_up_sub_questions_text_en": A string containing ONLY 2 sub-questions, each numbered and on a new line, OR the specific insufficiency message mentioned in instruction 3.
