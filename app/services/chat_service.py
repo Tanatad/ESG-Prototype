@@ -1,6 +1,6 @@
 from typing import List, Tuple
 from langchain_google_genai import ChatGoogleGenerativeAI
-from app.services.persistence.mongodb import AsyncMongoDBSaver
+from app.services.persistence.mongodb import MongoDBSaver
 from langgraph.graph import MessagesState
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -9,28 +9,26 @@ from app.services.neo4j_service import Neo4jService
 from langgraph.graph import END, StateGraph, START
 from langchain_core.documents import Document
 from dotenv import load_dotenv
-from app.services.rate_limit import llm_rate_limiter
+from app.services.rate_limit import RateLimiter as llm_rate_limiter
 import os
 from enum import Enum
+import time # Import time for debugging
 
 load_dotenv()
 
-# คลาสสำหรับบริการแปลภาษาโดยใช้ LLM
+RPM_LIMIT = int(os.getenv("REQUESTS_PER_MINUTE", "60"))
+
 class LLMTranslationService:
     def __init__(self, llm: ChatGoogleGenerativeAI):
         self.llm = llm
 
     async def translate(self, text: str, target_language: str) -> str:
-        """
-        แปลข้อความโดยใช้ LLM ที่กำหนด
-        """
         if not text or text.strip() == "":
             return ""
 
         lang_map = {"en": "English", "th": "Thai"}
         target_lang_name = lang_map.get(target_language, target_language)
         
-        # สร้าง Prompt สำหรับการแปลภาษา
         prompt = ChatPromptTemplate.from_messages(
             [
                 SystemMessage(
@@ -47,11 +45,9 @@ class LLMTranslationService:
         
         try:
             response = await chain.ainvoke({})
-            # คาดหวังว่า content จะเป็นข้อความที่แปลแล้ว
             return response.content.strip()
         except Exception as e:
-            print(f"LLM Translation failed: {e}")
-            # หากการแปลล้มเหลว ให้คืนค่าข้อความเดิมกลับไป
+            print(f"--- [ERROR] LLM Translation failed: {e}") # Added error print
             return text
 
 class ContextType(Enum):
@@ -66,52 +62,49 @@ class State(MessagesState):
     cypher_answer: str
     context_type: ContextType = ContextType.BOTH
     is_thai_question: bool = False
-    # --- ส่วนที่เพิ่มเข้ามา ---
-    # เพิ่ม state เพื่อเก็บคำถามที่จะใช้ใน RAG prompt
     question_for_prompt: str = None
-    # --- สิ้นสุดส่วนที่เพิ่มเข้ามา ---
 
 class ChatService:
     def __init__(self, 
-                 memory,
-                 Neo4jService: Neo4jService
-                 ):
+                 memory: MongoDBSaver,
+                 neo4j_service: Neo4jService
+                ):
         self.memory = memory
-        self.Neo4jService = Neo4jService
+        self.Neo4jService = neo4j_service
         self.graph = self.graph_workflow().compile(checkpointer=self.memory)
         self.llm = ChatGoogleGenerativeAI(
-            model=os.getenv("CHAT_MODEL","gemini-2.5-flash-preview-05-20"), #ปรับแก้เป็น Model ที่รองรับ Gemini API
-            max_retries=10,
-            rate_limiter=llm_rate_limiter
+            model=os.getenv("CHAT_MODEL", "gemini-2.5-flash-preview-05-20"), 
+            max_retries=2, # ลด retries ตอนดีบัก
+            rate_limiter=llm_rate_limiter(requests_per_minute=RPM_LIMIT) 
         )
         self.translator = LLMTranslationService(llm=self.llm)
         
     @classmethod
     async def create(cls):
-        url = os.getenv("MONGO_URL") or None
-        db_name = os.getenv("MONGO_DB_NAME") or None
+        url = os.getenv("MONGO_URL")
+        db_name = os.getenv("MONGO_DB_NAME")
 
-        async with AsyncMongoDBSaver.from_conn_info(
+        # เรียกใช้งานตรงๆ เพื่อรับ instance ที่การเชื่อมต่อยังคงอยู่
+        memory = await MongoDBSaver.from_conn_info(
             url=url, db_name=db_name
-        ) as memory:
-            neo4j_service = Neo4jService()
-            return cls(memory, neo4j_service)
+        )
+        
+        neo4j_service = Neo4jService()
+        return cls(memory, neo4j_service)
     
+    # ... (ส่วน _is_thai และ __asummarize_conversation ไม่ได้แก้ไข) ...
     def _is_thai(self, text: str) -> bool:
         for char in text:
             if "\u0E00" <= char <= "\u0E7F":
                 return True
         return False
     
-    async def __asummarize_conversation(self,state: State):
+    async def __asummarize_conversation(self, state: State):
         summary = state.get("summary", "")
-        if summary:
-            summary_message = (
-                f"This is summary of the conversation to date: {summary}\n\n"
-                "Extend the summary by taking into account the new messages above:"
-            )
-        else:
-            summary_message = "Create a summary of the conversation above:"
+        summary_message = (
+            f"This is a summary of the conversation to date: {summary}\n\n"
+            "Extend the summary by taking into account the new messages above:"
+        ) if summary else "Create a summary of the conversation above:"
 
         model = self.llm
         messages = state["messages"][-6:] + [HumanMessage(content=summary_message)]
@@ -119,115 +112,97 @@ class ChatService:
         
         return {"summary": response.content}
     
-    def __should_continue(self,state: State):
-        messages = state["messages"]
-        if len(messages) > 6:
+    def __should_continue(self, state: State):
+        if len(state["messages"]) > 6:
             return "summarize_conversation"
         return END
     
-    # --- ส่วนที่แก้ไข ---
-    async def __retrieve(self,state: State):
-        original_question = state.get("messages", "")[-1].content
+    async def __retrieve(self, state: State):
+        print("\n--- [DEBUG 1] Entered '__retrieve' node ---")
+        original_question = state["messages"][-1].content
+        print(f"--- [DEBUG 2] Original question: {original_question} ---")
         
         is_thai = self._is_thai(original_question)
-        question_for_retrieval = original_question
         
-        # ตรวจสอบว่าเป็นภาษาไทยหรือไม่
         if is_thai:
-            print(f"ตรวจพบคำถามภาษาไทย: '{original_question}'")
-            # แปลคำถามเป็นภาษาอังกฤษเพื่อใช้ในการ retrieve
+            print("--- [DEBUG 3] Thai question detected. Translating... ---")
             question_for_retrieval = await self.translator.translate(original_question, target_language="en")
-            print(f"แปลเป็นภาษาอังกฤษ: '{question_for_retrieval}'")
+            print(f"--- [DEBUG 4] Translated to English: {question_for_retrieval} ---")
+        else:
+            print("--- [DEBUG 3] English question detected. No translation needed. ---")
+            question_for_retrieval = original_question
         
-        # กำหนดคำถามที่จะใช้ใน Prompt สุดท้าย ให้เป็นภาษาอังกฤษเสมอหากมีการแปลเกิดขึ้น
-        question_for_final_prompt = question_for_retrieval
+        print("--- [DEBUG 5] Calling Neo4j service to get graph output... ---")
+        start_time = time.time()
+        retriever = await self.Neo4jService.get_output(question_for_retrieval, k=10)
+        end_time = time.time()
+        print(f"--- [DEBUG 6] Neo4j call finished. Took {end_time - start_time:.2f} seconds. ---")
         
-        # ดำเนินการ retrieve ด้วยคำถามภาษาอังกฤษ
-        retriever = await self.Neo4jService.get_output(question_for_retrieval,k=10)
-        
-        # คืนค่าต่างๆ พร้อมกับคำถามสำหรับ Prompt
-        return {
+        result = {
             "cypher_answer": retriever.cypher_answer, 
             "documents": retriever.relate_documents,
             "is_thai_question": is_thai,
-            "question_for_prompt": question_for_final_prompt 
+            "question_for_prompt": question_for_retrieval 
         }
-    # --- สิ้นสุดส่วนที่แก้ไข ---
+        print("--- [DEBUG 7] Exiting '__retrieve' node. ---")
+        return result
     
-    # --- ส่วนที่แก้ไข ---
-    async def __esg_model(self,state: State):
+    async def __esg_model(self, state: State):
+        print("\n--- [DEBUG 8] Entered '__esg_model' node ---")
         model = self.llm
-        context_type = state.get("context_type", ContextType.BOTH)
-        cypher_answer = ""
-        docs = []
-        
-        if context_type == ContextType.CYPHER:
-            cypher_answer = state.get("cypher_answer", "")  
-        elif context_type == ContextType.VECTOR:
-            docs = state.get("documents", [])
-        elif context_type == ContextType.BOTH:
-            cypher_answer = state.get("cypher_answer", "")
-            docs = state.get("documents", [])
-            
-        # ใช้ 'question_for_prompt' จาก state ซึ่งเป็นภาษาอังกฤษ
         question_to_use = state.get("question_for_prompt")
+        print(f"--- [DEBUG 9] Question for RAG prompt: {question_to_use} ---")
 
-        system_prompt, user_prompt = self.__prompt_rag(question_to_use,
-                                                       docs,
-                                                       cypher_answer)
-        prompt_template = ChatPromptTemplate([
+        docs = state.get("documents", [])
+        cypher_answer = state.get("cypher_answer", "")
+
+        system_prompt, user_prompt = self.__prompt_rag(question_to_use, docs, cypher_answer)
+        
+        prompt_template = ChatPromptTemplate.from_messages([
             system_prompt,
             MessagesPlaceholder("msgs"),
             user_prompt,
         ])
+        
         rag_chain = prompt_template | model 
-        messages = state["messages"]
-        summary = state.get("summary", "")
-        if summary:
-            system_message = f"Summary of conversation earlier: {summary}"
-            messages = [SystemMessage(content=system_message)] + state["messages"]
-        messages = trim_messages(
-            state["messages"],
-            max_tokens=90000,
-            strategy="last",
-            token_counter=self.llm,
-            allow_partial=False,
-        )
-        response = await rag_chain.ainvoke({"msgs": messages[:-1]})
+        
+        messages_to_send = state["messages"]
+        
+        print("--- [DEBUG 10] Calling main RAG chain (LLM)... ---")
+        start_time = time.time()
+        response = await rag_chain.ainvoke({"msgs": messages_to_send[:-1]})
+        end_time = time.time()
+        print(f"--- [DEBUG 11] Main RAG chain finished. Took {end_time - start_time:.2f} seconds. ---")
 
-        # หากคำถามตั้งต้นเป็นภาษาไทย ให้แปลคำตอบกลับเป็นไทย
         if state.get("is_thai_question", False):
-            print(f"ได้รับคำตอบเป็นภาษาอังกฤษ: '{response.content}'")
+            print("--- [DEBUG 12] Translating response back to Thai... ---")
             thai_content = await self.translator.translate(response.content, target_language="th")
-            print(f"แปลกลับเป็นภาษาไทย: '{thai_content}'")
             response = AIMessage(content=thai_content, id=response.id)
+            print("--- [DEBUG 13] Finished translating back to Thai. ---")
 
+        print("--- [DEBUG 14] Exiting '__esg_model' node. ---")
         return {"messages": [response]}
-    # --- สิ้นสุดส่วนที่แก้ไข ---
         
-    def __prompt_rag(self,question:str,documents: List[Document],structure:str) -> Tuple[SystemMessage, HumanMessage]:
+    # ... (ส่วน __prompt_rag, delete_by_thread_id, graph_workflow ไม่ได้แก้ไข) ...
+    def __prompt_rag(self, question: str, documents: List[Document], structure: str) -> Tuple[SystemMessage, HumanMessage]:
         context = "\n".join([doc.page_content for doc in documents])
-        system_prompt = f"""
-                                    You are an assistant for question-answering tasks.
-                                    You answer the question directly without 'Context: ' or 'Answer: '.
-                                    """
-        
-        # --- PROMPT ที่แก้ไขแล้ว ---
-        # เปลี่ยนจาก "concise and direct" เป็นการสั่งให้ตอบอย่างละเอียดและครอบคลุม
-        user_prompt = f"""
-                            Question: {question}
+        system_prompt_content = """
+You are an assistant for question-answering tasks.
+You answer the question directly without 'Context: ' or 'Answer: '.
+"""
+        user_prompt_content = f"""
+Question: {question}
 
-                            Use the provided context and structure to provide a comprehensive and detailed answer.
-                            Synthesize the information from the context to be as helpful as possible.
-                            If the context doesn’t provide enough information, use general knowledge to assist. If neither is sufficient, state that you don’t know the answer.
+Use the provided context and structure to provide a comprehensive and detailed answer.
+Synthesize the information from the context to be as helpful as possible.
+If the context doesn’t provide enough information, use general knowledge to assist. If neither is sufficient, state that you don’t know the answer.
 
-                            Structure: {structure}
-                            Context: {context}
-                                    """
-        
-        return SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)
+Structure: {structure}
+Context: {context}
+"""
+        return SystemMessage(content=system_prompt_content), HumanMessage(content=user_prompt_content)
     
-    async def delete_by_thread_id(self,thread_id: str):
+    async def delete_by_thread_id(self, thread_id: str):
         await self.memory.delete_by_thread_id(thread_id)
         
     def graph_workflow(self):
@@ -235,11 +210,16 @@ class ChatService:
         builder.add_node("retrieve", self.__retrieve)
         builder.add_node("esg_model", self.__esg_model)
         builder.add_node("summarize_conversation", self.__asummarize_conversation)
+        
         builder.add_edge(START, "retrieve")
         builder.add_edge("retrieve", "esg_model")
-        builder.add_conditional_edges("esg_model",self.__should_continue,{
-            "summarize_conversation": "summarize_conversation",
-            END: END
-        })
+        builder.add_conditional_edges(
+            "esg_model",
+            self.__should_continue,
+            {
+                "summarize_conversation": "summarize_conversation",
+                END: END
+            }
+        )
         builder.add_edge("summarize_conversation", END)
         return builder

@@ -2,10 +2,11 @@ import re
 import os
 import asyncio
 import inspect
+import logging
 import traceback
 import functools
 import neo4j
-from typing import IO, List, Optional
+from typing import IO, List, Optional, Dict, Any
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -18,9 +19,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.graphs.graph_document import GraphDocument, Node as GraphNode, Relationship as GraphRelationship
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_cohere import CohereEmbeddings
-from app.services.rate_limit import llm_rate_limiter
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from pydantic import BaseModel
+from fastapi import UploadFile
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from google.api_core.exceptions import InternalServerError, ServiceUnavailable
@@ -78,6 +79,7 @@ class Neo4jService:
         self.store = None
         self.graph = None
         self.environment = os.getenv("ENVIRONMENT", "development")
+        self.logger = logging.getLogger(__name__) # <--- เพิ่ม
         self.llm = ChatGoogleGenerativeAI(
             temperature=0.2,
             model=os.getenv("NEO4J_MODEL", "gemini-2.5-flash-preview-05-20"),
@@ -131,6 +133,115 @@ class Neo4jService:
                 print(f"Error initializing Azure Document Intelligence client: {e}")
                 traceback.print_exc()
 
+    async def find_semantically_similar_chunks(self, query_text: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """
+        Finds similar chunks using the async version of the vector store search.
+        """
+        if not self.store:
+            self.logger.warning("Vector store is not initialized. Cannot perform semantic search.")
+            return []
+        
+        try:
+            self.logger.info(f"Performing ASYNC semantic search for: '{query_text}'")
+            # --- CORRECTED: Use the async version of the similarity search method ---
+            similar_nodes_with_scores = await self.store.asimilarity_search_with_score(
+                query=query_text, 
+                k=top_k
+            )
+            # --------------------------------------------------------------------
+            
+            return [
+                {
+                    "text": node.page_content,
+                    "chunk_id": node.metadata.get("chunk_id", ""),
+                    "document_id": node.metadata.get("doc_id", ""),
+                    "score": score 
+                }
+                for node, score in similar_nodes_with_scores
+            ]
+        except Exception as e:
+            self.logger.error(f"Error during async semantic similarity search: {e}")
+            traceback.print_exc()
+            return []
+
+    async def run_document_pipeline(self, file: UploadFile):
+        """
+        Orchestrates the end-to-end processing of an uploaded file into the Knowledge Graph.
+        This function is called by the controller.
+        """
+        self.logger.info(f"Starting document pipeline for file: {file.filename}")
+        try:
+            # Read file content into memory
+            file_content = await file.read()
+            file_stream = IO[bytes](file_content)
+
+            # Use the existing `flow` method to process the single file
+            # We wrap the file stream and name in lists to match the `flow` method's signature
+            await self.flow(files=[file_stream], file_names=[file.filename])
+
+            self.logger.info(f"Successfully completed document pipeline for file: {file.filename}")
+
+        except Exception as e:
+            self.logger.error(f"Error in document pipeline for {file.filename}: {e}")
+            traceback.print_exc()
+            raise
+        finally:
+            await file.close()
+
+    ### NEW AND CORRECTED FUNCTION 2: Keyword-based chunk search ###
+    def find_chunks_by_keywords(self, keywords: List[str], top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Searches for StandardChunk nodes using a secure parameterized query.
+        The driver handles escaping of special characters in keywords.
+        """
+        if not keywords:
+            return []
+
+        self.logger.info(f"Searching for chunks with keywords using parameterized query: {keywords}")
+
+        # 1. Prepare parameters for the query
+        params = {}
+        where_clauses = []
+        for i, keyword in enumerate(keywords):
+            param_name = f"keyword_{i}"
+            # Add the keyword to the parameters dictionary
+            params[param_name] = keyword
+            # Use the parameter name (e.g., $keyword_0) in the Cypher query clause
+            where_clauses.append(f"toLower(chunk.text) CONTAINS toLower(${param_name})")
+
+        # 2. Construct the final query string with placeholders
+        query = f"""
+        MATCH (chunk:StandardChunk)
+        WHERE {' OR '.join(where_clauses)}
+        WITH chunk
+        LIMIT {top_k}
+        RETURN chunk.text AS text, chunk.chunk_id AS chunk_id, chunk.doc_id AS document_id
+        """
+
+        try:
+            # 3. Execute the query by passing the query string and the parameters dictionary
+            results = self.graph.query(query, parameters=params)
+            
+            if not results:
+                self.logger.info("No chunks found for the given keywords.")
+                return []
+
+            found_chunks = [
+                {
+                    "text": record["text"],
+                    "chunk_id": record["chunk_id"],
+                    "document_id": record["document_id"]
+                }
+                for record in results
+            ]
+            self.logger.info(f"Found {len(found_chunks)} chunks matching keywords.")
+            return found_chunks
+
+        except Exception as e:
+            self.logger.error(f"Error executing parameterized keyword search query in Neo4j: {e}")
+            traceback.print_exc()
+            return []
+        
     def init_graph(self, url=None, username=None, password=None):
         # --- START: แก้ไขกลับไปเป็นแบบเดิมที่ถูกต้อง ---
         if not self.graph:
@@ -380,7 +491,7 @@ class Neo4jService:
         )
         return await asyncio.to_thread(splitter.split_documents, documents)
 
-    async def translate_documents_with_openai(self, documents: List[Document], batch_size: int = 10):
+    async def translate_documents_with_gemini(self, documents: List[Document], batch_size: int = 10):
         def contains_thai(text: str) -> bool:
             thai_pattern = re.compile("[\u0E00-\u0E7F]")
             return bool(thai_pattern.search(text))
@@ -614,7 +725,7 @@ class Neo4jService:
 
     async def flow(self, files: List[IO[bytes]], file_names: List[str]):
         loop = asyncio.get_running_loop()
-
+        processed_doc_ids = []
         if self.document_intelligence_client:
             print("Using Azure Document Intelligence for PDF processing.")
             documents_from_pdf_loader = await self.read_PDFs_and_create_documents_azure(files, file_names)
@@ -631,7 +742,7 @@ class Neo4jService:
             print("No chunks were created after splitting. Aborting flow.")
             return
 
-        translated_chunks_lc_docs = await self.translate_documents_with_openai(split_chunks_lc_docs)
+        translated_chunks_lc_docs = await self.translate_documents_with_gemini(split_chunks_lc_docs)
         
         docs_by_source_file = {}
         for chunk_lc_doc in translated_chunks_lc_docs:
@@ -653,13 +764,23 @@ class Neo4jService:
             prompt=custom_esg_graph_extraction_prompt
         )
         
-        for file_name, chunks in docs_by_source_file.items():
+        for i, file_name in enumerate(file_names): # <-- ใช้ file_names ที่รับเข้ามาเป็นหลัก
+            # สร้าง doc_id ที่สอดคล้องกับ _create_standard_document_and_chunks
+            # ซึ่งใช้ file_name เป็น doc_id โดยตรง
+            doc_id = file_name
+            processed_doc_ids.append(doc_id) # <-- เก็บ doc_id ที่จะถูกสร้าง
+            
+            # ดึง chunks ของไฟล์ปัจจุบัน
+            chunks_for_this_file = docs_by_source_file.get(file_name)
+            if not chunks_for_this_file:
+                continue
+
             print(f"Processing file: {file_name}")
             standard_title_from_filename = file_name.split('_', 2)[-1].replace(".pdf", "").replace("_", " ")
 
             chunk_docs_with_ids_for_transformer = await self._create_standard_document_and_chunks(
                 file_name=file_name,
-                translated_chunks=chunks,
+                translated_chunks=chunks_for_this_file,
                 standard_title=standard_title_from_filename
             )
 
@@ -674,6 +795,8 @@ class Neo4jService:
         print("All files processed. Adding description embeddings...")
         await loop.run_in_executor(None, self.add_description_embeddings_to_nodes)
         print("PDF processing flow completed.")
+        
+        return processed_doc_ids # <-- เพิ่ม return statement ที่ท้ายฟังก์ชัน
 
 
     async def get_relate(self, query, k):     

@@ -177,3 +177,11 @@ tests/test_small/*.pdf
 
 dataset/
 figures/
+
+neo4j/data/
+neo4j/logs/
+neo4jbackup/
+esg-llm-mongo/
+
+neo4j/
+neo4jbackup/

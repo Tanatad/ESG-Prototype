@@ -4,6 +4,7 @@ from app.dependencies import get_chat_service
 from app.services.chat_service import ChatService
 from langchain_core.messages import SystemMessage, HumanMessage
 from fastapi.responses import JSONResponse
+import traceback # <--- FIX 1: เพิ่มการ import นี้
 
 router = APIRouter()
 
@@ -16,10 +17,23 @@ async def chat(
     try:
         config = {"configurable": {"thread_id": request.thread_id }}
         messages = ([SystemMessage(content=request.prompt)] if request.prompt else []) + [HumanMessage(content=request.question)]
+        
+        # จุดที่คาดว่าเกิด error อยู่ในบรรทัดนี้
         output = await chat_graph.ainvoke({"messages": messages}, config=config)
+        
         return ChatRagResponse(messages=output["messages"])
+
     except Exception as e:
+        # FIX 2: เพิ่ม 3 บรรทัดนี้เพื่อบังคับให้แสดง Traceback ใน Terminal
+        print("\n--- !!! AN EXCEPTION OCCURRED IN CHAT CONTROLLER !!! ---")
+        traceback.print_exc() # พิมพ์สาเหตุของ Error ทั้งหมดออกมา
+        print("--- !!! END OF EXCEPTION !!! ---\n")
+        
         raise HTTPException(status_code=500, detail=str(e))
+
+# --------------------------------------------------------------------
+# หมายเหตุ: Endpoint อื่นๆ ไม่จำเป็นต้องแก้ไข แต่ใส่ไว้เพื่อให้ไฟล์สมบูรณ์
+# --------------------------------------------------------------------
 
 @router.get("/{thread_id}", response_model=ChatRagResponse)
 async def read_chat_rag(

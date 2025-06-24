@@ -19,7 +19,7 @@ source .venv/bin/activate
 Execute the following command after creating the environment to install the necessary packages:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirement-win.txt
 ```
 
 If you install any new packages, update the `requirements.txt` file by running:
@@ -77,3 +77,12 @@ python -m app.main
 - MongoDB can be used locally.
 
 .\.myvenv_py312\Scripts\activate
+
+MATCH (n) DETACH DELETE n;
+DROP INDEX entity_description_embedding_index IF EXISTS;
+DROP INDEX standard_chunk_embedding_index IF EXISTS;
+DROP CONSTRAINT standard_chunk_chunk_id IF EXISTS;
+DROP CONSTRAINT standard_document_doc_id IF EXISTS;
+DROP CONSTRAINT constraint_907a464e IF EXISTS;
+
+streamlit run streamlit_app.py  

@@ -12,66 +12,46 @@ from app.models.esg_question_model import ESGQuestion
 
 router = APIRouter()
 
-@router.post("/uploadfile", summary="Upload files to build KG and evolve questions automatically.")
-async def uploadfile(
+@router.post("/uploadfile", status_code=202)
+async def upload_file(
+    files: List[UploadFile],
     background_tasks: BackgroundTasks,
-    files: List[UploadFile] = File(..., description="One or more PDF files to process into the Knowledge Graph."),
     neo4j_service: Neo4jService = Depends(get_neo4j_service),
     qg_service: QuestionGenerationService = Depends(get_question_generation_service)
 ):
-    print(f"[CONTROLLER LOG /uploadfile] Received {len(files)} file(s).")
-    start_req_time = time.time()
-
-    if not files:
-        return JSONResponse(content={"error": "No files received."}, status_code=400)
-
-    file_data_for_neo4j: List[Tuple[str, BytesIO]] = []
-    original_filenames_for_log: List[str] = []
-
+    """
+    This endpoint ingests a list of documents into the knowledge graph
+    and triggers the question evolution process as a background task.
+    """
     try:
-        for i, file_upload in enumerate(files):
-            original_filenames_for_log.append(file_upload.filename)
-            content = await file_upload.read()
-            processed_filename = f"files_{i}_{file_upload.filename}" 
-            file_data_for_neo4j.append((processed_filename, BytesIO(content)))
-            await file_upload.close()
+        print(f"[CONTROLLER LOG /uploadfile] Received {len(files)} file(s).")
+        
+        # เตรียมไฟล์สำหรับส่งให้ service
+        file_streams = [file.file for file in files]
+        file_names = [file.filename for file in files]
+        
+        print("[CONTROLLER LOG /uploadfile] Calling neo4j_service.flow to ingest data...")
+        
+        # --- CORRECTED PART ---
+        # รับค่า document_ids ที่ประมวลผลเสร็จแล้วกลับมา
+        processed_doc_ids = await neo4j_service.flow(files=file_streams, file_names=file_names)
+        
+        print(f"[CONTROLLER LOG /uploadfile] Ingestion complete. Triggering background question evolution for doc_ids: {processed_doc_ids}")
+        
+        # ส่ง document_ids เข้าไปใน background task
+        background_tasks.add_task(
+            qg_service.evolve_and_store_questions,
+            document_ids=processed_doc_ids,
+            is_baseline_upload=True # สมมติว่าการอัปโหลดผ่าน Endpoint นี้เป็น Baseline เสมอ
+        )
+        # --- END CORRECTED PART ---
+
+        return {"message": f"Successfully started processing for {len(files)} files. Question evolution is running in the background."}
+
     except Exception as e:
-        return JSONResponse(content={"error": f"Error during file reading: {str(e)}"}, status_code=500)
-
-    try:
-        if file_data_for_neo4j:
-            print(f"[CONTROLLER LOG /uploadfile] Calling neo4j_service.flow to ingest data...")
-            streams_only = [fs_tuple[1] for fs_tuple in file_data_for_neo4j]
-            names_only = [fs_tuple[0] for fs_tuple in file_data_for_neo4j]
-            # --- START: ส่วนที่แก้ไข ---
-            await neo4j_service.flow(streams_only, names_only) # ไม่ต้องรับค่าใส่ตัวแปร
-            # --- END: ส่วนที่แก้ไข ---
-            print("[CONTROLLER LOG /uploadfile] KG ingestion completed.")
-    except Exception as e:
-        return JSONResponse(content={"error": f"Error processing files for Knowledge Graph: {str(e)}"}, status_code=500)
-
-    active_questions_count = await ESGQuestion.find(ESGQuestion.is_active == True).count()
-    is_baseline_upload_automated = (active_questions_count == 0)
-    
-    print(f"[CONTROLLER LOG /uploadfile] Auto-detected baseline mode: {is_baseline_upload_automated} (Active questions in DB: {active_questions_count})")
-
-    background_tasks.add_task(
-        qg_service.evolve_and_store_questions,
-        is_baseline_upload=is_baseline_upload_automated
-    )
-
-    print("[CONTROLLER LOG /uploadfile] Question AI evolution task added to background.")
-    
-    req_duration = time.time() - start_req_time
-    print(f"[CONTROLLER LOG /uploadfile] Request successfully completed in {req_duration:.4f} seconds.")
-    return JSONResponse(
-        content={
-            "status": "Success", 
-            "message": f"Successfully processed {len(file_data_for_neo4j)} files. Question AI evolution (Auto-Detected Baseline={is_baseline_upload_automated}) triggered.",
-            "original_filenames": original_filenames_for_log,
-        }, 
-        status_code=202
-    )
+        print(f"[CONTROLLER ERROR /uploadfile] Error during file upload processing: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/query", response_model=GraphRagResponse)
 async def query(

@@ -1,58 +1,82 @@
-# ใน esg_question_model.py
+# file: app/models/esg_question_model.py
+
 from beanie import Document
-from pydantic import BaseModel, Field # Field จาก pydantic โดยตรงสำหรับ sub-model
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field
+from typing import Optional, List, Any
 from datetime import datetime, timezone
 
-class SubQuestionDetail(BaseModel): # Pydantic BaseModel สำหรับรายละเอียดของ Sub-Question
+# --- Sub-Models (These are already Schemas, no changes needed) ---
+
+class RelatedSETQuestion(BaseModel):
+    set_id: str = Field(..., description="The unique identifier for the SET benchmark question.")
+    title_th: str = Field(..., description="The Thai title or question text of the SET benchmark.")
+    relevance_score: Optional[float] = Field(None, description="The calculated relevance score.")
+
+class SubQuestionDetail(BaseModel):
     sub_question_text_en: str
     sub_question_text_th: Optional[str] = None
-    sub_theme_name: str # ชื่อของ Consolidated Sub-Theme ที่ Sub-Question นี้เกี่ยวข้อง
-    category_dimension: str # E, S, G dimension ของ Sub-Theme นี้
+    sub_theme_name: str
+    category_dimension: str
     keywords: Optional[str] = None
-    theme_description_en: Optional[str] = None # Description ของ Sub-Theme นี้
+    theme_description_en: Optional[str] = None
     theme_description_th: Optional[str] = None
     constituent_entity_ids: List[str] = Field(default_factory=list)
     source_document_references: List[str] = Field(default_factory=list)
-    detailed_source_info: Optional[str] = None # Detailed source info for this set of sub-questions
-    # เพิ่ม metadata ที่เฉพาะเจาะจงกับ sub-question นี้ได้ถ้าต้องการ
-    # เช่น _first_order_community_id_source
+    detailed_source_info: Optional[str] = None
 
-class ESGQuestion(Document): # Document นี้จะแทน Main Category/Main Theme และ Main Question ของมัน
-    # --- Main Category / Main Theme Information ---
-    theme: str = Field(..., description="The Main ESG Category name.") # ชัดเจนว่าเป็น Main Category
-    category: str = Field(..., description="The primary ESG dimension (E, S, G) for this Main Category.")
-    keywords: Optional[str] = Field(None, description="Keywords for this Main Category.")
-    theme_description_en: Optional[str] = Field(None, description="English description of this Main Category.")
+# --- START OF FIX ---
+
+# --- 1. สร้าง Schema (พิมพ์เขียวข้อมูล) ---
+# คลาสนี้ใช้สำหรับเก็บข้อมูลและแสดงผล โดยไม่จำเป็นต้อง Initialize Beanie
+class ESGQuestionSchema(BaseModel):
+    # เพิ่ม field 'id' เพื่อรับค่า '_id' จาก MongoDB ได้อย่างถูกต้อง
+    id: Any = Field(None, alias="_id")
+
+    # --- คัดลอก Fields ทั้งหมดจาก ESGQuestion เดิมมาไว้ที่นี่ ---
+    # Core Content Fields
+    theme: str = Field(..., description="The main theme or category name of the question set.", index=True)
+    category: str = Field(..., description="The primary ESG dimension (E, S, or G).")
+    main_question_text_en: str = Field(..., description="The main, high-level question.")
+    
+    # Optional Descriptive Fields
+    keywords: Optional[str] = None
+    theme_description_en: Optional[str] = None
+    
+    # Translated Fields
+    theme_th: Optional[str] = None
+    main_question_text_th: Optional[str] = None
     theme_description_th: Optional[str] = None
     
-    # --- Main Question for this Main Category ---
-    main_question_text_en: str = Field(..., description="The single, open-ended Main Question for this Main Category.")
-    main_question_text_th: Optional[str] = None
-    
-    # --- Sub-Questions related to this Main Category ---
-    # แต่ละ item ใน list นี้คือชุดของ sub-questions ที่มาจาก consolidated sub-theme หนึ่งๆ
-    sub_questions_sets: List[SubQuestionDetail] = Field(default_factory=list, description="List of sub-question sets, each corresponding to a consolidated sub-theme under this main category.")
+    # Structured Data
+    sub_questions_sets: List[SubQuestionDetail] = Field(default_factory=list)
+    related_set_questions: List[RelatedSETQuestion] = Field(default_factory=list)
 
-    # --- Context and Source Information for the Main Category overall ---
-    # (อาจจะเก็บ constituent entities และ source docs ของ Main Category โดยรวมไว้ที่นี่)
-    main_category_constituent_entity_ids: List[str] = Field(default_factory=list)
-    main_category_source_document_references: List[str] = Field(default_factory=list)
+    # Metadata Fields
+    is_active: bool = Field(default=True, index=True)
+    version: int = Field(default=1, index=True)
+    generation_method: Optional[str] = None
     
-    # --- Versioning and Status for the Main Category/Question document ---
-    validation_status: Optional[str] = None
-    version: int = 1
-    is_active: bool = True
+    # Timestamps
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    
-    # --- Provenance and Metadata ---
-    generation_method: Optional[str] = Field(None, description="Method used to generate this Main Category and its questions.")
-    metadata_extras: Optional[Dict[str, Any]] = Field(None, description="Extra metadata, e.g., _main_category_raw_id.")
 
+    class Config:
+        # อนุญาตให้ Pydantic map ข้อมูลจาก key '_id' ใน MongoDB มาใส่ใน field 'id' ของโมเดลได้
+        populate_by_name = True
+        # ป้องกัน Error หากมี field เกินมาในข้อมูลจาก DB
+        extra = "ignore" 
+
+# --- 2. สร้าง Document (ตัวคุยกับ DB) ให้สืบทอดจาก Schema ---
+# คลาสนี้จะถูกใช้โดยส่วนอื่นๆ ของแอปที่ทำงานกับ Beanie แบบ Async
+class ESGQuestion(Document, ESGQuestionSchema):
+    # ไม่ต้องประกาศ Fields ซ้ำซ้อนอีกต่อไป เพราะมันสืบทอดมาจาก ESGQuestionSchema แล้ว
+    
+    # มีแค่ Settings ที่เป็นของ Beanie โดยเฉพาะ
     class Settings:
-        name = "esg_hierarchical_questions_denormalized" # ใช้ชื่อ collection ใหม่ที่ชัดเจน
-        # indexes = [
-        #     "theme", # Main Category Name
-        #     "is_active",
-        # ]
+        name = "esg_questions_final" # ชื่อ collection ที่ถูกต้องของคุณ
+        indexes = [
+            [("theme", 1), ("version", -1)],
+            [("is_active", 1)], 
+        ]
+
+# --- END OF FIX ---

@@ -1,21 +1,64 @@
-from langchain_core.rate_limiters import InMemoryRateLimiter
+# app/services/rate_limit.py
 
-max_tokens_per_request = 5000
+import time
+from typing import Any, Optional
+import asyncio
 
-# test file: รายงานนโยบายและเอกสารด้าน ESG.pdf
-# Free tier: test file ~ 2 mins
-max_tpm = 1000000  
-max_rpm = 1000
+# Import BaseRateLimiter จาก LangChain
+from langchain_core.rate_limiters import BaseRateLimiter
 
-# Paid tier 1: test file ~ 35 secs
-# max_tpm = 4000000
-# max_rpm = 2000
 
-tokens_per_second = max_tpm / 60  # Tokens per second
-requests_per_second = max_rpm / 60  # Requests per second
+# คลาสของเราสืบทอดจาก BaseRateLimiter
+class RateLimiter(BaseRateLimiter):
+    """A simple rate limiter that enforces a certain number of requests per minute."""
 
-llm_rate_limiter = InMemoryRateLimiter(
-    requests_per_second=requests_per_second,
-    check_every_n_seconds=0.1,  # You can adjust this interval if needed
-    max_bucket_size=max_tpm // max_tokens_per_request  # Maximum number of tokens allowed in the bucket
-)
+    def __init__(self, requests_per_minute: int):
+        """
+        Initializes the rate limiter.
+
+        Args:
+            requests_per_minute: The maximum number of requests allowed per minute.
+        """
+        self.requests_per_minute = requests_per_minute
+        self.token_interval = 60.0 / self.requests_per_minute
+        self.last_request_time: Optional[float] = None
+
+    def acquire(self, **kwargs: Any) -> None:
+        """
+        Acquires a token, blocking if necessary until a token is available.
+        This method is called by LangChain before making a request.
+        """
+        while True:
+            current_time = time.monotonic()
+            if (
+                self.last_request_time is None
+                or (current_time - self.last_request_time) >= self.token_interval
+            ):
+                self.last_request_time = current_time
+                return
+            
+            sleep_time = self.token_interval - (current_time - self.last_request_time)
+            time.sleep(sleep_time)
+
+    async def aacquire(self, **kwargs: Any) -> None:
+        """
+        Asynchronously acquires a token, yielding control if necessary until a token is available.
+        This method is called by LangChain for async operations.
+        """
+        while True:
+            current_time = time.monotonic()
+            if (
+                self.last_request_time is None
+                or (current_time - self.last_request_time) >= self.token_interval
+            ):
+                self.last_request_time = current_time
+                return
+
+            sleep_time = self.token_interval - (current_time - self.last_request_time)
+            await asyncio.sleep(sleep_time)
+
+    # --- FIX: เพิ่มเมธอดนี้เข้าไปเพื่อรองรับโค้ดส่วนที่เรียกใช้ .wait() ---
+    def wait(self, **kwargs: Any) -> None:
+        """An alias for the acquire method for compatibility with older patterns."""
+        # ทำให้ wait() ทำงานเหมือน acquire() ทุกประการ
+        self.acquire(**kwargs)
