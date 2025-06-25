@@ -982,26 +982,50 @@ class QuestionGenerationService:
     
             # --- ฟังก์ชันนี้คือเวอร์ชันสมบูรณ์ที่เติมโค้ดส่วนที่ขาดไปแล้ว ---
     async def evolve_and_store_questions(self, document_ids: List[str], is_baseline_upload: bool = False):
-        """
-        Orchestrates question evolution with the new two-phase architecture.
-        """
-        self.logger.info(f"Starting NEW architecture for question evolution. Baseline: {is_baseline_upload}")
-
+        self.logger.info(f"Starting 2-PASS question evolution (Simple Strategy). Baseline: {is_baseline_upload}")
+        
         # --- PHASE 0: SETUP ---
+        all_set_benchmarks = self.mongodb_service.get_set_benchmark_questions()
         if not all_set_benchmarks:
             self.logger.error("Could not load SET benchmark questions. Aborting.")
             return
 
-        # --- PHASE 1: SET-DRIVEN QUESTION GENERATION (Top-Down) ---
-        self.logger.info("--- PHASE 1: Starting SET-Driven Question Generation ---")
-        set_driven_tasks = [
-            self._find_evidence_and_generate_for_set_q(set_q) for set_q in all_set_benchmarks
-        ]
-        set_driven_results = await asyncio.gather(*set_driven_tasks)
-        set_driven_questions = [q for q in set_driven_results if q is not None]
-        self.logger.info(f"PHASE 1 Complete: Generated {len(set_driven_questions)} questions based on SET benchmarks and available evidence.")
+        # --- PHASE 1, ROUND 1: Standard Search (High Precision) ---
+        self.logger.info("--- ROUND 1: Starting Standard Search using 'Theme: Question' ---")
+        
+        generated_questions_r1 = []
+        # เราจะใช้ asyncio.gather เพื่อรันพร้อมกันทั้งหมด
+        tasks_r1 = [self._find_evidence_and_generate_for_set_q(set_q) for set_q in all_set_benchmarks]
+        results_r1 = await asyncio.gather(*tasks_r1)
+        generated_questions_r1 = [q for q in results_r1 if q is not None]
+        
+        # หาว่าคำถาม SET ID ไหนที่ถูกสร้างไปแล้วในรอบแรก
+        covered_set_ids_r1 = {item['related_set_questions'][0].set_id for item in generated_questions_r1 if item.get('related_set_questions')}
+        
+        self.logger.info(f"ROUND 1 Complete: Generated {len(generated_questions_r1)} questions, covering {len(covered_set_ids_r1)} SET IDs.")
 
-        # --- PHASE 2: KG-DRIVEN QUESTION GENERATION (Bottom-Up) ---
+        # --- PHASE 1, ROUND 2: Broader Search for Uncovered Questions ---
+        uncovered_set_qs = [q for q in all_set_benchmarks if q['id'] not in covered_set_ids_r1]
+        generated_questions_r2 = []
+        if uncovered_set_qs:
+            self.logger.info(f"--- ROUND 2: Starting Broader Search for {len(uncovered_set_qs)} uncovered SET questions ---")
+            
+            # ในรอบที่ 2 เราจะสร้าง task สำหรับคำถามที่ยังไม่ถูกค้นพบเท่านั้น
+            tasks_r2 = []
+            for set_q in uncovered_set_qs:
+                # สร้างคำค้นหาแบบกว้าง โดยใช้เฉพาะเนื้อหาคำถาม
+                broad_query = set_q.get('question_text_en', '')
+                tasks_r2.append(self._find_evidence_and_generate_for_set_q(set_q, custom_query=broad_query))
+
+            results_r2 = await asyncio.gather(*tasks_r2)
+            generated_questions_r2 = [q for q in results_r2 if q is not None]
+
+        self.logger.info(f"ROUND 2 Complete: Generated {len(generated_questions_r2)} additional questions.")
+        
+        # --- PHASE 1.5: Combine all SET-Driven questions ---
+        set_driven_questions = generated_questions_r1 + generated_questions_r2
+        
+        # --- PHASE 2 & 3 (KG-Driven and Integration) remain the same ---
         self.logger.info("--- PHASE 2: Starting KG-Driven Question Generation for Extended Coverage ---")
         organic_themes = await self._run_adaptive_theme_identification()
         kg_driven_questions = []
@@ -1012,7 +1036,6 @@ class QuestionGenerationService:
                 if is_redundant:
                     self.logger.info(f"Skipping redundant organic theme: '{theme.get('main_category_name_en')}'")
                     continue
-
                 q_set_obj = await self.generate_question_for_theme_level(theme)
                 if q_set_obj:
                     q_dict = await self._convert_gqs_to_final_dict(q_set_obj, theme)
@@ -1020,7 +1043,6 @@ class QuestionGenerationService:
         
         self.logger.info(f"PHASE 2 Complete: Generated {len(kg_driven_questions)} unique, organic questions.")
 
-        # --- PHASE 3: INTEGRATION & STORAGE ---
         self.logger.info("--- PHASE 3: Integrating all generated questions into the database ---")
         all_candidate_questions = set_driven_questions + kg_driven_questions
 
@@ -1033,7 +1055,7 @@ class QuestionGenerationService:
                 existing = await ESGQuestion.find_one({"theme": candidate_dict['theme']})
                 if not existing:
                     self.logger.info(f"[BASELINE] Adding new question for theme: {candidate_dict.get('theme')}")
-                    await self.mongodb_service.store_esg_question(ESGQuestion(**candidate_dict))
+                    await ESGQuestion(**candidate_dict).insert()
                 else:
                     self.logger.info(f"[BASELINE] Theme '{candidate_dict.get('theme')}' already exists. Skipping.")
             else:
@@ -1117,14 +1139,19 @@ class QuestionGenerationService:
 
 # ในคลาส QuestionGenerationService
 
-    async def _find_evidence_and_generate_for_set_q(self, set_question: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def _find_evidence_and_generate_for_set_q(self, set_question: Dict[str, Any], custom_query: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Finds evidence, generates questions, AND translates them for SET-Driven questions.
+        Finds evidence and generates questions. Can accept a custom query for the 2nd pass.
         """
-        set_topic_query = f"{set_question.get('theme_set', '')}: {set_question.get('question_text_en', '')}"
-        self.logger.info(f"Searching for evidence for SET ID: {set_question.get('id')}")
+        # ถ้ามี custom_query มาให้ใช้เลย, ถ้าไม่มีให้สร้างแบบปกติ
+        if custom_query:
+            search_query = custom_query
+        else:
+            search_query = f"{set_question.get('theme_set', '')}: {set_question.get('question_text_en', '')}"
 
-        evidence_chunks = await self.neo4j_service.find_semantically_similar_chunks(query_text=set_topic_query, top_k=3)
+        self.logger.info(f"Searching for evidence for SET ID: {set_question.get('id')} using query: '{search_query[:100]}...'")
+
+        evidence_chunks = await self.neo4j_service.find_semantically_similar_chunks(query_text=search_query, top_k=3)
         if not evidence_chunks:
             return None
 
@@ -1139,7 +1166,7 @@ class QuestionGenerationService:
 
         prompt =  f"""
         You are an expert ESG analyst creating a detailed questionnaire.
-        The main topic is the SET benchmark question: "{set_topic_query}"
+        The main topic is the SET benchmark question: "{search_query}"
 
         Based ONLY on the following context extracted from company documents, formulate 2-4 specific and actionable sub-questions that explore the main topic in detail. The sub-questions must be directly answerable from the provided context. Do not invent questions if the context is insufficient.
 
@@ -1152,11 +1179,10 @@ class QuestionGenerationService:
         """
 
         try:
-            # ใช้ self.qg_llm ที่ถูกกำหนดค่าอย่างถูกต้องใน __init__ แล้ว
             response_object = await self.qg_llm.ainvoke(prompt)
             result = self._extract_json_from_llm_output(response_object.content)
             
-            if not result:
+            if not result or not result.get("sub_questions"):
                 return None
 
             sub_questions_list = result.get("sub_questions", [])
@@ -1193,7 +1219,7 @@ class QuestionGenerationService:
                         sub_question_text_th=sub_q_text_th,
                         sub_theme_name=f"Details for {set_question.get('id')}",
                         category_dimension=set_question.get('dimension'),
-                        detailed_source_info=f"Generated from evidence chunks related to '{set_topic_query}'"
+                        detailed_source_info=f"Generated from evidence chunks related to '{search_query}'"
                     )
                 ],
                 "related_set_questions": [related_set_q_obj],
