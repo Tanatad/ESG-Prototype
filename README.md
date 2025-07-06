@@ -85,4 +85,4 @@ DROP CONSTRAINT standard_chunk_chunk_id IF EXISTS;
 DROP CONSTRAINT standard_document_doc_id IF EXISTS;
 DROP CONSTRAINT constraint_907a464e IF EXISTS;
 
-streamlit run streamlit_app.py  
+streamlit run streamlit_app.py

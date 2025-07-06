@@ -6,7 +6,7 @@ import logging
 import traceback
 import functools
 import neo4j
-from typing import IO, List, Optional, Dict, Any
+from typing import IO, List, Optional, Dict, Any, Tuple
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -143,19 +143,22 @@ class Neo4jService:
         
         try:
             self.logger.info(f"Performing ASYNC semantic search for: '{query_text}'")
-            # --- CORRECTED: Use the async version of the similarity search method ---
             similar_nodes_with_scores = await self.store.asimilarity_search_with_score(
                 query=query_text, 
                 k=top_k
             )
-            # --------------------------------------------------------------------
             
+            # This part is crucial: we need to get the entity IDs linked to the chunk
+            chunk_ids = [node.metadata.get("chunk_id") for node, score in similar_nodes_with_scores if node.metadata.get("chunk_id")]
+            entity_map = await self._get_entities_for_chunks(chunk_ids)
+
             return [
                 {
                     "text": node.page_content,
                     "chunk_id": node.metadata.get("chunk_id", ""),
                     "document_id": node.metadata.get("doc_id", ""),
-                    "score": score 
+                    "score": score,
+                    "entity_ids": entity_map.get(node.metadata.get("chunk_id"), []) # Add the entity IDs here
                 }
                 for node, score in similar_nodes_with_scores
             ]
@@ -164,26 +167,87 @@ class Neo4jService:
             traceback.print_exc()
             return []
 
+    async def _get_entities_for_chunks(self, chunk_ids: List[str]) -> Dict[str, List[str]]:
+        """Given a list of chunk IDs, returns a map of chunk_id -> [entity_id_1, entity_id_2, ...]."""
+        if not chunk_ids:
+            return {}
+        
+        query = """
+        UNWIND $chunk_ids AS c_id
+        MATCH (sc:StandardChunk {chunk_id: c_id})-[:CONTAINS_ENTITY]->(e:__Entity__)
+        RETURN c_id, COLLECT(e.id) AS entity_ids
+        """
+        try:
+            results = await asyncio.to_thread(self.graph.query, query, params={'chunk_ids': chunk_ids})
+            return {record['c_id']: record['entity_ids'] for record in results}
+        except Exception as e:
+            self.logger.error(f"Error fetching entities for chunks: {e}")
+            return {}
+
+    async def get_chunks_by_standard_code(self, standard_code: str) -> List[Dict[str, Any]]:
+        """
+        Retrieves all StandardChunk nodes that have a specific `standard_code`.
+        This is used for the targeted discovery phase (Phase 2).
+        """
+        if not self.graph:
+            self.logger.error("Neo4j graph not initialized. Cannot get chunks by standard code.")
+            return []
+
+        self.logger.info(f"Fetching chunks for specific standard_code: {standard_code}")
+        
+        query = """
+        MATCH (sc:StandardChunk {standard_code: $standard_code})
+        // Also collect the IDs of entities contained within each chunk
+        OPTIONAL MATCH (sc)-[:CONTAINS_ENTITY]->(e:__Entity__)
+        RETURN 
+            sc.chunk_id AS chunk_id,
+            sc.text AS text,
+            sc.doc_id AS doc_id,
+            sc.page_number AS page_number,
+            collect(e.id) AS entity_ids
+        """
+        try:
+            params = {'standard_code': standard_code}
+            results = await asyncio.to_thread(self.graph.query, query, params=params)
+            
+            if not results:
+                self.logger.warning(f"No chunks found with standard_code: {standard_code}")
+                return []
+
+            # Format the results into a list of dictionaries
+            formatted_results = [
+                {
+                    "chunk_id": record["chunk_id"],
+                    "text": record["text"],
+                    "doc_id": record["doc_id"],
+                    "page_number": record["page_number"],
+                    "entity_ids": record["entity_ids"] # This will be a list of entity IDs
+                }
+                for record in results
+            ]
+            self.logger.info(f"Found {len(formatted_results)} chunks for standard_code: {standard_code}")
+            return formatted_results
+
+        except Exception as e:
+            self.logger.error(f"Error executing get_chunks_by_standard_code for '{standard_code}': {e}", exc_info=True)
+            return []
+
     async def run_document_pipeline(self, file: UploadFile):
         """
         Orchestrates the end-to-end processing of an uploaded file into the Knowledge Graph.
-        This function is called by the controller.
         """
         self.logger.info(f"Starting document pipeline for file: {file.filename}")
         try:
-            # Read file content into memory
             file_content = await file.read()
+            # It's important to create a new IO stream for each use or reset it
             file_stream = IO[bytes](file_content)
 
-            # Use the existing `flow` method to process the single file
-            # We wrap the file stream and name in lists to match the `flow` method's signature
             await self.flow(files=[file_stream], file_names=[file.filename])
 
             self.logger.info(f"Successfully completed document pipeline for file: {file.filename}")
 
         except Exception as e:
-            self.logger.error(f"Error in document pipeline for {file.filename}: {e}")
-            traceback.print_exc()
+            self.logger.error(f"Error in document pipeline for {file.filename}: {e}", exc_info=True)
             raise
         finally:
             await file.close()
@@ -192,24 +256,19 @@ class Neo4jService:
     def find_chunks_by_keywords(self, keywords: List[str], top_k: int = 5) -> List[Dict[str, Any]]:
         """
         Searches for StandardChunk nodes using a secure parameterized query.
-        The driver handles escaping of special characters in keywords.
         """
         if not keywords:
             return []
 
         self.logger.info(f"Searching for chunks with keywords using parameterized query: {keywords}")
 
-        # 1. Prepare parameters for the query
         params = {}
         where_clauses = []
         for i, keyword in enumerate(keywords):
             param_name = f"keyword_{i}"
-            # Add the keyword to the parameters dictionary
             params[param_name] = keyword
-            # Use the parameter name (e.g., $keyword_0) in the Cypher query clause
             where_clauses.append(f"toLower(chunk.text) CONTAINS toLower(${param_name})")
 
-        # 2. Construct the final query string with placeholders
         query = f"""
         MATCH (chunk:StandardChunk)
         WHERE {' OR '.join(where_clauses)}
@@ -219,14 +278,13 @@ class Neo4jService:
         """
 
         try:
-            # 3. Execute the query by passing the query string and the parameters dictionary
             results = self.graph.query(query, parameters=params)
             
             if not results:
                 self.logger.info("No chunks found for the given keywords.")
                 return []
 
-            found_chunks = [
+            return [
                 {
                     "text": record["text"],
                     "chunk_id": record["chunk_id"],
@@ -234,12 +292,8 @@ class Neo4jService:
                 }
                 for record in results
             ]
-            self.logger.info(f"Found {len(found_chunks)} chunks matching keywords.")
-            return found_chunks
-
         except Exception as e:
-            self.logger.error(f"Error executing parameterized keyword search query in Neo4j: {e}")
-            traceback.print_exc()
+            self.logger.error(f"Error executing parameterized keyword search query in Neo4j: {e}", exc_info=True)
             return []
         
     def init_graph(self, url=None, username=None, password=None):
@@ -558,105 +612,64 @@ class Neo4jService:
 
 
     async def _create_standard_document_and_chunks(self, 
-                                                file_name: str, 
-                                                translated_chunks: List[Document], 
-                                                standard_title: str = None):
-        doc_id = file_name 
+                                                 file_name: str, 
+                                                 translated_chunks: List[Document], 
+                                                 standard_title: Optional[str] = None,
+                                                 # --- FIX 2: เพิ่ม parameter `standard_code` ---
+                                                 standard_code: Optional[str] = None):
+        doc_id = file_name
         doc_title = standard_title if standard_title else file_name
         
-        merge_doc_query = """
-        MERGE (d:StandardDocument {doc_id: $doc_id})
-        ON CREATE SET d.title = $title, d.source_file_name = $source_file_name, d.last_processed_timestamp = timestamp()
-        ON MATCH SET d.title = $title, d.source_file_name = $source_file_name, d.last_processed_timestamp = timestamp()
-        RETURN d.doc_id AS document_id
-        """
-        doc_result = await asyncio.to_thread(
-            self.graph.query, 
-            merge_doc_query, 
-            params={'doc_id': doc_id, 'title': doc_title, 'source_file_name': file_name}
-        )
-        created_doc_id = doc_result[0]['document_id'] if doc_result and doc_result[0] else doc_id
-        print(f"MERGED StandardDocument: {created_doc_id}")
+        # (Merge StandardDocument logic remains the same)
+        merge_doc_query = "MERGE (d:StandardDocument {doc_id: $doc_id}) SET d.title = $title, d.source_file_name = $source_file_name"
+        await asyncio.to_thread(self.graph.query, merge_doc_query, params={'doc_id': doc_id, 'title': doc_title, 'source_file_name': file_name})
 
-        chunk_details_for_graph_transformer = []
         chunk_nodes_data_for_cypher = []
+        documents_for_transformer = []
 
         for i, chunk_doc in enumerate(translated_chunks):
             chunk_text = chunk_doc.page_content
-            metadata = chunk_doc.metadata
-            original_section_id = metadata.get('category', metadata.get('header_1', metadata.get('section', None)))
-            page_number = metadata.get('page_number', None)
-
-            embedding_vector = None # <--- 1. กำหนดค่าเริ่มต้นเป็น None
             try:
-                # --- 2. นี่คือจุดที่เรียก Google AI ---
                 embedding_vector = await asyncio.to_thread(self.llm_embbedding.embed_query, chunk_text)
-            
             except (InternalServerError, ServiceUnavailable) as e:
-                # --- 3. ถ้า Google มีปัญหา ให้ข้าม Chunk นี้ไป ---
-                print(f"WARNING: Google AI embedding failed for a chunk in doc '{created_doc_id}'. Skipping this chunk. Error: {e}")
-                continue # <-- คำสั่งให้ข้ามไปทำงานกับ chunk ต่อไปใน loop
+                self.logger.warning(f"Embedding failed for a chunk in doc '{doc_id}'. Skipping. Error: {e}")
+                continue
 
-            # โค้ดส่วนที่เหลือจะทำงานก็ต่อเมื่อการสร้าง embedding สำเร็จ
-            chunk_id = f"{created_doc_id}_chunk_{i:04d}"
-
-            chunk_data_for_cypher = {
+            chunk_id = f"{doc_id}_chunk_{i:04d}"
+            
+            # --- FIX 3: เพิ่ม standard_code เข้าไปใน dictionary ---
+            chunk_data = {
                 'chunk_id': chunk_id,
                 'text': chunk_text,
-                'original_section_id': str(original_section_id) if original_section_id else None,
-                'page_number': page_number,
-                'sequence_in_document': i,
                 'embedding': embedding_vector,
-                'doc_id': created_doc_id 
+                'doc_id': doc_id,
+                'standard_code': standard_code, # <--- เพิ่มบรรทัดนี้
+                'page_number': chunk_doc.metadata.get('page_number')
             }
-            chunk_nodes_data_for_cypher.append(chunk_data_for_cypher)
-            
-            transformer_doc_metadata = {'chunk_id': chunk_id, 'doc_id': created_doc_id}
-            if 'source_file_name' in metadata:
-                    transformer_doc_metadata['source_file_name'] = metadata['source_file_name']
-            if page_number is not None:
-                    transformer_doc_metadata['page_number'] = page_number
-
-            chunk_details_for_graph_transformer.append(
-                Document(page_content=chunk_text, metadata=transformer_doc_metadata)
-            )
+            # ----------------------------------------------------
+            chunk_nodes_data_for_cypher.append(chunk_data)
+            documents_for_transformer.append(Document(page_content=chunk_text, metadata={'chunk_id': chunk_id, 'doc_id': doc_id}))
 
         if chunk_nodes_data_for_cypher:
-            total_processed_for_this_doc = 0
-            batch_size_for_cypher = 500
-            for i in range(0, len(chunk_nodes_data_for_cypher), batch_size_for_cypher):
-                batch_data = chunk_nodes_data_for_cypher[i:i + batch_size_for_cypher]
-                create_chunks_query = f"""
-                UNWIND $chunks_data AS chunk_props
-                MATCH (d:StandardDocument {{doc_id: chunk_props.doc_id}})
-                MERGE (sc:{self.standard_chunk_node_label} {{chunk_id: chunk_props.chunk_id}})
-                ON CREATE SET 
-                    sc.text = chunk_props.text,
-                    sc.original_section_id = chunk_props.original_section_id,
-                    sc.page_number = chunk_props.page_number,
-                    sc.sequence_in_document = chunk_props.sequence_in_document,
-                    sc.embedding = chunk_props.embedding,
-                    sc.doc_id = chunk_props.doc_id,
-                    sc.last_updated = timestamp()
-                ON MATCH SET
-                    sc.text = chunk_props.text, 
-                    sc.embedding = chunk_props.embedding,
-                    sc.original_section_id = chunk_props.original_section_id,
-                    sc.page_number = chunk_props.page_number,
-                    sc.last_updated = timestamp()
-                MERGE (d)-[r:HAS_CHUNK {{order: chunk_props.sequence_in_document}}]->(sc)
-                RETURN count(sc) AS chunks_processed
-                """
-                result = await asyncio.to_thread(
-                    self.graph.query, 
-                    create_chunks_query, 
-                    params={'chunks_data': batch_data}
-                )
-                if result and result[0]:
-                    total_processed_for_this_doc += result[0].get('chunks_processed', 0)
-            print(f"Processed {total_processed_for_this_doc} chunks for document {created_doc_id}.")
+            # --- FIX 3: เพิ่มการ SET `standard_code` ใน Cypher Query ---
+            create_chunks_query = f"""
+            UNWIND $chunks_data AS props
+            MATCH (d:StandardDocument {{doc_id: props.doc_id}})
+            MERGE (sc:{self.standard_chunk_node_label} {{chunk_id: props.chunk_id}})
+            SET 
+                sc.text = props.text,
+                sc.embedding = props.embedding,
+                sc.doc_id = props.doc_id,
+                sc.standard_code = props.standard_code,
+                sc.page_number = props.page_number,
+                sc.last_updated = timestamp()
+            MERGE (d)-[:HAS_CHUNK]->(sc)
+            """
+            # ---------------------------------------------------------
+            await asyncio.to_thread(self.graph.query, create_chunks_query, params={'chunks_data': chunk_nodes_data_for_cypher})
+            self.logger.info(f"Processed {len(chunk_nodes_data_for_cypher)} chunks for document {doc_id}.")
 
-        return chunk_details_for_graph_transformer
+        return documents_for_transformer
 
     async def _apply_llm_graph_transformer_to_chunks(self, 
                                                     chunk_documents: List[Document],
@@ -724,36 +737,48 @@ class Neo4jService:
                 traceback.print_exc()
 
     async def flow(self, files: List[IO[bytes]], file_names: List[str]):
+        """
+        Orchestrates the end-to-end data ingestion and knowledge graph creation pipeline.
+        This includes reading, chunking, translating, and extracting graph data from documents.
+        """
         loop = asyncio.get_running_loop()
         processed_doc_ids = []
+
+        # 1. Read PDFs and create initial Document objects
+        # Determines which PDF reader to use based on configuration
         if self.document_intelligence_client:
-            print("Using Azure Document Intelligence for PDF processing.")
+            self.logger.info("Using Azure Document Intelligence for PDF processing.")
             documents_from_pdf_loader = await self.read_PDFs_and_create_documents_azure(files, file_names)
         else:
-            print("Azure Document Intelligence client not available, falling back to UnstructuredFileLoader.")
+            self.logger.info("Azure client not available, falling back to Unstructured.")
             documents_from_pdf_loader = await loop.run_in_executor(None, self.read_PDFs_and_create_documents, files, file_names)
         
         if not documents_from_pdf_loader:
-            print("No documents were loaded from PDFs. Aborting flow.")
-            return
+            self.logger.error("No documents were loaded from PDFs. Aborting flow.")
+            return []
 
+        # 2. Split loaded documents into smaller chunks
         split_chunks_lc_docs = await self.split_documents_into_chunks(documents_from_pdf_loader)
         if not split_chunks_lc_docs:
-            print("No chunks were created after splitting. Aborting flow.")
-            return
+            self.logger.error("No chunks were created after splitting. Aborting flow.")
+            return []
 
+        # 3. Translate chunks from Thai to English (as requested)
+        self.logger.info(f"Starting translation for {len(split_chunks_lc_docs)} chunks...")
         translated_chunks_lc_docs = await self.translate_documents_with_gemini(split_chunks_lc_docs)
+        self.logger.info("Translation complete.")
         
+        # 4. Group translated chunks by their original source file
         docs_by_source_file = {}
         for chunk_lc_doc in translated_chunks_lc_docs:
             source_fn = chunk_lc_doc.metadata.get('source_file_name', "unknown_source_file.pdf")
-            if source_fn not in docs_by_source_file:
-                docs_by_source_file[source_fn] = []
-            docs_by_source_file[source_fn].append(chunk_lc_doc)
+            docs_by_source_file.setdefault(source_fn, []).append(chunk_lc_doc)
 
-        esg_allowed_relationships = [ "HAS_FRAMEWORK", "COMPLIES_WITH", "REFERENCES_STANDARD", "DISCLOSES_INFORMATION_ON", "REPORTS_ON", "APPLIES_TO", "MENTIONS", "DEFINES", "HAS_METRIC", "MEASURES", "TRACKS_KPI", "SETS_TARGET", "ACHIEVES_GOAL", "IDENTIFIES_RISK", "PRESENTS_OPPORTUNITY", "HAS_IMPACT_ON", "MITIGATES_RISK", "HAS_STRATEGY", "IMPLEMENTS_POLICY", "FOLLOWS_PROCESS", "ENGAGES_IN_ACTIVITY", "INVESTS_IN", "OPERATES_IN", "LOCATED_IN", "GOVERNED_BY", "PART_OF", "COMPONENT_OF", "SUBCLASS_OF", "INSTANCE_OF", "RELATES_TO", "ASSOCIATED_WITH", "CAUSES", "INFLUENCES", "CONTRIBUTES_TO", "REQUIRES", "ADDRESSES", "MANAGES", "MONITORS", "EVALUATES", "ISSUED_BY", "DEVELOPED_BY", "PUBLISHED_IN", "EFFECTIVE_DATE" ]
+        # 5. Initialize the Graph Transformer with custom ESG schema and prompt
         esg_allowed_nodes = [ "Organization", "Person", "Standard", "Framework", "Guideline", "Regulation", "Law", "Report", "Document", "Disclosure", "Topic", "SubTopic", "Category", "Metric", "Indicator", "KPI", "Target", "Goal", "Objective", "Risk", "Opportunity", "Impact", "Strategy", "Policy", "Process", "Practice", "Activity", "Initiative", "Program", "Project", "Stakeholder", "Investor", "Employee", "Customer", "Supplier", "Community", "Government", "Region", "Country", "Location", "Facility", "EnvironmentalFactor", "SocialFactor", "GovernanceFactor", "ClimateChange", "GreenhouseGas", "GHGEmissions", "Energy", "Water", "Waste", "Biodiversity", "HumanRights", "LaborPractices", "HealthAndSafety", "DiversityAndInclusion", "CommunityEngagement", "BoardComposition", "Ethics", "Corruption", "ShareholderRights", "EconomicValue", "FinancialPerformance", "OperatingCost", "Revenue", "Investment", "Date", "Year", "Period", "Unit", "Value", "Percentage", "Currency", "Source", "Reference", "Term", "Concept" ]
-
+        esg_allowed_relationships = [ "HAS_FRAMEWORK", "COMPLIES_WITH", "REFERENCES_STANDARD", "DISCLOSES_INFORMATION_ON", "REPORTS_ON", "APPLIES_TO", "MENTIONS", "DEFINES", "HAS_METRIC", "MEASURES", "TRACKS_KPI", "SETS_TARGET", "ACHIEVES_GOAL", "IDENTIFIES_RISK", "PRESENTS_OPPORTUNITY", "HAS_IMPACT_ON", "MITIGATES_RISK", "HAS_STRATEGY", "IMPLEMENTS_POLICY", "FOLLOWS_PROCESS", "ENGAGES_IN_ACTIVITY", "INVESTS_IN", "OPERATES_IN", "LOCATED_IN", "GOVERNED_BY", "PART_OF", "COMPONENT_OF", "SUBCLASS_OF", "INSTANCE_OF", "RELATES_TO", "ASSOCIATED_WITH", "CAUSES", "INFLUENCES", "CONTRIBUTES_TO", "REQUIRES", "ADDRESSES", "MANAGES", "MONITORS", "EVALUATES", "ISSUED_BY", "DEVELOPED_BY", "PUBLISHED_IN", "EFFECTIVE_DATE" ]
+        
+        # Assume custom_esg_graph_extraction_prompt is defined in the class __init__
         llm_transformer_for_kg = LLMGraphTransformer(
             llm=self.llm,
             node_properties=["description", "name"],
@@ -764,39 +789,44 @@ class Neo4jService:
             prompt=custom_esg_graph_extraction_prompt
         )
         
-        for i, file_name in enumerate(file_names): # <-- ใช้ file_names ที่รับเข้ามาเป็นหลัก
-            # สร้าง doc_id ที่สอดคล้องกับ _create_standard_document_and_chunks
-            # ซึ่งใช้ file_name เป็น doc_id โดยตรง
+        # 6. Process each file's chunks
+        for file_name in file_names:
             doc_id = file_name
-            processed_doc_ids.append(doc_id) # <-- เก็บ doc_id ที่จะถูกสร้าง
+            processed_doc_ids.append(doc_id)
             
-            # ดึง chunks ของไฟล์ปัจจุบัน
             chunks_for_this_file = docs_by_source_file.get(file_name)
             if not chunks_for_this_file:
+                self.logger.warning(f"No chunks found for file {file_name} after processing. Skipping.")
                 continue
 
-            print(f"Processing file: {file_name}")
-            standard_title_from_filename = file_name.split('_', 2)[-1].replace(".pdf", "").replace("_", " ")
+            self.logger.info(f"Starting graph processing for file: {file_name}")
+            
+            # Extract title and standard code for tagging
+            standard_title, standard_code = self._extract_info_from_filename(file_name)
 
+            # Create document and chunk nodes in Neo4j, tagging them with standard_code
             chunk_docs_with_ids_for_transformer = await self._create_standard_document_and_chunks(
                 file_name=file_name,
                 translated_chunks=chunks_for_this_file,
-                standard_title=standard_title_from_filename
+                standard_title=standard_title,
+                standard_code=standard_code
             )
 
+            # Apply LLM to extract entities/relationships and link them to chunks
             if chunk_docs_with_ids_for_transformer:
                 await self._apply_llm_graph_transformer_to_chunks(
                     chunk_docs_with_ids_for_transformer,
                     llm_transformer_for_kg
                 )
             
-            print(f"Completed KG extraction for file: {file_name}\n--------------------")
+            self.logger.info(f"Completed KG extraction for file: {file_name}\n--------------------")
 
-        print("All files processed. Adding description embeddings...")
+        # 7. Final step: Populate embeddings for new entity descriptions
+        self.logger.info("All files processed. Adding description embeddings for new __Entity__ nodes...")
         await loop.run_in_executor(None, self.add_description_embeddings_to_nodes)
-        print("PDF processing flow completed.")
+        self.logger.info("PDF processing flow completed successfully.")
         
-        return processed_doc_ids # <-- เพิ่ม return statement ที่ท้ายฟังก์ชัน
+        return processed_doc_ids
 
 
     async def get_relate(self, query, k):     
@@ -1058,3 +1088,11 @@ class Neo4jService:
                 print(f"[NEO4J ERROR] Error fetching context for central entity '{center_id}': {e_entity_ctx}")
         
         return "\n\n".join(final_graph_context_parts)
+    
+    def _extract_info_from_filename(self, file_name: str) -> Tuple[str, Optional[str]]:
+        title = file_name.replace(".pdf", "").replace("_", " ")
+        match = re.search(r'GRI[\s_-]?(\d{3})', file_name, re.IGNORECASE)
+        if match:
+            standard_code = f"GRI-{match.group(1)}"
+            return title, standard_code
+        return title, None

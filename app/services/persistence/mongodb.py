@@ -328,6 +328,21 @@ class MongoDBSaver(BaseCheckpointSaver):
             self.logger.error(f"Error during semantic search for questions: {e}")
             return []
 
+    async def has_existing_questions(self) -> bool:
+        """Checks if there are any documents in the ESGQuestion collection."""
+        try:
+            # ใช้ find_one() ซึ่งเร็วกว่าการ count สำหรับการเช็คว่ามีข้อมูลหรือไม่
+            existing_question = await ESGQuestion.find_one()
+            if existing_question:
+                self.logger.info("Found existing questions in the database.")
+                return True
+            else:
+                self.logger.info("Question database is empty.")
+                return False
+        except Exception as e:
+            self.logger.error(f"Error checking for existing questions in MongoDB: {e}", exc_info=True)
+            return False # Assume it's not empty on error to be safe
+
     async def update_question_set_mappings(self, question_id: str, new_mappings: List[RelatedSETQuestion]):
         self.logger.info(f"Updating SET mappings for question ID: {question_id}")
         question = await ESGQuestion.get(question_id)

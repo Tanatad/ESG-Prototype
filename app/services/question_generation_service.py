@@ -34,7 +34,13 @@ from app.data.set_benchmarks import benchmark_questions as all_set_benchmarks # 
 
 load_dotenv()
 
+TARGET_GRI_STANDARDS = [
+    'GRI-302', 'GRI-303', 'GRI-306', 'GRI-401', 'GRI-403', 
+    'GRI-404', 'GRI-408', 'GRI-205'
+]
+FINAL_VALIDATION_SIMILARITY_THRESHOLD = 0.90 
 SIMILARITY_THRESHOLD_KG_THEME_UPDATE = 0.85
+DEFAULT_NODE_TYPE = "UnknownEntityType"
 
 # PROCESS_SCOPE constants remain the same
 PROCESS_SCOPE_PDF_SPECIFIC_IMPACT = "pdf_specific_impact" # Not directly used by new theme logic, but analyze_pdf_impact might still be
@@ -186,55 +192,73 @@ class QuestionGenerationService:
             print(f"[QG_SERVICE ERROR /translate] Error during translation to Thai for text '{text_to_translate[:30]}...': {e}")
             return None # Or return original text_to_translate as fallback
 
-    async def _get_entity_graph_data(self) -> Optional[Dict[str, Any]]:
-        # ... (Method from your latest code, ensure query_nodes and query_edges are correct) ...
-        print("[QG_SERVICE LOG] Fetching __Entity__ graph data from Neo4j...")
-        try:
-            query_nodes = """
-            MATCH (e:__Entity__)
-            WHERE e.id IS NOT NULL
-            OPTIONAL MATCH (sc:StandardChunk)-[:CONTAINS_ENTITY]->(e) // <<< ส่วนนี้มีปัญหา
-            RETURN
-                e.id AS id,
-                COALESCE(e.description, '') AS description,
-                [lbl IN labels(e) WHERE lbl <> '__Entity__'] AS specific_labels,
-                COALESCE(sc.doc_id, '') AS source_document_doc_id // <<< ทำให้ได้ค่าว่าง
+    async def _get_entity_graph_data(self, 
+                                    exclude_entity_ids: Optional[Set[str]] = None,
+                                    include_only_entity_ids: Optional[List[str]] = None,
+                                    doc_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Fetches __Entity__ graph data, with flexible filtering options.
+        """
+        self.logger.info("Fetching __Entity__ graph data from Neo4j...")
+        params = {}
+        node_match_clause = ""
+        
+        if doc_ids:
+            self.logger.info(f"Filtering graph data by doc_ids: {doc_ids}")
+            # --- FIX: ตั้งชื่อตัวแปรให้ StandardChunk node เป็น `sc` ---
+            node_match_clause = """
+            MATCH (e:__Entity__)<--(sc:StandardChunk)
+            WHERE sc.doc_id IN $doc_ids
             """
-            query_edges = """
-            MATCH (e1:__Entity__)-[r]-(e2:__Entity__)
-            WHERE e1.id IS NOT NULL AND e2.id IS NOT NULL AND e1.id <> e2.id
-            RETURN DISTINCT e1.id AS source, e2.id AS target
-            """
-            loop = asyncio.get_running_loop()
-            nodes_result = await loop.run_in_executor(None, self.neo4j_service.graph.query, query_nodes)
-            edges_result = await loop.run_in_executor(None, self.neo4j_service.graph.query, query_edges)
+            # ---------------------------------------------------------
+            params['doc_ids'] = doc_ids
+        elif include_only_entity_ids:
+            self.logger.info(f"Filtering graph data to include only {len(include_only_entity_ids)} entities.")
+            node_match_clause = "MATCH (e:__Entity__) WHERE e.id IN $include_ids"
+            params['include_ids'] = include_only_entity_ids
+        else:
+            node_match_clause = "MATCH (e:__Entity__)"
+            if exclude_entity_ids:
+                self.logger.info(f"Filtering graph data to exclude {len(exclude_entity_ids)} entities.")
+                node_match_clause += " WHERE NOT e.id IN $exclude_ids"
+                params['exclude_ids'] = list(exclude_entity_ids)
 
-            if not nodes_result: print("[QG_SERVICE WARNING] No __Entity__ nodes found."); return None
-            nodes_map: Dict[str, Dict[str, Any]] = {}
-            for record in nodes_result:
-                if record and record.get('id'):
-                    node_id = record['id']
-                    if node_id in nodes_map:
-                        if not nodes_map[node_id]['source_document_doc_id'] and record['source_document_doc_id']:
-                            nodes_map[node_id]['source_document_doc_id'] = record['source_document_doc_id']
-                    else:
-                        nodes_map[node_id] = {
-                            'id': node_id,
-                            'description': record['description'],
-                            'labels': record['specific_labels'] if record['specific_labels'] else [DEFAULT_NODE_TYPE],
-                            'source_document_doc_id': record['source_document_doc_id']
-                        }
-            edges: List[Tuple[str, str]] = []
-            if edges_result:
-                for record in edges_result:
-                    source, target = record.get('source'), record.get('target')
-                    if source and target and source in nodes_map and target in nodes_map:
-                        edges.append((source, target))
-            print(f"[QG_SERVICE INFO] Fetched {len(nodes_map)} __Entity__ nodes and {len(edges)} edges (before unique).")
-            if not nodes_map: print("[QG_SERVICE WARNING] No valid __Entity__ nodes after processing."); return None
-            return {"nodes_map": nodes_map, "edges": list(set(tuple(sorted(edge)) for edge in edges))}
+        # Query ที่เหลือยังคงเดิม แต่ตอนนี้จะทำงานกับ node_match_clause ที่ถูกต้องแล้ว
+        query_nodes = f"""
+        {node_match_clause}
+        WITH DISTINCT e
+        OPTIONAL MATCH (sc:StandardChunk)-[:CONTAINS_ENTITY]->(e)
+        RETURN
+            e.id AS id,
+            COALESCE(e.description, '') AS description,
+            [lbl IN labels(e) WHERE lbl <> '__Entity__'] AS specific_labels,
+            COLLECT(DISTINCT {{doc_id: sc.doc_id, standard_code: sc.standard_code}}) as sources
+        """
+        
+        query_edges = f"""
+        {node_match_clause}
+        WITH COLLECT(DISTINCT e.id) as valid_ids
+        MATCH (e1:__Entity__)-[r]-(e2:__Entity__)
+        WHERE e1.id IN valid_ids AND e2.id IN valid_ids AND e1.id <> e2.id
+        RETURN DISTINCT e1.id AS source, e2.id AS target
+        """
+        
+        try:
+            nodes_result = await self.run_in_executor(self.neo4j_service.graph.query, query_nodes, params)
+            edges_result = await self.run_in_executor(self.neo4j_service.graph.query, query_edges, params)
+
+            nodes_map = self._process_node_results(nodes_result)
+            edges = self._process_edge_results(edges_result, nodes_map)
+
+            self.logger.info(f"Fetched {len(nodes_map)} nodes and {len(edges)} edges based on filters.")
+            if not nodes_map: 
+                self.logger.warning("No nodes found with the current filter criteria.")
+                return None
+            return {"nodes_map": nodes_map, "edges": edges}
+            
         except Exception as e:
-            print(f"[QG_SERVICE ERROR] Error fetching __Entity__ graph data: {e}"); traceback.print_exc(); return None
+            self.logger.error(f"Error fetching filtered __Entity__ graph data: {e}", exc_info=True)
+            return None
 
     async def _detect_first_order_communities(self, entity_graph_data: Dict[str, Any], min_community_size: int = 2) -> Dict[int, List[str]]:
         # ... (Method from your latest code) ...
@@ -372,43 +396,46 @@ class QuestionGenerationService:
     
     async def identify_hierarchical_themes_from_kg(
         self,
-        min_first_order_community_size: int, # รับค่าจากภายนอก
-        min_main_category_fo_community_count: int, # รับค่าจากภายนอก
+        min_first_order_community_size: int,
+        min_main_category_fo_community_count: int,
+        entity_graph_data: Dict[str, Any]  # <-- เพิ่ม parameter นี้
     ) -> List[Dict[str, Any]]:
         """
-        Orchestrates the hierarchical theme identification process.
-        This function is now simpler as the adaptive logic is handled by the caller.
+        Orchestrates the hierarchical theme identification process using pre-fetched graph data.
         """
-        print(f"[QG_SERVICE LOG] Identifying themes with settings: min_fo_comm_size={min_first_order_community_size}, min_mc_fo_comm_count={min_main_category_fo_community_count}")
-        entity_graph_data = await self._get_entity_graph_data()
+        self.logger.info(f"Identifying themes with settings: min_fo_comm_size={min_first_order_community_size}, min_mc_fo_comm_count={min_main_category_fo_community_count}")
+        
+        # entity_graph_data = await self._get_entity_graph_data() # <--- ลบบรรทัดนี้ทิ้ง
+
         if not entity_graph_data or not entity_graph_data.get("nodes_map"):
-            print("[QG_SERVICE WARNING] Could not retrieve entity graph data. Aborting theme identification."); return []
+            self.logger.warning("Could not use provided entity graph data. Aborting theme identification.")
+            return []
 
         # Step 1: Detect first-order communities (sub-themes)
         first_order_communities_map = await self._detect_first_order_communities(entity_graph_data, min_community_size=min_first_order_community_size)
         if not first_order_communities_map:
-            print("[QG_SERVICE WARNING] No first-order communities found with current settings. Aborting."); return []
+            self.logger.warning("No first-order communities found with current settings. Aborting.")
+            return []
 
-        # Step 2: Generate consolidated theme details for each first-order community
+        # (The rest of the function logic remains the same)
         all_consolidated_themes, all_entity_data_map = await self._generate_all_consolidated_themes(first_order_communities_map, entity_graph_data)
         if not all_consolidated_themes:
-            print("[QG_SERVICE WARNING] No consolidated themes (sub-themes) generated from first-order communities."); return []
+            self.logger.warning("No consolidated themes (sub-themes) generated from first-order communities.")
+            return []
 
-        # Step 3: Create meta-graph and detect main categories
         meta_graph = await self._create_community_meta_graph(first_order_communities_map, entity_graph_data)
         main_category_groupings = await self._detect_main_categories_from_meta_graph(
             meta_graph, 
             min_main_category_fo_community_count=min_main_category_fo_community_count
         )
 
-        # Step 4: Fallback and Final Assembly
         if not main_category_groupings:
-            print("[QG_SERVICE WARNING] No main category groupings from meta-graph. Structuring flat themes as main categories.")
+            self.logger.warning("No main category groupings from meta-graph. Structuring flat themes as main categories.")
             return [self._structure_flat_theme_as_main_category(ct, idx) for idx, ct in enumerate(all_consolidated_themes)]
 
         main_categories_final = await self._assemble_main_categories(main_category_groupings, all_consolidated_themes)
         
-        print(f"[QG_SERVICE LOG] Identified {len(main_categories_final)} hierarchical main categories.")
+        self.logger.info(f"Identified {len(main_categories_final)} hierarchical main categories.")
         return main_categories_final
 
     async def _generate_all_consolidated_themes(self, first_order_communities_map, entity_graph_data):
@@ -981,87 +1008,625 @@ class QuestionGenerationService:
             return False
     
             # --- ฟังก์ชันนี้คือเวอร์ชันสมบูรณ์ที่เติมโค้ดส่วนที่ขาดไปแล้ว ---
-    async def evolve_and_store_questions(self, document_ids: List[str], is_baseline_upload: bool = False):
-        self.logger.info(f"Starting 2-PASS question evolution (Simple Strategy). Baseline: {is_baseline_upload}")
+    async def evolve_and_store_questions(self, document_ids: List[str]):
+        """
+        Main orchestrator that automatically detects whether to run in 
+        Baseline or Update mode by checking the database state.
+        """
+        # ตรวจสอบสถานะของฐานข้อมูลเพื่อเลือกโหมดการทำงานอัตโนมัติ
+        is_db_empty = not await self.mongodb_service.has_existing_questions()
+
+        if is_db_empty:
+            self.logger.info("--- Database is empty. Running in BASELINE mode. ---")
+            await self._run_baseline_generation()
+        else:
+            self.logger.info(f"--- Database has data. Running in UPDATE mode for docs: {document_ids} ---")
+            await self._run_update_generation(document_ids)
+
+    # ===================================================================
+    # MODE 1: BASELINE GENERATION LOGIC (เหมือนเดิม แต่ปรับการบันทึกเล็กน้อย)
+    # ===================================================================
+    async def _run_baseline_generation(self):
+        """
+        Performs the full 4-phase question generation for the initial setup.
+        """
+        self.logger.info("Starting full 4-Phase question generation for baseline.")
         
-        # --- PHASE 0: SETUP ---
-        all_set_benchmarks = self.mongodb_service.get_set_benchmark_questions()
-        if not all_set_benchmarks:
-            self.logger.error("Could not load SET benchmark questions. Aborting.")
+        all_set_benchmarks_from_db = self.mongodb_service.get_set_benchmark_questions()
+        if not all_set_benchmarks_from_db:
+            self.logger.error("BASELINE RUN: Could not load SET benchmark questions. Aborting.")
             return
 
-        # --- PHASE 1, ROUND 1: Standard Search (High Precision) ---
-        self.logger.info("--- ROUND 1: Starting Standard Search using 'Theme: Question' ---")
-        
-        generated_questions_r1 = []
-        # เราจะใช้ asyncio.gather เพื่อรันพร้อมกันทั้งหมด
-        tasks_r1 = [self._find_evidence_and_generate_for_set_q(set_q) for set_q in all_set_benchmarks]
-        results_r1 = await asyncio.gather(*tasks_r1)
-        generated_questions_r1 = [q for q in results_r1 if q is not None]
-        
-        # หาว่าคำถาม SET ID ไหนที่ถูกสร้างไปแล้วในรอบแรก
-        covered_set_ids_r1 = {item['related_set_questions'][0].set_id for item in generated_questions_r1 if item.get('related_set_questions')}
-        
-        self.logger.info(f"ROUND 1 Complete: Generated {len(generated_questions_r1)} questions, covering {len(covered_set_ids_r1)} SET IDs.")
+        used_entity_ids, used_chunk_ids = set(), set()
 
-        # --- PHASE 1, ROUND 2: Broader Search for Uncovered Questions ---
-        uncovered_set_qs = [q for q in all_set_benchmarks if q['id'] not in covered_set_ids_r1]
-        generated_questions_r2 = []
-        if uncovered_set_qs:
-            self.logger.info(f"--- ROUND 2: Starting Broader Search for {len(uncovered_set_qs)} uncovered SET questions ---")
+        # Phase 1: SET-Driven
+        set_driven_questions, used_entity_ids_p1, used_chunk_ids_p1 = await self._run_set_driven_phase(all_set_benchmarks_from_db)
+        used_entity_ids.update(used_entity_ids_p1)
+        used_chunk_ids.update(used_chunk_ids_p1)
+
+        # Phase 2: Targeted GRI
+        targeted_questions, used_entity_ids_p2, used_chunk_ids_p2 = await self._run_targeted_gri_phase(TARGET_GRI_STANDARDS, used_entity_ids, used_chunk_ids)
+        used_entity_ids.update(used_entity_ids_p2)
+        used_chunk_ids.update(used_chunk_ids_p2)
+        
+        # Phase 3: Organic Discovery
+        # ใช้ ID ทั้งหมดที่ใช้ไปใน Phase 1 และ 2 เพื่อหา Residual Graph
+        organic_questions = await self._run_organic_discovery_phase(used_entity_ids, used_chunk_ids)
+
+        # Phase 4A: Final Validation
+        candidates_for_validation = targeted_questions + organic_questions
+        final_approved_questions = await self._run_final_validation_phase(candidates_for_validation, all_set_benchmarks_from_db)
+
+        # Phase 4B: Integration (Baseline Mode)
+        all_questions_to_integrate = set_driven_questions + final_approved_questions
+        self.logger.info(f"BASELINE (Integration): Saving {len(all_questions_to_integrate)} question sets.")
+        
+        for candidate_dict in all_questions_to_integrate:
+            # ในโหมด Baseline เราจะบันทึกทุกอย่างเป็นเวอร์ชัน 1
+            candidate_dict['version'] = 1
+            await self.mongodb_service.store_esg_question(ESGQuestion(**candidate_dict))
+        
+        self.logger.info("Baseline generation process completed successfully.")
+
+    async def _run_organic_discovery_phase(self, used_entity_ids: Set[str], used_chunk_ids: Set[str]) -> List[Dict]:
+        """Runs the organic, uncovered theme discovery (Phase 3)."""
+        self.logger.info(f"PHASE 3: Fetching residual graph, excluding {len(used_entity_ids)} entities.")
+        
+        # Get graph data, excluding all nodes used in previous phases
+        residual_graph_data = await self._get_entity_graph_data(exclude_entity_ids=used_entity_ids)
+        if not residual_graph_data or not residual_graph_data.get("nodes_map"):
+            self.logger.warning("PHASE 3: Residual graph is empty. No organic themes to discover.")
+            return []
+
+        # Run adaptive theme identification on the residual graph
+        theme_structures = await self._run_adaptive_theme_identification(entity_graph_data=residual_graph_data)
+        if not theme_structures:
+            return []
             
-            # ในรอบที่ 2 เราจะสร้าง task สำหรับคำถามที่ยังไม่ถูกค้นพบเท่านั้น
-            tasks_r2 = []
-            for set_q in uncovered_set_qs:
-                # สร้างคำค้นหาแบบกว้าง โดยใช้เฉพาะเนื้อหาคำถาม
-                broad_query = set_q.get('question_text_en', '')
-                tasks_r2.append(self._find_evidence_and_generate_for_set_q(set_q, custom_query=broad_query))
-
-            results_r2 = await asyncio.gather(*tasks_r2)
-            generated_questions_r2 = [q for q in results_r2 if q is not None]
-
-        self.logger.info(f"ROUND 2 Complete: Generated {len(generated_questions_r2)} additional questions.")
+        q_sets, info_map = await self._generate_qsets_from_theme_structures(theme_structures)
         
-        # --- PHASE 1.5: Combine all SET-Driven questions ---
-        set_driven_questions = generated_questions_r1 + generated_questions_r2
+        organic_questions = []
+        for q_set in q_sets:
+            q_dict = await self._convert_gqs_to_final_dict(q_set, info_map[q_set.main_category_name])
+            organic_questions.append(q_dict)
+            
+        return organic_questions
+
+    async def _run_final_validation_phase(self, candidate_questions: List[Dict], set_benchmarks: List[Dict]) -> List[Dict]:
+        """Performs final validation check against SET benchmarks (Phase 4A)."""
+        if not candidate_questions:
+            return []
         
-        # --- PHASE 2 & 3 (KG-Driven and Integration) remain the same ---
-        self.logger.info("--- PHASE 2: Starting KG-Driven Question Generation for Extended Coverage ---")
-        organic_themes = await self._run_adaptive_theme_identification()
-        kg_driven_questions = []
+        self.logger.info(f"Performing final validation for {len(candidate_questions)} candidate questions...")
 
-        if organic_themes:
-            for theme in organic_themes:
-                is_redundant = await self._is_theme_redundant(theme, set_driven_questions)
-                if is_redundant:
-                    self.logger.info(f"Skipping redundant organic theme: '{theme.get('main_category_name_en')}'")
-                    continue
-                q_set_obj = await self.generate_question_for_theme_level(theme)
-                if q_set_obj:
-                    q_dict = await self._convert_gqs_to_final_dict(q_set_obj, theme)
-                    kg_driven_questions.append(q_dict)
+        set_q_texts = [q.get('question_text_en', '') for q in set_benchmarks]
         
-        self.logger.info(f"PHASE 2 Complete: Generated {len(kg_driven_questions)} unique, organic questions.")
+        # 1. embed_texts ตอนนี้จะคืนค่าเป็น list ของ 1D arrays (หรือ None)
+        set_q_embedding_list = await self.embed_texts(set_q_texts)
 
-        self.logger.info("--- PHASE 3: Integrating all generated questions into the database ---")
-        all_candidate_questions = set_driven_questions + kg_driven_questions
+        # 2. กรองอันที่ล้มเหลวออก และ "stack" ส่วนที่เหลือให้เป็น Matrix 2D ก้อนเดียว
+        valid_set_embeddings = [emb for emb in set_q_embedding_list if emb is not None]
+        if not valid_set_embeddings:
+            self.logger.error("Could not generate any embeddings for SET benchmarks. Cannot perform validation. Approving all candidates as a fallback.")
+            return candidate_questions
 
-        if not all_candidate_questions:
-            self.logger.warning("No candidate questions were generated in this run.")
+        # np.vstack จะแปลง list ของ 1D arrays ให้เป็น 2D matrix
+        set_q_embeddings_matrix = np.vstack(valid_set_embeddings)
+
+        approved_questions = []
+        for candidate in candidate_questions:
+            candidate_text = f"{candidate.get('theme', '')} {candidate.get('main_question_text_en', '')}"
+            
+            # 3. สร้าง embedding ของ candidate ซึ่งตอนนี้จะเป็น 1D array
+            candidate_embedding_list = await self.embed_texts([candidate_text])
+            candidate_embedding_1d = candidate_embedding_list[0] if candidate_embedding_list else None
+            
+            if candidate_embedding_1d is None:
+                self.logger.warning(f"Could not create embedding for candidate '{candidate.get('theme')}'. Approving by default.")
+                approved_questions.append(candidate)
+                continue
+            
+            # 4. reshape candidate's 1D array ให้เป็น 2D array (1, dim) เพื่อให้เข้า function ได้
+            candidate_embedding_2d = candidate_embedding_1d.reshape(1, -1)
+            
+            # 5. ตอนนี้การคำนวณจะถูกต้อง: cosine_similarity(2D_array, 2D_array)
+            similarities = cosine_similarity(candidate_embedding_2d, set_q_embeddings_matrix)
+            max_similarity = np.max(similarities)
+            
+            if max_similarity < FINAL_VALIDATION_SIMILARITY_THRESHOLD:
+                self.logger.info(f"Candidate '{candidate.get('theme')}' PASSED validation (max similarity: {max_similarity:.4f})")
+                approved_questions.append(candidate)
+            else:
+                self.logger.warning(f"Candidate '{candidate.get('theme')}' REJECTED as redundant to SET (max similarity: {max_similarity:.4f})")
+        
+        return approved_questions
+
+    async def _get_entity_graph_data(self, 
+                                     exclude_entity_ids: Optional[Set[str]] = None,
+                                     include_only_entity_ids: Optional[List[str]] = None,
+                                     doc_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        self.logger.info("Fetching __Entity__ graph data from Neo4j...")
+        params = {}
+        node_match_clause = "MATCH (e:__Entity__)"
+        
+        if doc_ids:
+            self.logger.info(f"Filtering graph data by doc_ids: {doc_ids}")
+            # This is the most specific filter, for update mode
+            node_match_clause = "MATCH (e:__Entity__)<--(:StandardChunk) WHERE sc.doc_id IN $doc_ids"
+            params['doc_ids'] = doc_ids
+        elif include_only_entity_ids:
+            self.logger.info(f"Filtering graph data to include only {len(include_only_entity_ids)} entities.")
+            node_match_clause += " WHERE e.id IN $include_ids"
+            params['include_ids'] = include_only_entity_ids
+        elif exclude_entity_ids:
+            self.logger.info(f"Filtering graph data to exclude {len(exclude_entity_ids)} entities.")
+            node_match_clause += " WHERE NOT e.id IN $exclude_ids"
+            params['exclude_ids'] = list(exclude_entity_ids)
+
+        query_nodes = f"{node_match_clause} WITH DISTINCT e RETURN e.id AS id, e.description AS description"
+        query_edges = f"{node_match_clause} WITH COLLECT(DISTINCT e.id) as valid_ids MATCH (e1:__Entity__)-[r]-(e2:__Entity__) WHERE e1.id IN valid_ids AND e2.id IN valid_ids RETURN e1.id AS source, e2.id AS target"
+        
+        try:
+            nodes_result = await self.run_in_executor(self.neo4j_service.graph.query, query_nodes, params)
+            edges_result = await self.run_in_executor(self.neo4j_service.graph.query, query_edges, params)
+            nodes_map = {r['id']: {'id': r['id'], 'description': r['description']} for r in nodes_result}
+            edges = [(r['source'], r['target']) for r in edges_result]
+            
+            self.logger.info(f"Fetched {len(nodes_map)} nodes and {len(edges)} edges based on filters.")
+            if not nodes_map: return None
+            return {"nodes_map": nodes_map, "edges": list(set(map(tuple, map(sorted, edges))))}
+        except Exception as e:
+            self.logger.error(f"Error fetching filtered __Entity__ graph data: {e}", exc_info=True)
+            return None
+
+    def _process_node_results(self, nodes_result) -> Dict:
+        """Processes the raw node query result into a nodes_map."""
+        nodes_map = {}
+        if not nodes_result:
+            return nodes_map
+        for record in nodes_result:
+            node_id = record.get('id')
+            if node_id:
+                nodes_map[node_id] = {
+                    'id': node_id,
+                    'description': record.get('description', ''),
+                    'labels': record.get('specific_labels', [DEFAULT_NODE_TYPE]),
+                    'sources': record.get('sources', []) # List of {doc_id, standard_code} dicts
+                }
+        return nodes_map
+
+    def _process_edge_results(self, edges_result, nodes_map: Dict) -> List:
+        """Processes the raw edge query result into a list of tuples."""
+        edges = []
+        if not edges_result:
+            return edges
+        for record in edges_result:
+            source, target = record.get('source'), record.get('target')
+            # Ensure edges only connect nodes that are actually in our map
+            if source and target and source in nodes_map and target in nodes_map:
+                edges.append(tuple(sorted((source, target))))
+        return list(set(edges))
+
+    async def embed_texts(self, texts: List[str]) -> List[Optional[np.ndarray]]:
+        """A helper to embed a list of texts and return a list of 1D numpy arrays."""
+        if not self.similarity_llm_embedding or not texts:
+            return [None] * len(texts)
+        try:
+            embeddings = await self.run_in_executor(self.similarity_llm_embedding.embed_documents, texts)
+            # คืนค่าเป็น list ของ 1D arrays โดยตรง
+            return [np.array(emb) for emb in embeddings]
+        except Exception as e:
+            self.logger.error(f"Failed to generate embeddings: {e}", exc_info=True)
+            return [None] * len(texts)
+
+    async def run_in_executor(self, func, *args):
+        """Helper to run synchronous functions in an asyncio event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func, *args)
+
+    async def _run_set_driven_phase(self, all_set_benchmarks: List[Dict]) -> Tuple[List[Dict], Set[str], Set[str]]:
+        """
+        Runs the SET-driven question generation (Phase 1) using a 2-Round search strategy.
+        """
+        self.logger.info("--- Starting Phase 1: SET-Driven Generation (2-Round Strategy) ---")
+        
+        final_questions = []
+        used_entities = set()
+        used_chunks = set()
+        
+        # --- Round 1: High-Precision Search ---
+        self.logger.info("PHASE 1 (Round 1): Starting high-precision search.")
+        round1_tasks = [self._find_evidence_and_generate_for_set_q(set_q) for set_q in all_set_benchmarks]
+        round1_results = await asyncio.gather(*round1_tasks)
+
+        covered_set_ids = set()
+        for res in round1_results:
+            if res and res.get("question"):
+                final_questions.append(res["question"])
+                used_entities.update(res.get("used_entity_ids", set()))
+                used_chunks.update(res.get("used_chunk_ids", set()))
+                if res["question"].get("related_set_questions"):
+                    covered_set_ids.add(res["question"]["related_set_questions"][0].set_id)
+        
+        self.logger.info(f"PHASE 1 (Round 1) Complete: Generated {len(final_questions)} questions, covering {len(covered_set_ids)} SET IDs.")
+
+        # --- Round 2: Broader Search for Uncovered Questions ---
+        uncovered_set_qs = [q for q in all_set_benchmarks if q['id'] not in covered_set_ids]
+        if not uncovered_set_qs:
+            self.logger.info("PHASE 1 (Round 2): All SET questions covered in Round 1. Skipping.")
+            return final_questions, used_entities, used_chunks
+
+        self.logger.info(f"PHASE 1 (Round 2): Starting broader search for {len(uncovered_set_qs)} uncovered SET questions.")
+        round2_tasks = []
+        for set_q in uncovered_set_qs:
+            broad_query = set_q.get('question_text_en', '')
+            round2_tasks.append(self._find_evidence_and_generate_for_set_q(set_q, custom_query=broad_query))
+
+        round2_results = await asyncio.gather(*round2_tasks)
+        
+        round2_question_count = 0
+        for res in round2_results:
+            if res and res.get("question"):
+                set_id = res["question"]["related_set_questions"][0].set_id
+                if set_id not in covered_set_ids:
+                    final_questions.append(res["question"])
+                    used_entities.update(res.get("used_entity_ids", set()))
+                    used_chunks.update(res.get("used_chunk_ids", set()))
+                    covered_set_ids.add(set_id)
+                    round2_question_count += 1
+
+        self.logger.info(f"PHASE 1 (Round 2) Complete: Generated {round2_question_count} additional questions.")
+        
+        return final_questions, used_entities, used_chunks
+
+    async def _run_update_generation(self, document_ids: List[str]):
+        self.logger.info("UPDATE RUN (Step 1): Generating candidate questions from new documents.")
+        
+        # This is the line that was causing the error
+        subgraph_data = await self._get_entity_graph_data(doc_ids=document_ids)
+        
+        if not subgraph_data:
+            self.logger.warning(f"UPDATE RUN: No graph data found for new documents: {document_ids}. Aborting.")
             return
 
-        for candidate_dict in all_candidate_questions:
-            if is_baseline_upload:
-                existing = await ESGQuestion.find_one({"theme": candidate_dict['theme']})
-                if not existing:
-                    self.logger.info(f"[BASELINE] Adding new question for theme: {candidate_dict.get('theme')}")
-                    await ESGQuestion(**candidate_dict).insert()
-                else:
-                    self.logger.info(f"[BASELINE] Theme '{candidate_dict.get('theme')}' already exists. Skipping.")
-            else:
-                await self._evaluate_and_integrate_new_question(candidate_dict)
+        candidate_themes = await self.identify_hierarchical_themes_from_kg(entity_graph_data=subgraph_data, min_first_order_community_size=3, min_main_category_fo_community_count=1)
+        if not candidate_themes:
+            self.logger.warning(f"UPDATE RUN: Could not generate any candidate themes from new documents. Aborting.")
+            return
+
+        candidate_qsets, info_map = await self._generate_qsets_from_theme_structures(candidate_themes)
+        self.logger.info(f"UPDATE RUN (Step 1) Complete: Generated {len(candidate_qsets)} candidate questions.")
+
+        self.logger.info("UPDATE RUN (Step 2): Evaluating candidates against existing questions in DB.")
+        active_db_questions = await ESGQuestion.find(ESGQuestion.is_active == True).to_list()
         
-        self.logger.info("Question evolution process completed successfully.")
+        for candidate_qset in candidate_qsets:
+            await self._evaluate_and_integrate_update(candidate_qset, info_map.get(candidate_qset.main_category_name, {}), active_db_questions)
+            
+        self.logger.info("Update generation process completed successfully.")
+
+    async def _run_baseline_generation(self):
+        """
+        Performs the full 4-phase question generation for the initial setup.
+        """
+        self.logger.info("Starting full 4-Phase question generation for baseline.")
+        
+        all_set_benchmarks_from_db = self.mongodb_service.get_set_benchmark_questions()
+        if not all_set_benchmarks_from_db:
+            self.logger.error("BASELINE RUN: Could not load SET benchmark questions. Aborting.")
+            return
+
+        used_entity_ids, used_chunk_ids = set(), set()
+
+        # Phase 1: SET-Driven
+        set_driven_questions, used_entity_ids_p1, used_chunk_ids_p1 = await self._run_set_driven_phase(all_set_benchmarks_from_db)
+        used_entity_ids.update(used_entity_ids_p1)
+        used_chunk_ids.update(used_chunk_ids_p1)
+        self.logger.info(f"BASELINE (Phase 1) Complete: Generated {len(set_driven_questions)} SET-driven questions.")
+
+        # Phase 2: Targeted GRI
+        targeted_questions, used_entity_ids_p2, used_chunk_ids_p2 = await self._run_targeted_gri_phase(TARGET_GRI_STANDARDS, used_entity_ids, used_chunk_ids)
+        used_entity_ids.update(used_entity_ids_p2)
+        used_chunk_ids.update(used_chunk_ids_p2)
+        self.logger.info(f"BASELINE (Phase 2) Complete: Generated {len(targeted_questions)} targeted GRI questions.")
+        
+        # Phase 3: Organic Discovery
+        organic_questions = await self._run_organic_discovery_phase(used_entity_ids, used_chunk_ids)
+        self.logger.info(f"BASELINE (Phase 3) Complete: Generated {len(organic_questions)} organic questions.")
+
+        # Phase 4A: Final Validation
+        candidates_for_validation = targeted_questions + organic_questions
+        final_approved_questions = await self._run_final_validation_phase(candidates_for_validation, all_set_benchmarks_from_db)
+        self.logger.info(f"BASELINE (Phase 4A) Complete: {len(final_approved_questions)} questions passed final validation.")
+
+        # Phase 4B: Integration (Baseline Mode)
+        all_questions_to_integrate = set_driven_questions + final_approved_questions
+        self.logger.info(f"BASELINE (Phase 4B): Integrating a total of {len(all_questions_to_integrate)} question sets.")
+        
+        for candidate_dict in all_questions_to_integrate:
+            # For baseline, only add if the theme does not exist at all.
+            theme_name = candidate_dict.get('theme')
+            existing = await ESGQuestion.find_one({"theme": theme_name})
+            if not existing:
+                self.logger.info(f"[BASELINE] Adding new question for theme: {theme_name}")
+                # Ensure related_set_questions are converted to dicts if they are Pydantic models
+                if 'related_set_questions' in candidate_dict:
+                    candidate_dict['related_set_questions'] = [q.model_dump() for q in candidate_dict['related_set_questions']]
+                if 'sub_questions_sets' in candidate_dict:
+                    candidate_dict['sub_questions_sets'] = [sq.model_dump() for sq in candidate_dict['sub_questions_sets']]
+                await ESGQuestion(**candidate_dict).insert()
+            else:
+                self.logger.info(f"[BASELINE] Theme '{theme_name}' already exists. Skipping.")
+        
+        self.logger.info("Baseline generation process completed successfully.")
+
+    async def _evaluate_and_integrate_update(self, 
+                                           candidate_qset: GeneratedQuestionSet,
+                                           candidate_theme_info: Dict, 
+                                           active_db_questions: List[ESGQuestion]):
+        """
+        Compares a single candidate against all active DB questions and decides
+        whether to ADD, REPLACE, or DISCARD.
+        """
+        # Find the most similar existing question in the database
+        most_similar_db_q = await self._find_most_similar_db_question(candidate_qset, active_db_questions)
+        
+        # Case 1: The candidate is completely new
+        if not most_similar_db_q:
+            self.logger.info(f"UPDATE: Candidate '{candidate_qset.main_category_name}' is novel. Adding as new question.")
+            new_question_dict = await self._convert_gqs_to_final_dict(candidate_qset, candidate_theme_info)
+            await self.mongodb_service.store_esg_question(ESGQuestion(**new_question_dict))
+            return
+
+        # Case 2: The candidate is similar to an existing question; an LLM must decide which is better.
+        self.logger.info(f"UPDATE: Candidate '{candidate_qset.main_category_name}' is similar to existing question '{most_similar_db_q.theme}'. Evaluating quality...")
+        is_better, is_same_topic = await self._is_new_theme_better(most_similar_db_q, candidate_qset)
+
+        if not is_same_topic:
+            self.logger.info(f"UPDATE: LLM judged topics are different. Adding '{candidate_qset.main_category_name}' as new question.")
+            new_question_dict = await self._convert_gqs_to_final_dict(candidate_qset, candidate_theme_info)
+            await self.mongodb_service.store_esg_question(ESGQuestion(**new_question_dict))
+        elif is_better:
+            self.logger.warning(f"UPDATE: New candidate '{candidate_qset.main_category_name}' is BETTER. Replacing old question.")
+            # Deactivate the old version
+            await self.mongodb_service.deactivate_question_set_in_db(str(most_similar_db_q.id))
+            # Prepare and store the new version
+            new_question_dict = await self._convert_gqs_to_final_dict(candidate_qset, candidate_theme_info)
+            new_question_dict['version'] = most_similar_db_q.version + 1
+            await self.mongodb_service.store_esg_question(ESGQuestion(**new_question_dict))
+        else:
+            self.logger.info(f"UPDATE: Existing question '{most_similar_db_q.theme}' is better. Discarding new candidate.")
+
+    async def _find_most_similar_db_question(self, 
+                                           candidate_qset: GeneratedQuestionSet, 
+                                           active_db_questions: List[ESGQuestion],
+                                           threshold=0.85) -> Optional[ESGQuestion]:
+        """Finds the most semantically similar question from the database."""
+        if not active_db_questions: return None
+
+        candidate_text = f"{candidate_qset.main_category_name} {candidate_qset.main_category_description}"
+        db_q_texts = [f"{q.theme} {q.theme_description_en}" for q in active_db_questions]
+
+        candidate_embedding = (await self.embed_texts([candidate_text]))[0]
+        db_embeddings = await self.embed_texts(db_q_texts)
+        
+        valid_db_embeddings_with_indices = [(i, emb) for i, emb in enumerate(db_embeddings) if emb is not None]
+        if not valid_db_embeddings_with_indices or candidate_embedding is None:
+            return None
+
+        indices, valid_embs = zip(*valid_db_embeddings_with_indices)
+        db_embeddings_matrix = np.vstack(valid_embs)
+        
+        similarities = cosine_similarity(candidate_embedding.reshape(1, -1), db_embeddings_matrix)
+        
+        highest_score_idx = np.argmax(similarities)
+        highest_score = similarities[0, highest_score_idx]
+
+        if highest_score >= threshold:
+            original_db_index = indices[highest_score_idx]
+            return active_db_questions[original_db_index]
+        
+        return None
+
+    async def _find_evidence_and_generate_for_set_q(self, set_question: Dict) -> Optional[Dict]:
+        """Finds evidence, generates a question, and returns used node IDs."""
+        search_query = f"{set_question.get('theme_set', '')}: {set_question.get('question_text_en', '')}"
+        
+        # This function should be updated to also return the IDs of chunks/entities used
+        # For now, we assume neo4j_service returns dicts with 'chunk_id' and 'entity_ids'
+        evidence_chunks = await self.neo4j_service.find_semantically_similar_chunks(query_text=search_query, top_k=3)
+        
+        if not evidence_chunks: return None
+        
+        # Assume a threshold and validation logic...
+        validated_evidence = [chunk for chunk in evidence_chunks if chunk.get('score', 0.0) >= 0.7]
+        if not validated_evidence: return None
+
+        # (LLM call to generate sub-questions based on evidence...)
+        # This part is simplified for brevity. Assume it produces a valid question_dict.
+        question_dict = await self._generate_final_dict_for_set_q(set_question, validated_evidence)
+        if not question_dict:
+             return None
+
+        used_chunk_ids = {chunk['chunk_id'] for chunk in validated_evidence}
+        # Assuming each chunk has a list of related entity IDs
+        used_entity_ids = {eid for chunk in validated_evidence for eid in chunk.get('entity_ids', [])}
+        
+        return {
+            "question": question_dict,
+            "used_entity_ids": used_entity_ids,
+            "used_chunk_ids": used_chunk_ids
+        }
+
+    async def _generate_final_dict_for_set_q(
+        self,
+        set_question: Dict[str, Any],
+        validated_evidence: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Takes a SET benchmark question and validated evidence to generate sub-questions
+        and format the final dictionary for a SET-driven question.
+        """
+        if not validated_evidence:
+            # This check is redundant if the calling function already checks, but good for safety
+            return None
+
+        main_topic_str = f"{set_question.get('theme_set', '')}: {set_question.get('question_text_en', '')}"
+        self.logger.info(f"Attempting to generate sub-questions for SET ID: {set_question.get('id')}")
+        
+        context_str = "\n\n---\n\n".join([chunk['text'] for chunk in validated_evidence])
+        
+        # --- FIX: ปรับปรุง Prompt ให้ยืดหยุ่นมากขึ้น ---
+        prompt = f"""
+        You are an expert ESG analyst creating a detailed questionnaire for the industrial packaging sector.
+        The main topic is derived from the SET benchmark question: "{main_topic_str}"
+
+        Based on the following context extracted from company documents, formulate 2-3 specific and actionable sub-questions that explore the main topic in detail.
+
+        CONTEXT:
+        ---
+        {context_str}
+        ---
+
+        INSTRUCTIONS:
+        1.  Your primary goal is to create sub-questions that are directly answerable or verifiable from the PROVIDED CONTEXT.
+        2.  If the context is sparse or not perfectly aligned, generate broader sub-questions that are still highly relevant to the main topic, rather than giving up. For example, ask about policies, management approaches, or data collection processes related to the main topic.
+        3.  Ensure the questions are distinct and probe for different aspects (e.g., policy, performance, governance).
+        4.  Return the result as a valid JSON object with a single key "sub_questions", which is a list of strings. Do not return an empty list unless the context is completely irrelevant.
+
+        Example output:
+        {{
+            "sub_questions": [
+                "What is the company's stated policy on water recycling mentioned in the report?",
+                "According to the context, what were the total water withdrawal figures for the last fiscal year?"
+            ]
+        }}
+        """
+
+        try:
+            response_object = await self.qg_llm.ainvoke(prompt)
+            llm_content = response_object.content
+            
+            # เพิ่ม Log เพื่อดูผลลัพธ์ดิบจาก LLM
+            self.logger.info(f"LLM Raw Output for SET ID {set_question.get('id')}: {llm_content}")
+
+            result = self._extract_json_from_llm_output(llm_content)
+            
+            if not result or not isinstance(result.get("sub_questions"), list) or not result.get("sub_questions"):
+                self.logger.warning(f"LLM did not return a valid list of sub-questions for SET ID: {set_question.get('id')}. Skipping.")
+                return None
+
+            sub_questions_list = result["sub_questions"]
+            
+            # (ส่วนที่เหลือของฟังก์ชันเหมือนเดิม)
+            main_q_en = set_question.get('question_text_en', '')
+            main_q_th = set_question.get('question_text_th', '') 
+            desc_en = f"Questions generated to cover SET benchmark: {main_q_en}"
+            sub_q_text_en = "\n".join(f"{i+1}. {q}" for i, q in enumerate(sub_questions_list))
+
+            desc_th, sub_q_text_th = await asyncio.gather(
+                self.translate_text_to_thai(desc_en, category_name=main_q_en),
+                self.translate_text_to_thai(sub_q_text_en, category_name=main_q_en)
+            )
+
+            highest_relevance_score = max(chunk.get('score', 0.0) for chunk in validated_evidence)
+            related_set_q_obj = RelatedSETQuestion(
+                set_id=set_question.get('id'),
+                title_th=main_q_th,
+                relevance_score=highest_relevance_score
+            )
+
+            # Pydantic models need to be converted to dict for the final structure if the DB model expects dicts.
+            # Assuming your _evaluate_and_integrate_new_question handles Pydantic objects or dicts correctly.
+            sub_q_detail_obj = SubQuestionDetail(
+                sub_question_text_en=sub_q_text_en,
+                sub_question_text_th=sub_q_text_th,
+                sub_theme_name=f"Details for {set_question.get('id')}",
+                category_dimension=set_question.get('dimension'),
+                detailed_source_info=f"Generated from {len(validated_evidence)} evidence chunks related to '{main_topic_str}'"
+            )
+
+            final_dict = {
+                "theme": f"SET Coverage: {set_question.get('theme_set')} ({set_question.get('id')})",
+                "category": set_question.get('dimension'),
+                "keywords": set_question.get('theme_set'),
+                "theme_description_en": desc_en,
+                "theme_description_th": desc_th,
+                "main_question_text_en": main_q_en,
+                "main_question_text_th": main_q_th,
+                "sub_questions_sets": [sub_q_detail_obj],
+                "related_set_questions": [related_set_q_obj],
+                "generation_method": "SET-Driven",
+            }
+            return final_dict
+
+        except Exception as e:
+            self.logger.error(f"Critical error during final dictionary generation for SET ID {set_question.get('id')}: {e}", exc_info=True)
+            return None
+
+    async def _run_targeted_gri_phase(self, target_standards: List[str], existing_used_entities: Set[str], existing_used_chunks: Set[str]) -> Tuple[List[Dict], Set[str], Set[str]]:
+        """
+        Runs the targeted GRI-driven question generation (Phase 2).
+        This version finds all communities but only generates a question for the LARGEST one.
+        """
+        final_questions = []
+        newly_used_entities = set()
+        newly_used_chunks = set()
+
+        for standard_code in target_standards:
+            self.logger.info(f"PHASE 2: Searching for target standard: {standard_code}")
+            
+            target_chunks = await self.neo4j_service.get_chunks_by_standard_code(standard_code)
+            unseen_chunks = [chunk for chunk in target_chunks if chunk['chunk_id'] not in existing_used_chunks]
+            
+            if not unseen_chunks:
+                self.logger.info(f"PHASE 2: No new, unseen documents found for {standard_code}. Skipping.")
+                continue
+
+            all_entities_in_chunks = {eid for chunk in unseen_chunks for eid in chunk.get('entity_ids', [])}
+            unseen_entity_ids = list(all_entities_in_chunks - existing_used_entities)
+            
+            if not unseen_entity_ids:
+                self.logger.info(f"PHASE 2: No new entities found for {standard_code}. Skipping.")
+                continue
+
+            subgraph_data = await self._get_entity_graph_data(include_only_entity_ids=unseen_entity_ids)
+            
+            theme_structures = await self.identify_hierarchical_themes_from_kg(
+                entity_graph_data=subgraph_data, 
+                min_first_order_community_size=3, 
+                min_main_category_fo_community_count=1
+            )
+            
+            if not theme_structures:
+                self.logger.warning(f"PHASE 2: Could not generate any theme structures for {standard_code} from its subgraph.")
+                continue
+
+            # --- NEW LOGIC: Select only the largest theme/community ---
+            self.logger.info(f"PHASE 2: Found {len(theme_structures)} potential themes for {standard_code}. Selecting the largest one.")
+            
+            largest_theme = max(
+                theme_structures, 
+                key=lambda theme: len(theme.get('_constituent_entity_ids_in_mc', []))
+            )
+            
+            final_theme_to_process = [largest_theme] # Create a list with only the single largest theme
+            
+            self.logger.info(f"PHASE 2: Selected largest theme '{largest_theme.get('main_category_name_en')}' with {len(largest_theme.get('_constituent_entity_ids_in_mc', []))} entities.")
+            # --- END OF NEW LOGIC ---
+
+            # Generate question set for only the largest theme
+            q_sets, info_map = await self._generate_qsets_from_theme_structures(final_theme_to_process)
+
+            for q_set in q_sets: # This loop will now only run once
+                q_dict = await self._convert_gqs_to_final_dict(q_set, info_map[q_set.main_category_name])
+                final_questions.append(q_dict)
+            
+            # Update newly used IDs for this phase
+            newly_used_chunks.update({chunk['chunk_id'] for chunk in unseen_chunks})
+            newly_used_entities.update(unseen_entity_ids)
+
+        return final_questions, newly_used_entities, newly_used_chunks
 
     async def _map_themes_to_set_benchmarks(
         self, 
@@ -1118,94 +1683,112 @@ class QuestionGenerationService:
 
     def _extract_json_from_llm_output(self, llm_output: str) -> Optional[Dict]:
         """
-        Attempts to extract a JSON object from the LLM's raw text output,
-        handling cases where it's embedded in Markdown code fences.
+        Attempts to extract a JSON object from the LLM's raw text output.
+        (This is a helper function assumed to be present in the class)
         """
         if not llm_output:
             return None
-        
         try:
-            # First, try to find JSON within ```json ... ```
             match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", llm_output, re.DOTALL)
             if match:
                 json_str = match.group(1)
-                return json.loads(json_str)
             else:
-                # If no markdown, try to parse the whole string
-                return json.loads(llm_output)
+                first_brace = llm_output.find('{')
+                last_brace = llm_output.rfind('}')
+                if first_brace != -1 and last_brace > first_brace:
+                    json_str = llm_output[first_brace : last_brace + 1]
+                else:
+                    return None
+            return json.loads(json_str)
         except json.JSONDecodeError:
             self.logger.warning(f"Could not decode JSON from LLM output: {llm_output[:200]}")
             return None
 
-# ในคลาส QuestionGenerationService
-
-    async def _find_evidence_and_generate_for_set_q(self, set_question: Dict[str, Any], custom_query: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    # ในคลาส QuestionGenerationService
+    async def _find_evidence_and_generate_for_set_q(self, set_question: Dict, custom_query: Optional[str] = None) -> Optional[Dict]:
         """
-        Finds evidence and generates questions. Can accept a custom query for the 2nd pass.
+        (User's Trusted Logic)
+        Finds evidence and generates a SET question. Returns None if sub-questions cannot be generated.
+        This version is adapted to return used node IDs for the 4-phase architecture.
         """
-        # ถ้ามี custom_query มาให้ใช้เลย, ถ้าไม่มีให้สร้างแบบปกติ
         if custom_query:
             search_query = custom_query
+            search_type = "Broad"
         else:
             search_query = f"{set_question.get('theme_set', '')}: {set_question.get('question_text_en', '')}"
+            search_type = "Precision"
 
-        self.logger.info(f"Searching for evidence for SET ID: {set_question.get('id')} using query: '{search_query[:100]}...'")
+        self.logger.info(f"Phase 1 ({search_type} Search): Searching evidence for SET ID: {set_question.get('id')}")
 
         evidence_chunks = await self.neo4j_service.find_semantically_similar_chunks(query_text=search_query, top_k=3)
         if not evidence_chunks:
             return None
 
+        # ใช้ Threshold เดิมที่คุณเชื่อมั่น
         SIMILARITY_THRESHOLD = 0.67
         validated_evidence = [chunk for chunk in evidence_chunks if chunk.get('score', 0.0) >= SIMILARITY_THRESHOLD]
+        
         if not validated_evidence:
-            self.logger.info(f"Evidence for SET ID {set_question.get('id')} did not meet threshold {SIMILARITY_THRESHOLD}.")
+            self.logger.info(f"Phase 1 ({search_type} Search): Evidence for SET ID {set_question.get('id')} did not meet threshold {SIMILARITY_THRESHOLD}.")
             return None
 
-        self.logger.info(f"Found {len(validated_evidence)} validated evidence chunks for SET ID: {set_question.get('id')}. Generating sub-questions...")
+        self.logger.info(f"Phase 1 ({search_type} Search): Found {len(validated_evidence)} validated chunks for SET ID: {set_question.get('id')}. Attempting generation...")
         context_str = "\n\n---\n\n".join([chunk['text'] for chunk in validated_evidence])
 
-        prompt =  f"""
+        prompt = f"""
         You are an expert ESG analyst creating a detailed questionnaire.
         The main topic is the SET benchmark question: "{search_query}"
-
         Based ONLY on the following context extracted from company documents, formulate 2-4 specific and actionable sub-questions that explore the main topic in detail. The sub-questions must be directly answerable from the provided context. Do not invent questions if the context is insufficient.
-
         CONTEXT:
         ---
         {context_str}
         ---
-
-        Return the result as a JSON object with a single key "sub_questions", which is a list of strings. If you cannot formulate questions from the context, return an empty JSON object {{}}.
+        Return the result as a JSON object with a single key "sub_questions", which is a list of strings. If you cannot formulate questions from the context, return an empty JSON object {{}} or a JSON with an empty list.
         """
 
         try:
             response_object = await self.qg_llm.ainvoke(prompt)
             result = self._extract_json_from_llm_output(response_object.content)
             
-            if not result or not result.get("sub_questions"):
+            # --- LOGIC เดิมของคุณที่เข้มงวด ---
+            if not result or "sub_questions" not in result:
+                self.logger.warning(f"LLM did not return a valid JSON with 'sub_questions' key for SET ID: {set_question.get('id')}. Skipping.")
                 return None
 
             sub_questions_list = result.get("sub_questions", [])
             if not sub_questions_list:
-                self.logger.warning(f"LLM returned valid JSON but no sub-questions for SET ID: {set_question.get('id')}.")
+                self.logger.warning(f"LLM returned an empty list for sub-questions for SET ID: {set_question.get('id')}. Skipping as per original logic.")
                 return None
+            # --- สิ้นสุด Logic เดิม ---
+
+            # ถ้าผ่านจุดนี้มาได้ แสดงว่า LLM สร้างคำถามย่อยสำเร็จ
+            self.logger.info(f"Phase 1 ({search_type} Search): LLM successfully generated {len(sub_questions_list)} sub-questions for SET ID: {set_question.get('id')}.")
 
             main_q_en = set_question.get('question_text_en', '')
-            main_q_th = set_question.get('question_text_th', '') 
-
+            main_q_th = set_question.get('question_text_th', '')
             desc_en = f"Questions generated to cover SET benchmark: {main_q_en}"
-            desc_th = await self.translate_text_to_thai(desc_en)
-
             sub_q_text_en = "\n".join(f"{i+1}. {q}" for i, q in enumerate(sub_questions_list))
-            sub_q_text_th = await self.translate_text_to_thai(sub_q_text_en)
+
+            desc_th, sub_q_text_th = await asyncio.gather(
+                self.translate_text_to_thai(desc_en),
+                self.translate_text_to_thai(sub_q_text_en)
+            )
 
             related_set_q_obj = RelatedSETQuestion(
                 set_id=set_question.get('id'),
                 title_th=main_q_th,
                 relevance_score=validated_evidence[0].get('score')
             )
-
-            return {
+            
+            sub_q_detail_obj = SubQuestionDetail(
+                sub_question_text_en=sub_q_text_en,
+                sub_question_text_th=sub_q_text_th,
+                sub_theme_name=f"Details for {set_question.get('id')}",
+                category_dimension=set_question.get('dimension'),
+                detailed_source_info=f"Generated from evidence chunks related to '{search_query}'"
+            )
+            
+            question_dict = {
                 "theme": f"SET Coverage: {set_question.get('theme_set')} ({set_question.get('id')})",
                 "category": set_question.get('dimension'),
                 "keywords": set_question.get('theme_set'),
@@ -1213,21 +1796,24 @@ class QuestionGenerationService:
                 "theme_description_th": desc_th,
                 "main_question_text_en": main_q_en,
                 "main_question_text_th": main_q_th,
-                "sub_questions_sets": [
-                    SubQuestionDetail(
-                        sub_question_text_en=sub_q_text_en,
-                        sub_question_text_th=sub_q_text_th,
-                        sub_theme_name=f"Details for {set_question.get('id')}",
-                        category_dimension=set_question.get('dimension'),
-                        detailed_source_info=f"Generated from evidence chunks related to '{search_query}'"
-                    )
-                ],
+                "sub_questions_sets": [sub_q_detail_obj],
                 "related_set_questions": [related_set_q_obj],
                 "generation_method": "SET-Driven"
             }
+
+            # --- การปรับแก้ที่สำคัญ ---
+            # รวบรวม ID ที่ใช้แล้วเพื่อส่งกลับ
+            used_chunk_ids = {chunk['chunk_id'] for chunk in validated_evidence}
+            used_entity_ids = {eid for chunk in validated_evidence for eid in chunk.get('entity_ids', [])}
+            
+            return {
+                "question": question_dict,
+                "used_entity_ids": used_entity_ids,
+                "used_chunk_ids": used_chunk_ids
+            }
+
         except Exception as e:
-            self.logger.error(f"Error during LLM generation for SET ID {set_question.get('id')}: {e}")
-            traceback.print_exc()
+            self.logger.error(f"Error during LLM generation for SET ID {set_question.get('id')}: {e}", exc_info=True)
             return None
 
     # --- NEW HELPER FOR PHASE 2 ---
@@ -1397,19 +1983,27 @@ class QuestionGenerationService:
         else:
             self.logger.info("No related SET questions found after re-evaluation.")
 
-    async def _run_adaptive_theme_identification(self) -> List[Dict[str, Any]]:
-        """Runs theme identification with adaptive settings."""
+    async def _run_adaptive_theme_identification(self, entity_graph_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Runs theme identification with adaptive settings, using pre-fetched graph data."""
         MINIMUM_DESIRED_THEMES = 15
         
-        print("[QG_SERVICE INFO] Attempt 1: Identifying themes with HIGH quality settings (4, 2)...")
-        themes = await self.identify_hierarchical_themes_from_kg(min_first_order_community_size=4, min_main_category_fo_community_count=2)
+        self.logger.info("Attempt 1: Identifying themes with HIGH quality settings (4, 2)...")
+        themes = await self.identify_hierarchical_themes_from_kg(
+            min_first_order_community_size=4, 
+            min_main_category_fo_community_count=2,
+            entity_graph_data=entity_graph_data  # <-- ส่งต่อ entity_graph_data
+        )
 
         if len(themes) < MINIMUM_DESIRED_THEMES:
-            print(f"[QG_SERVICE WARNING] High-quality settings yielded only {len(themes)} themes. Retrying with MEDIUM settings (3, 2)...")
-            themes = await self.identify_hierarchical_themes_from_kg(min_first_order_community_size=3, min_main_category_fo_community_count=2)
+            self.logger.warning(f"High-quality settings yielded only {len(themes)} themes. Retrying with MEDIUM settings (3, 2)...")
+            themes = await self.identify_hierarchical_themes_from_kg(
+                min_first_order_community_size=3, 
+                min_main_category_fo_community_count=2,
+                entity_graph_data=entity_graph_data  # <-- ส่งต่อ entity_graph_data
+            )
         
         if not themes:
-            print("[QG_SERVICE CRITICAL] No themes could be generated from any graph-based method.")
+            self.logger.critical("No themes could be generated from any graph-based method.")
             return []
             
         return themes

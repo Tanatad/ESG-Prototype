@@ -42,7 +42,6 @@ async def upload_file(
         background_tasks.add_task(
             qg_service.evolve_and_store_questions,
             document_ids=processed_doc_ids,
-            is_baseline_upload=True # สมมติว่าการอัปโหลดผ่าน Endpoint นี้เป็น Baseline เสมอ
         )
         # --- END CORRECTED PART ---
 
