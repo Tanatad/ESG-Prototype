@@ -352,3 +352,18 @@ class MongoDBSaver(BaseCheckpointSaver):
             self.logger.info("Successfully updated mappings.")
         else:
             self.logger.warning(f"Could not find question with ID '{question_id}' to update mappings.")
+
+    async def clear_all_questions(self):
+        """
+        Deletes all documents from the ESGQuestion collection.
+        Used to ensure a clean state before a baseline run.
+        """
+        try:
+            self.logger.warning("Clearing all documents from the ESGQuestion collection for baseline run...")
+            await ESGQuestion.delete_all()
+            self.logger.info("Successfully cleared the ESGQuestion collection.")
+        except Exception as e:
+            self.logger.error(f"Failed to clear ESGQuestion collection: {e}", exc_info=True)
+            # You might want to raise the exception to stop the process
+            # if a clean state is absolutely required.
+            raise

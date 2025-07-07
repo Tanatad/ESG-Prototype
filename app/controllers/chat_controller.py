@@ -8,27 +8,31 @@ import traceback # <--- FIX 1: เพิ่มการ import นี้
 
 router = APIRouter()
 
-@router.post("/", response_model=ChatRagResponse)
-async def chat(
+@router.post("/invoke", response_model=ChatRagResponse)
+async def invoke_chat_chain(
     request: ChatRagRequest,
     chat_service: ChatService = Depends(get_chat_service)
 ):
+    """
+    Handles a single invocation of the chat graph chain.
+    """
     chat_graph = chat_service.graph
     try:
-        config = {"configurable": {"thread_id": request.thread_id }}
-        messages = ([SystemMessage(content=request.prompt)] if request.prompt else []) + [HumanMessage(content=request.question)]
+        config = {"configurable": {"thread_id": request.thread_id}}
+        # สร้าง list ของ messages ตามที่ chain ต้องการ
+        messages = [HumanMessage(content=request.question)]
+        if request.prompt:
+            # เพิ่ม SystemMessage ถ้ามี prompt ส่งมา
+            messages.insert(0, SystemMessage(content=request.prompt))
         
-        # จุดที่คาดว่าเกิด error อยู่ในบรรทัดนี้
         output = await chat_graph.ainvoke({"messages": messages}, config=config)
         
-        return ChatRagResponse(messages=output["messages"])
+        return ChatRagResponse(messages=output.get("messages", []))
 
     except Exception as e:
-        # FIX 2: เพิ่ม 3 บรรทัดนี้เพื่อบังคับให้แสดง Traceback ใน Terminal
         print("\n--- !!! AN EXCEPTION OCCURRED IN CHAT CONTROLLER !!! ---")
-        traceback.print_exc() # พิมพ์สาเหตุของ Error ทั้งหมดออกมา
+        traceback.print_exc()
         print("--- !!! END OF EXCEPTION !!! ---\n")
-        
         raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------------------------------------------------------

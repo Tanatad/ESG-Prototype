@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-
 # --- CORRECT: Import the initializer from dependencies ---
 from app.dependencies import initialize_global_services
 from app.routers import routers

@@ -86,3 +86,4 @@ DROP CONSTRAINT standard_document_doc_id IF EXISTS;
 DROP CONSTRAINT constraint_907a464e IF EXISTS;
 
 streamlit run streamlit_app.py
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000

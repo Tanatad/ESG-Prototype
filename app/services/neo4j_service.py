@@ -134,19 +134,13 @@ class Neo4jService:
                 traceback.print_exc()
 
     async def find_semantically_similar_chunks(self, query_text: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """
-        Finds similar chunks using the async version of the vector store search.
-        """
         if not self.store:
             self.logger.warning("Vector store is not initialized. Cannot perform semantic search.")
             return []
         
         try:
             self.logger.info(f"Performing ASYNC semantic search for: '{query_text}'")
-            similar_nodes_with_scores = await self.store.asimilarity_search_with_score(
-                query=query_text, 
-                k=top_k
-            )
+            similar_nodes_with_scores = await self.store.asimilarity_search_with_score(query=query_text, k=top_k)
             
             # This part is crucial: we need to get the entity IDs linked to the chunk
             chunk_ids = [node.metadata.get("chunk_id") for node, score in similar_nodes_with_scores if node.metadata.get("chunk_id")]
@@ -156,21 +150,19 @@ class Neo4jService:
                 {
                     "text": node.page_content,
                     "chunk_id": node.metadata.get("chunk_id", ""),
-                    "document_id": node.metadata.get("doc_id", ""),
+                    "doc_id": node.metadata.get("doc_id", ""),
                     "score": score,
                     "entity_ids": entity_map.get(node.metadata.get("chunk_id"), []) # Add the entity IDs here
                 }
                 for node, score in similar_nodes_with_scores
             ]
         except Exception as e:
-            self.logger.error(f"Error during async semantic similarity search: {e}")
-            traceback.print_exc()
+            self.logger.error(f"Error during async semantic similarity search: {e}", exc_info=True)
             return []
 
     async def _get_entities_for_chunks(self, chunk_ids: List[str]) -> Dict[str, List[str]]:
-        """Given a list of chunk IDs, returns a map of chunk_id -> [entity_id_1, entity_id_2, ...]."""
-        if not chunk_ids:
-            return {}
+        """Given a list of chunk IDs, returns a map of chunk_id -> [entity_id_1, ...]."""
+        if not chunk_ids or not self.graph: return {}
         
         query = """
         UNWIND $chunk_ids AS c_id
@@ -736,16 +728,14 @@ class Neo4jService:
                 print(f"Error linking LLMTransformer __Entity__ nodes to StandardChunks: {e_link}")
                 traceback.print_exc()
 
-    async def flow(self, files: List[IO[bytes]], file_names: List[str]):
+    async def flow(self, files: List[IO[bytes]], file_names: List[str]) -> List[str]:
         """
         Orchestrates the end-to-end data ingestion and knowledge graph creation pipeline.
         This includes reading, chunking, translating, and extracting graph data from documents.
         """
         loop = asyncio.get_running_loop()
-        processed_doc_ids = []
-
+        
         # 1. Read PDFs and create initial Document objects
-        # Determines which PDF reader to use based on configuration
         if self.document_intelligence_client:
             self.logger.info("Using Azure Document Intelligence for PDF processing.")
             documents_from_pdf_loader = await self.read_PDFs_and_create_documents_azure(files, file_names)
@@ -763,22 +753,26 @@ class Neo4jService:
             self.logger.error("No chunks were created after splitting. Aborting flow.")
             return []
 
-        # 3. Translate chunks from Thai to English (as requested)
+        # 3. Translate chunks from Thai to English
         self.logger.info(f"Starting translation for {len(split_chunks_lc_docs)} chunks...")
         translated_chunks_lc_docs = await self.translate_documents_with_gemini(split_chunks_lc_docs)
         self.logger.info("Translation complete.")
         
         # 4. Group translated chunks by their original source file
-        docs_by_source_file = {}
+        docs_by_source_file: Dict[str, List[Document]] = {}
         for chunk_lc_doc in translated_chunks_lc_docs:
             source_fn = chunk_lc_doc.metadata.get('source_file_name', "unknown_source_file.pdf")
             docs_by_source_file.setdefault(source_fn, []).append(chunk_lc_doc)
 
-        # 5. Initialize the Graph Transformer with custom ESG schema and prompt
+        # --- CORRECTED POSITION ---
+        # Get the list of processed document IDs AFTER populating the dictionary
+        processed_doc_ids = list(docs_by_source_file.keys())
+        # ------------------------
+
+        # 5. Initialize the Graph Transformer
         esg_allowed_nodes = [ "Organization", "Person", "Standard", "Framework", "Guideline", "Regulation", "Law", "Report", "Document", "Disclosure", "Topic", "SubTopic", "Category", "Metric", "Indicator", "KPI", "Target", "Goal", "Objective", "Risk", "Opportunity", "Impact", "Strategy", "Policy", "Process", "Practice", "Activity", "Initiative", "Program", "Project", "Stakeholder", "Investor", "Employee", "Customer", "Supplier", "Community", "Government", "Region", "Country", "Location", "Facility", "EnvironmentalFactor", "SocialFactor", "GovernanceFactor", "ClimateChange", "GreenhouseGas", "GHGEmissions", "Energy", "Water", "Waste", "Biodiversity", "HumanRights", "LaborPractices", "HealthAndSafety", "DiversityAndInclusion", "CommunityEngagement", "BoardComposition", "Ethics", "Corruption", "ShareholderRights", "EconomicValue", "FinancialPerformance", "OperatingCost", "Revenue", "Investment", "Date", "Year", "Period", "Unit", "Value", "Percentage", "Currency", "Source", "Reference", "Term", "Concept" ]
         esg_allowed_relationships = [ "HAS_FRAMEWORK", "COMPLIES_WITH", "REFERENCES_STANDARD", "DISCLOSES_INFORMATION_ON", "REPORTS_ON", "APPLIES_TO", "MENTIONS", "DEFINES", "HAS_METRIC", "MEASURES", "TRACKS_KPI", "SETS_TARGET", "ACHIEVES_GOAL", "IDENTIFIES_RISK", "PRESENTS_OPPORTUNITY", "HAS_IMPACT_ON", "MITIGATES_RISK", "HAS_STRATEGY", "IMPLEMENTS_POLICY", "FOLLOWS_PROCESS", "ENGAGES_IN_ACTIVITY", "INVESTS_IN", "OPERATES_IN", "LOCATED_IN", "GOVERNED_BY", "PART_OF", "COMPONENT_OF", "SUBCLASS_OF", "INSTANCE_OF", "RELATES_TO", "ASSOCIATED_WITH", "CAUSES", "INFLUENCES", "CONTRIBUTES_TO", "REQUIRES", "ADDRESSES", "MANAGES", "MONITORS", "EVALUATES", "ISSUED_BY", "DEVELOPED_BY", "PUBLISHED_IN", "EFFECTIVE_DATE" ]
         
-        # Assume custom_esg_graph_extraction_prompt is defined in the class __init__
         llm_transformer_for_kg = LLMGraphTransformer(
             llm=self.llm,
             node_properties=["description", "name"],
@@ -790,21 +784,16 @@ class Neo4jService:
         )
         
         # 6. Process each file's chunks
-        for file_name in file_names:
-            doc_id = file_name
-            processed_doc_ids.append(doc_id)
-            
+        for file_name in processed_doc_ids: # Use the generated list of doc IDs
             chunks_for_this_file = docs_by_source_file.get(file_name)
             if not chunks_for_this_file:
-                self.logger.warning(f"No chunks found for file {file_name} after processing. Skipping.")
+                self.logger.warning(f"No chunks found for file {file_name} after grouping. Skipping.")
                 continue
 
             self.logger.info(f"Starting graph processing for file: {file_name}")
             
-            # Extract title and standard code for tagging
             standard_title, standard_code = self._extract_info_from_filename(file_name)
 
-            # Create document and chunk nodes in Neo4j, tagging them with standard_code
             chunk_docs_with_ids_for_transformer = await self._create_standard_document_and_chunks(
                 file_name=file_name,
                 translated_chunks=chunks_for_this_file,
@@ -812,7 +801,6 @@ class Neo4jService:
                 standard_code=standard_code
             )
 
-            # Apply LLM to extract entities/relationships and link them to chunks
             if chunk_docs_with_ids_for_transformer:
                 await self._apply_llm_graph_transformer_to_chunks(
                     chunk_docs_with_ids_for_transformer,
@@ -827,7 +815,6 @@ class Neo4jService:
         self.logger.info("PDF processing flow completed successfully.")
         
         return processed_doc_ids
-
 
     async def get_relate(self, query, k):     
         if not self.store:

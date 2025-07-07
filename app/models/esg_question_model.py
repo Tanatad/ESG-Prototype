@@ -1,11 +1,27 @@
 # file: app/models/esg_question_model.py
 
-from beanie import Document
+from beanie import Document, PydanticObjectId
 from pydantic import BaseModel, Field
 from typing import Optional, List, Any
 from datetime import datetime, timezone
-
+from pydantic import BaseModel, Field, ConfigDict
 # --- Sub-Models (These are already Schemas, no changes needed) ---
+from bson import ObjectId
+
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v, *args, **kwargs):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid ObjectId")
+        return ObjectId(v)
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, field_schema):
+        field_schema.update(type="string")
 
 class RelatedSETQuestion(BaseModel):
     set_id: str = Field(..., description="The unique identifier for the SET benchmark question.")
@@ -30,7 +46,7 @@ class SubQuestionDetail(BaseModel):
 # คลาสนี้ใช้สำหรับเก็บข้อมูลและแสดงผล โดยไม่จำเป็นต้อง Initialize Beanie
 class ESGQuestionSchema(BaseModel):
     # เพิ่ม field 'id' เพื่อรับค่า '_id' จาก MongoDB ได้อย่างถูกต้อง
-    id: Any = Field(None, alias="_id")
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
 
     # --- คัดลอก Fields ทั้งหมดจาก ESGQuestion เดิมมาไว้ที่นี่ ---
     # Core Content Fields
@@ -73,10 +89,17 @@ class ESGQuestion(Document, ESGQuestionSchema):
     
     # มีแค่ Settings ที่เป็นของ Beanie โดยเฉพาะ
     class Settings:
-        name = "esg_questions_final" # ชื่อ collection ที่ถูกต้องของคุณ
-        indexes = [
-            [("theme", 1), ("version", -1)],
-            [("is_active", 1)], 
-        ]
+        name = "esg_questions_final" # The name of the MongoDB collection
 
+    # --- FIX: Add Pydantic V2 model_config ---
+    # This tells FastAPI how to handle the model correctly for JSON conversion
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={
+            ObjectId: str,
+            PydanticObjectId: str  # This handles Beanie's specific type
+        }
+    )
 # --- END OF FIX ---

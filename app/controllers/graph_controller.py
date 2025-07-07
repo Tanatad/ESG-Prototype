@@ -9,46 +9,45 @@ import traceback
 from app.dependencies import get_neo4j_service, get_question_generation_service
 from app.services.question_generation_service import QuestionGenerationService
 from app.models.esg_question_model import ESGQuestion
-
+import io
 router = APIRouter()
 
-@router.post("/uploadfile", status_code=202)
-async def upload_file(
-    files: List[UploadFile],
-    background_tasks: BackgroundTasks,
+@router.post("/uploadfile")
+async def upload_file_and_evolve(
+    files: List[UploadFile] = File(...),
+    is_baseline: bool = False, # เพิ่ม parameter นี้เพื่อรับค่าจาก Streamlit
     neo4j_service: Neo4jService = Depends(get_neo4j_service),
     qg_service: QuestionGenerationService = Depends(get_question_generation_service)
 ):
     """
-    This endpoint ingests a list of documents into the knowledge graph
-    and triggers the question evolution process as a background task.
+    Handles file upload, ingestion, and question evolution synchronously.
+    Returns a comparison result of the question set before and after the process.
     """
     try:
-        print(f"[CONTROLLER LOG /uploadfile] Received {len(files)} file(s).")
-        
-        # เตรียมไฟล์สำหรับส่งให้ service
-        file_streams = [file.file for file in files]
+        if not files:
+            raise HTTPException(status_code=400, detail="No files uploaded.")
+            
+        file_streams = [io.BytesIO(await file.read()) for file in files]
         file_names = [file.filename for file in files]
         
-        print("[CONTROLLER LOG /uploadfile] Calling neo4j_service.flow to ingest data...")
-        
-        # --- CORRECTED PART ---
-        # รับค่า document_ids ที่ประมวลผลเสร็จแล้วกลับมา
+        # --- Run the entire pipeline synchronously ---
+
+        # 1. Ingest documents into Neo4j
         processed_doc_ids = await neo4j_service.flow(files=file_streams, file_names=file_names)
         
-        print(f"[CONTROLLER LOG /uploadfile] Ingestion complete. Triggering background question evolution for doc_ids: {processed_doc_ids}")
-        
-        # ส่ง document_ids เข้าไปใน background task
-        background_tasks.add_task(
-            qg_service.evolve_and_store_questions,
-            document_ids=processed_doc_ids,
-        )
-        # --- END CORRECTED PART ---
+        if not processed_doc_ids:
+             raise HTTPException(status_code=500, detail="Document ingestion failed.")
 
-        return {"message": f"Successfully started processing for {len(files)} files. Question evolution is running in the background."}
+        # 2. Evolve questions and get the comparison result
+        #    (This requires modifying QuestionGenerationService to return the result)
+        comparison_result = await qg_service.evolve_and_store_questions(
+            document_ids=processed_doc_ids, 
+            is_baseline_upload=is_baseline
+        )
+
+        return comparison_result
 
     except Exception as e:
-        print(f"[CONTROLLER ERROR /uploadfile] Error during file upload processing: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 

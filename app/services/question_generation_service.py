@@ -192,25 +192,19 @@ class QuestionGenerationService:
             print(f"[QG_SERVICE ERROR /translate] Error during translation to Thai for text '{text_to_translate[:30]}...': {e}")
             return None # Or return original text_to_translate as fallback
 
-    async def _get_entity_graph_data(self, 
-                                    exclude_entity_ids: Optional[Set[str]] = None,
-                                    include_only_entity_ids: Optional[List[str]] = None,
-                                    doc_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-        """
-        Fetches __Entity__ graph data, with flexible filtering options.
-        """
+    async def _get_entity_graph_data(self,
+                                     exclude_entity_ids: Optional[Set[str]] = None,
+                                     include_only_entity_ids: Optional[List[str]] = None,
+                                     doc_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         self.logger.info("Fetching __Entity__ graph data from Neo4j...")
         params = {}
         node_match_clause = ""
-        
+
+        # --- FIX START: แก้ไขการสร้าง Cypher Query ---
         if doc_ids:
             self.logger.info(f"Filtering graph data by doc_ids: {doc_ids}")
-            # --- FIX: ตั้งชื่อตัวแปรให้ StandardChunk node เป็น `sc` ---
-            node_match_clause = """
-            MATCH (e:__Entity__)<--(sc:StandardChunk)
-            WHERE sc.doc_id IN $doc_ids
-            """
-            # ---------------------------------------------------------
+            # กำหนดตัวแปร sc ให้กับ StandardChunk node ตรงนี้
+            node_match_clause = "MATCH (e:__Entity__)<--(sc:StandardChunk) WHERE sc.doc_id IN $doc_ids"
             params['doc_ids'] = doc_ids
         elif include_only_entity_ids:
             self.logger.info(f"Filtering graph data to include only {len(include_only_entity_ids)} entities.")
@@ -220,10 +214,12 @@ class QuestionGenerationService:
             node_match_clause = "MATCH (e:__Entity__)"
             if exclude_entity_ids:
                 self.logger.info(f"Filtering graph data to exclude {len(exclude_entity_ids)} entities.")
+                # ส่วนนี้ไม่จำเป็นต้องมี sc เพราะไม่ได้กรองด้วย doc_id
                 node_match_clause += " WHERE NOT e.id IN $exclude_ids"
                 params['exclude_ids'] = list(exclude_entity_ids)
+        # --- FIX END ---
 
-        # Query ที่เหลือยังคงเดิม แต่ตอนนี้จะทำงานกับ node_match_clause ที่ถูกต้องแล้ว
+        # Query ส่วนที่เหลือยังคงเดิม และจะทำงานถูกต้องกับ node_match_clause ที่แก้ไขแล้ว
         query_nodes = f"""
         {node_match_clause}
         WITH DISTINCT e
@@ -234,7 +230,7 @@ class QuestionGenerationService:
             [lbl IN labels(e) WHERE lbl <> '__Entity__'] AS specific_labels,
             COLLECT(DISTINCT {{doc_id: sc.doc_id, standard_code: sc.standard_code}}) as sources
         """
-        
+
         query_edges = f"""
         {node_match_clause}
         WITH COLLECT(DISTINCT e.id) as valid_ids
@@ -242,7 +238,7 @@ class QuestionGenerationService:
         WHERE e1.id IN valid_ids AND e2.id IN valid_ids AND e1.id <> e2.id
         RETURN DISTINCT e1.id AS source, e2.id AS target
         """
-        
+
         try:
             nodes_result = await self.run_in_executor(self.neo4j_service.graph.query, query_nodes, params)
             edges_result = await self.run_in_executor(self.neo4j_service.graph.query, query_edges, params)
@@ -251,11 +247,11 @@ class QuestionGenerationService:
             edges = self._process_edge_results(edges_result, nodes_map)
 
             self.logger.info(f"Fetched {len(nodes_map)} nodes and {len(edges)} edges based on filters.")
-            if not nodes_map: 
+            if not nodes_map:
                 self.logger.warning("No nodes found with the current filter criteria.")
                 return None
             return {"nodes_map": nodes_map, "edges": edges}
-            
+
         except Exception as e:
             self.logger.error(f"Error fetching filtered __Entity__ graph data: {e}", exc_info=True)
             return None
@@ -509,8 +505,9 @@ class QuestionGenerationService:
                 constituent_entity_ids_for_ct.append(entity_id)
                 node_type_display_list = entity_data.get('labels', [DEFAULT_NODE_TYPE])
                 node_type_display = ", ".join(node_type_display_list) if node_type_display_list else DEFAULT_NODE_TYPE
-                node_desc = entity_data.get('description', 'No description.')
-                if not node_desc.strip(): node_desc = "No substantive description."
+                node_desc = entity_data.get('description')
+                if not node_desc or not node_desc.strip():
+                    node_desc = "No substantive description."
                 doc_id = entity_data.get('source_document_doc_id')
                 if doc_id and isinstance(doc_id, str) and doc_id.strip():
                     source_doc_names_in_ct.add(doc_id)
@@ -1008,20 +1005,85 @@ class QuestionGenerationService:
             return False
     
             # --- ฟังก์ชันนี้คือเวอร์ชันสมบูรณ์ที่เติมโค้ดส่วนที่ขาดไปแล้ว ---
-    async def evolve_and_store_questions(self, document_ids: List[str]):
+    async def evolve_and_store_questions(self, document_ids: List[str], is_baseline_upload: bool):
         """
-        Main orchestrator that automatically detects whether to run in 
-        Baseline or Update mode by checking the database state.
+        Main orchestrator that runs the pipeline and returns a JSON-serializable comparison result.
         """
-        # ตรวจสอบสถานะของฐานข้อมูลเพื่อเลือกโหมดการทำงานอัตโนมัติ
-        is_db_empty = not await self.mongodb_service.has_existing_questions()
+        self.logger.info(f"Evolve and store called with baseline_upload = {is_baseline_upload}")
 
-        if is_db_empty:
-            self.logger.info("--- Database is empty. Running in BASELINE mode. ---")
+        # Helper function to make data JSON serializable
+        def serialize_docs(docs_raw: List[Dict]) -> List[Dict]:
+            serialized = []
+            for doc in docs_raw:
+                # Convert ObjectId to string
+                if '_id' in doc:
+                    doc['_id'] = str(doc['_id'])
+                # Convert datetime to string (ISO format)
+                for key, value in doc.items():
+                    if isinstance(value, datetime):
+                        doc[key] = value.isoformat()
+                serialized.append(doc)
+            return serialized
+
+        # 1. Get state BEFORE processing
+        before_state_raw = await self.mongodb_service.get_all_active_questions_raw()
+        before_state_serializable = serialize_docs(before_state_raw)
+        before_map = {q["theme"]: q for q in before_state_serializable}
+
+        # 2. Decide which pipeline to run
+        if is_baseline_upload:
+            self.logger.info("--- Baseline mode selected by user. ---")
+            await self.mongodb_service.clear_all_questions()
             await self._run_baseline_generation()
         else:
-            self.logger.info(f"--- Database has data. Running in UPDATE mode for docs: {document_ids} ---")
+            # If not baseline, ensure we're not running on empty docs
+            if not document_ids:
+                self.logger.warning("Update mode called with no document IDs. Aborting evolution.")
+                # Return the "before" state as "unchanged"
+                return [{"question": q, "status": "unchanged"} for q in before_state_serializable]
+                
+            self.logger.info(f"--- Update mode selected. Running for docs: {document_ids} ---")
             await self._run_update_generation(document_ids)
+
+        # 3. Get state AFTER processing
+        all_q_raw = await self.mongodb_service.get_all_questions_raw()
+        after_state_serializable = serialize_docs(all_q_raw)
+        after_state_serializable.sort(key=lambda x: (x.get("theme", ""), x.get("version", 0)))
+
+        # 4. Compare and create the result payload
+        display_list = []
+        processed_themes = set()
+
+        # Iterate through the "after" state to find new and updated items
+        for q_after in after_state_serializable:
+            q_theme = q_after.get("theme")
+            processed_themes.add(q_theme)
+            
+            status = "unchanged"
+            q_before = before_map.get(q_theme)
+            
+            if not q_before:
+                status = "new"
+            elif q_after.get("version", 1) > q_before.get("version", 1):
+                status = "updated"
+            
+            if not q_after.get("is_active", False):
+                # This logic is complex, let's simplify: only show if it was active before
+                if q_before and q_before.get("is_active", False):
+                    status = "deactivated"
+                else:
+                    continue # Skip if it was already inactive or never existed
+
+            display_list.append({"question": q_after, "status": status})
+            
+        # Iterate through the "before" state to find items that are now missing (if any)
+        # This logic is implicitly handled by the "deactivated" status above.
+        
+        # If no changes were detected, just return the list of unchanged items
+        if not any(item['status'] != 'unchanged' for item in display_list):
+            return [{"question": q, "status": "unchanged"} for q in after_state_serializable]
+
+        return display_list
 
     # ===================================================================
     # MODE 1: BASELINE GENERATION LOGIC (เหมือนเดิม แต่ปรับการบันทึกเล็กน้อย)
@@ -1050,38 +1112,32 @@ class QuestionGenerationService:
         used_chunk_ids.update(used_chunk_ids_p2)
         
         # Phase 3: Organic Discovery
-        # ใช้ ID ทั้งหมดที่ใช้ไปใน Phase 1 และ 2 เพื่อหา Residual Graph
         organic_questions = await self._run_organic_discovery_phase(used_entity_ids, used_chunk_ids)
 
         # Phase 4A: Final Validation
         candidates_for_validation = targeted_questions + organic_questions
-        final_approved_questions = await self._run_final_validation_phase(candidates_for_validation, all_set_benchmarks_from_db)
+        final_approved_questions = await self._run_final_validation_phase(candidates_for_validation, set_driven_questions)
 
         # Phase 4B: Integration (Baseline Mode)
         all_questions_to_integrate = set_driven_questions + final_approved_questions
         self.logger.info(f"BASELINE (Integration): Saving {len(all_questions_to_integrate)} question sets.")
         
         for candidate_dict in all_questions_to_integrate:
-            # ในโหมด Baseline เราจะบันทึกทุกอย่างเป็นเวอร์ชัน 1
             candidate_dict['version'] = 1
             await self.mongodb_service.store_esg_question(ESGQuestion(**candidate_dict))
         
         self.logger.info("Baseline generation process completed successfully.")
 
     async def _run_organic_discovery_phase(self, used_entity_ids: Set[str], used_chunk_ids: Set[str]) -> List[Dict]:
-        """Runs the organic, uncovered theme discovery (Phase 3)."""
         self.logger.info(f"PHASE 3: Fetching residual graph, excluding {len(used_entity_ids)} entities.")
         
-        # Get graph data, excluding all nodes used in previous phases
         residual_graph_data = await self._get_entity_graph_data(exclude_entity_ids=used_entity_ids)
         if not residual_graph_data or not residual_graph_data.get("nodes_map"):
             self.logger.warning("PHASE 3: Residual graph is empty. No organic themes to discover.")
             return []
 
-        # Run adaptive theme identification on the residual graph
         theme_structures = await self._run_adaptive_theme_identification(entity_graph_data=residual_graph_data)
-        if not theme_structures:
-            return []
+        if not theme_structures: return []
             
         q_sets, info_map = await self._generate_qsets_from_theme_structures(theme_structures)
         
@@ -1092,92 +1148,18 @@ class QuestionGenerationService:
             
         return organic_questions
 
-    async def _run_final_validation_phase(self, candidate_questions: List[Dict], set_benchmarks: List[Dict]) -> List[Dict]:
-        """Performs final validation check against SET benchmarks (Phase 4A)."""
-        if not candidate_questions:
-            return []
+    async def _run_final_validation_phase(self, candidate_questions: List[Dict], set_driven_questions: List[Dict]) -> List[Dict]:
+        if not candidate_questions: return []
         
-        self.logger.info(f"Performing final validation for {len(candidate_questions)} candidate questions...")
-
-        set_q_texts = [q.get('question_text_en', '') for q in set_benchmarks]
-        
-        # 1. embed_texts ตอนนี้จะคืนค่าเป็น list ของ 1D arrays (หรือ None)
-        set_q_embedding_list = await self.embed_texts(set_q_texts)
-
-        # 2. กรองอันที่ล้มเหลวออก และ "stack" ส่วนที่เหลือให้เป็น Matrix 2D ก้อนเดียว
-        valid_set_embeddings = [emb for emb in set_q_embedding_list if emb is not None]
-        if not valid_set_embeddings:
-            self.logger.error("Could not generate any embeddings for SET benchmarks. Cannot perform validation. Approving all candidates as a fallback.")
-            return candidate_questions
-
-        # np.vstack จะแปลง list ของ 1D arrays ให้เป็น 2D matrix
-        set_q_embeddings_matrix = np.vstack(valid_set_embeddings)
-
+        self.logger.info(f"PHASE 4 (Validation): Checking {len(candidate_questions)} candidates for redundancy against SET-driven questions.")
         approved_questions = []
         for candidate in candidate_questions:
-            candidate_text = f"{candidate.get('theme', '')} {candidate.get('main_question_text_en', '')}"
-            
-            # 3. สร้าง embedding ของ candidate ซึ่งตอนนี้จะเป็น 1D array
-            candidate_embedding_list = await self.embed_texts([candidate_text])
-            candidate_embedding_1d = candidate_embedding_list[0] if candidate_embedding_list else None
-            
-            if candidate_embedding_1d is None:
-                self.logger.warning(f"Could not create embedding for candidate '{candidate.get('theme')}'. Approving by default.")
-                approved_questions.append(candidate)
-                continue
-            
-            # 4. reshape candidate's 1D array ให้เป็น 2D array (1, dim) เพื่อให้เข้า function ได้
-            candidate_embedding_2d = candidate_embedding_1d.reshape(1, -1)
-            
-            # 5. ตอนนี้การคำนวณจะถูกต้อง: cosine_similarity(2D_array, 2D_array)
-            similarities = cosine_similarity(candidate_embedding_2d, set_q_embeddings_matrix)
-            max_similarity = np.max(similarities)
-            
-            if max_similarity < FINAL_VALIDATION_SIMILARITY_THRESHOLD:
-                self.logger.info(f"Candidate '{candidate.get('theme')}' PASSED validation (max similarity: {max_similarity:.4f})")
+            is_redundant = await self._is_theme_redundant(candidate, set_driven_questions)
+            if not is_redundant:
                 approved_questions.append(candidate)
             else:
-                self.logger.warning(f"Candidate '{candidate.get('theme')}' REJECTED as redundant to SET (max similarity: {max_similarity:.4f})")
-        
+                self.logger.warning(f"Candidate '{candidate.get('theme')}' REJECTED as redundant to a SET-driven question.")
         return approved_questions
-
-    async def _get_entity_graph_data(self, 
-                                     exclude_entity_ids: Optional[Set[str]] = None,
-                                     include_only_entity_ids: Optional[List[str]] = None,
-                                     doc_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-        self.logger.info("Fetching __Entity__ graph data from Neo4j...")
-        params = {}
-        node_match_clause = "MATCH (e:__Entity__)"
-        
-        if doc_ids:
-            self.logger.info(f"Filtering graph data by doc_ids: {doc_ids}")
-            # This is the most specific filter, for update mode
-            node_match_clause = "MATCH (e:__Entity__)<--(:StandardChunk) WHERE sc.doc_id IN $doc_ids"
-            params['doc_ids'] = doc_ids
-        elif include_only_entity_ids:
-            self.logger.info(f"Filtering graph data to include only {len(include_only_entity_ids)} entities.")
-            node_match_clause += " WHERE e.id IN $include_ids"
-            params['include_ids'] = include_only_entity_ids
-        elif exclude_entity_ids:
-            self.logger.info(f"Filtering graph data to exclude {len(exclude_entity_ids)} entities.")
-            node_match_clause += " WHERE NOT e.id IN $exclude_ids"
-            params['exclude_ids'] = list(exclude_entity_ids)
-
-        query_nodes = f"{node_match_clause} WITH DISTINCT e RETURN e.id AS id, e.description AS description"
-        query_edges = f"{node_match_clause} WITH COLLECT(DISTINCT e.id) as valid_ids MATCH (e1:__Entity__)-[r]-(e2:__Entity__) WHERE e1.id IN valid_ids AND e2.id IN valid_ids RETURN e1.id AS source, e2.id AS target"
-        
-        try:
-            nodes_result = await self.run_in_executor(self.neo4j_service.graph.query, query_nodes, params)
-            edges_result = await self.run_in_executor(self.neo4j_service.graph.query, query_edges, params)
-            nodes_map = {r['id']: {'id': r['id'], 'description': r['description']} for r in nodes_result}
-            edges = [(r['source'], r['target']) for r in edges_result]
-            
-            self.logger.info(f"Fetched {len(nodes_map)} nodes and {len(edges)} edges based on filters.")
-            if not nodes_map: return None
-            return {"nodes_map": nodes_map, "edges": list(set(map(tuple, map(sorted, edges))))}
-        except Exception as e:
-            self.logger.error(f"Error fetching filtered __Entity__ graph data: {e}", exc_info=True)
-            return None
 
     def _process_node_results(self, nodes_result) -> Dict:
         """Processes the raw node query result into a nodes_map."""
@@ -1220,27 +1202,19 @@ class QuestionGenerationService:
             return [None] * len(texts)
 
     async def run_in_executor(self, func, *args):
-        """Helper to run synchronous functions in an asyncio event loop."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, func, *args)
 
     async def _run_set_driven_phase(self, all_set_benchmarks: List[Dict]) -> Tuple[List[Dict], Set[str], Set[str]]:
-        """
-        Runs the SET-driven question generation (Phase 1) using a 2-Round search strategy.
-        """
         self.logger.info("--- Starting Phase 1: SET-Driven Generation (2-Round Strategy) ---")
+        final_questions, used_entities, used_chunks = [], set(), set()
         
-        final_questions = []
-        used_entities = set()
-        used_chunks = set()
-        
-        # --- Round 1: High-Precision Search ---
         self.logger.info("PHASE 1 (Round 1): Starting high-precision search.")
-        round1_tasks = [self._find_evidence_and_generate_for_set_q(set_q) for set_q in all_set_benchmarks]
-        round1_results = await asyncio.gather(*round1_tasks)
+        tasks_r1 = [self._find_evidence_and_generate_for_set_q(set_q) for set_q in all_set_benchmarks]
+        results_r1 = await asyncio.gather(*tasks_r1)
 
         covered_set_ids = set()
-        for res in round1_results:
+        for res in results_r1:
             if res and res.get("question"):
                 final_questions.append(res["question"])
                 used_entities.update(res.get("used_entity_ids", set()))
@@ -1250,22 +1224,21 @@ class QuestionGenerationService:
         
         self.logger.info(f"PHASE 1 (Round 1) Complete: Generated {len(final_questions)} questions, covering {len(covered_set_ids)} SET IDs.")
 
-        # --- Round 2: Broader Search for Uncovered Questions ---
         uncovered_set_qs = [q for q in all_set_benchmarks if q['id'] not in covered_set_ids]
         if not uncovered_set_qs:
             self.logger.info("PHASE 1 (Round 2): All SET questions covered in Round 1. Skipping.")
             return final_questions, used_entities, used_chunks
 
         self.logger.info(f"PHASE 1 (Round 2): Starting broader search for {len(uncovered_set_qs)} uncovered SET questions.")
-        round2_tasks = []
+        tasks_r2 = []
         for set_q in uncovered_set_qs:
             broad_query = set_q.get('question_text_en', '')
-            round2_tasks.append(self._find_evidence_and_generate_for_set_q(set_q, custom_query=broad_query))
+            tasks_r2.append(self._find_evidence_and_generate_for_set_q(set_q, custom_query=broad_query))
 
-        round2_results = await asyncio.gather(*round2_tasks)
+        results_r2 = await asyncio.gather(*tasks_r2)
         
         round2_question_count = 0
-        for res in round2_results:
+        for res in results_r2:
             if res and res.get("question"):
                 set_id = res["question"]["related_set_questions"][0].set_id
                 if set_id not in covered_set_ids:
@@ -1276,20 +1249,21 @@ class QuestionGenerationService:
                     round2_question_count += 1
 
         self.logger.info(f"PHASE 1 (Round 2) Complete: Generated {round2_question_count} additional questions.")
-        
         return final_questions, used_entities, used_chunks
 
     async def _run_update_generation(self, document_ids: List[str]):
+        """
+        Generates questions only from new documents and compares them to existing ones.
+        """
         self.logger.info("UPDATE RUN (Step 1): Generating candidate questions from new documents.")
         
-        # This is the line that was causing the error
         subgraph_data = await self._get_entity_graph_data(doc_ids=document_ids)
         
         if not subgraph_data:
             self.logger.warning(f"UPDATE RUN: No graph data found for new documents: {document_ids}. Aborting.")
             return
 
-        candidate_themes = await self.identify_hierarchical_themes_from_kg(entity_graph_data=subgraph_data, min_first_order_community_size=3, min_main_category_fo_community_count=1)
+        candidate_themes = await self.identify_hierarchical_themes_from_kg(entity_graph_data=subgraph_data, min_first_order_community_size=3, min_main_category_fo_community_count=2)
         if not candidate_themes:
             self.logger.warning(f"UPDATE RUN: Could not generate any candidate themes from new documents. Aborting.")
             return
@@ -1298,7 +1272,7 @@ class QuestionGenerationService:
         self.logger.info(f"UPDATE RUN (Step 1) Complete: Generated {len(candidate_qsets)} candidate questions.")
 
         self.logger.info("UPDATE RUN (Step 2): Evaluating candidates against existing questions in DB.")
-        active_db_questions = await ESGQuestion.find(ESGQuestion.is_active == True).to_list()
+        active_db_questions = await self.mongodb_service.get_all_active_questions()
         
         for candidate_qset in candidate_qsets:
             await self._evaluate_and_integrate_update(candidate_qset, info_map.get(candidate_qset.main_category_name, {}), active_db_questions)
@@ -1400,8 +1374,8 @@ class QuestionGenerationService:
     async def _find_most_similar_db_question(self, 
                                            candidate_qset: GeneratedQuestionSet, 
                                            active_db_questions: List[ESGQuestion],
-                                           threshold=0.85) -> Optional[ESGQuestion]:
-        """Finds the most semantically similar question from the database."""
+                                           threshold=SIMILARITY_THRESHOLD_KG_THEME_UPDATE) -> Optional[ESGQuestion]:
+        # ... (Implementation is sound, no changes needed) ...
         if not active_db_questions: return None
 
         candidate_text = f"{candidate_qset.main_category_name} {candidate_qset.main_category_description}"
@@ -1428,28 +1402,19 @@ class QuestionGenerationService:
         
         return None
 
-    async def _find_evidence_and_generate_for_set_q(self, set_question: Dict) -> Optional[Dict]:
-        """Finds evidence, generates a question, and returns used node IDs."""
-        search_query = f"{set_question.get('theme_set', '')}: {set_question.get('question_text_en', '')}"
+    async def _find_evidence_and_generate_for_set_q(self, set_question: Dict, custom_query: Optional[str] = None) -> Optional[Dict]:
+        search_query = custom_query or f"{set_question.get('theme_set', '')}: {set_question.get('question_text_en', '')}"
         
-        # This function should be updated to also return the IDs of chunks/entities used
-        # For now, we assume neo4j_service returns dicts with 'chunk_id' and 'entity_ids'
         evidence_chunks = await self.neo4j_service.find_semantically_similar_chunks(query_text=search_query, top_k=3)
-        
         if not evidence_chunks: return None
         
-        # Assume a threshold and validation logic...
-        validated_evidence = [chunk for chunk in evidence_chunks if chunk.get('score', 0.0) >= 0.7]
+        validated_evidence = [chunk for chunk in evidence_chunks if chunk.get('score', 0.0) >= 0.67]
         if not validated_evidence: return None
 
-        # (LLM call to generate sub-questions based on evidence...)
-        # This part is simplified for brevity. Assume it produces a valid question_dict.
         question_dict = await self._generate_final_dict_for_set_q(set_question, validated_evidence)
-        if not question_dict:
-             return None
+        if not question_dict: return None
 
         used_chunk_ids = {chunk['chunk_id'] for chunk in validated_evidence}
-        # Assuming each chunk has a list of related entity IDs
         used_entity_ids = {eid for chunk in validated_evidence for eid in chunk.get('entity_ids', [])}
         
         return {
@@ -1565,13 +1530,7 @@ class QuestionGenerationService:
             return None
 
     async def _run_targeted_gri_phase(self, target_standards: List[str], existing_used_entities: Set[str], existing_used_chunks: Set[str]) -> Tuple[List[Dict], Set[str], Set[str]]:
-        """
-        Runs the targeted GRI-driven question generation (Phase 2).
-        This version finds all communities but only generates a question for the LARGEST one.
-        """
-        final_questions = []
-        newly_used_entities = set()
-        newly_used_chunks = set()
+        final_questions, newly_used_entities, newly_used_chunks = [], set(), set()
 
         for standard_code in target_standards:
             self.logger.info(f"PHASE 2: Searching for target standard: {standard_code}")
@@ -1579,16 +1538,12 @@ class QuestionGenerationService:
             target_chunks = await self.neo4j_service.get_chunks_by_standard_code(standard_code)
             unseen_chunks = [chunk for chunk in target_chunks if chunk['chunk_id'] not in existing_used_chunks]
             
-            if not unseen_chunks:
-                self.logger.info(f"PHASE 2: No new, unseen documents found for {standard_code}. Skipping.")
-                continue
+            if not unseen_chunks: continue
 
             all_entities_in_chunks = {eid for chunk in unseen_chunks for eid in chunk.get('entity_ids', [])}
             unseen_entity_ids = list(all_entities_in_chunks - existing_used_entities)
             
-            if not unseen_entity_ids:
-                self.logger.info(f"PHASE 2: No new entities found for {standard_code}. Skipping.")
-                continue
+            if not unseen_entity_ids: continue
 
             subgraph_data = await self._get_entity_graph_data(include_only_entity_ids=unseen_entity_ids)
             
@@ -1598,31 +1553,17 @@ class QuestionGenerationService:
                 min_main_category_fo_community_count=1
             )
             
-            if not theme_structures:
-                self.logger.warning(f"PHASE 2: Could not generate any theme structures for {standard_code} from its subgraph.")
-                continue
+            if not theme_structures: continue
 
-            # --- NEW LOGIC: Select only the largest theme/community ---
             self.logger.info(f"PHASE 2: Found {len(theme_structures)} potential themes for {standard_code}. Selecting the largest one.")
+            largest_theme = max(theme_structures, key=lambda theme: len(theme.get('_constituent_entity_ids_in_mc', [])))
             
-            largest_theme = max(
-                theme_structures, 
-                key=lambda theme: len(theme.get('_constituent_entity_ids_in_mc', []))
-            )
-            
-            final_theme_to_process = [largest_theme] # Create a list with only the single largest theme
-            
-            self.logger.info(f"PHASE 2: Selected largest theme '{largest_theme.get('main_category_name_en')}' with {len(largest_theme.get('_constituent_entity_ids_in_mc', []))} entities.")
-            # --- END OF NEW LOGIC ---
+            q_sets, info_map = await self._generate_qsets_from_theme_structures([largest_theme])
 
-            # Generate question set for only the largest theme
-            q_sets, info_map = await self._generate_qsets_from_theme_structures(final_theme_to_process)
-
-            for q_set in q_sets: # This loop will now only run once
+            for q_set in q_sets:
                 q_dict = await self._convert_gqs_to_final_dict(q_set, info_map[q_set.main_category_name])
                 final_questions.append(q_dict)
             
-            # Update newly used IDs for this phase
             newly_used_chunks.update({chunk['chunk_id'] for chunk in unseen_chunks})
             newly_used_entities.update(unseen_entity_ids)
 
@@ -1819,19 +1760,40 @@ class QuestionGenerationService:
     # --- NEW HELPER FOR PHASE 2 ---
 
     async def _is_theme_redundant(self, organic_theme: Dict[str, Any], set_driven_questions: List[Dict[str, Any]]) -> bool:
-        """Checks if an organic theme is too similar to any already-generated SET-driven questions."""
-        if not set_driven_questions:
-            return False
-
-        organic_theme_text = f"{organic_theme.get('main_category_name_en', '')} {organic_theme.get('main_category_description_en', '')}"
-        
+        organic_theme_text = f"{organic_theme.get('theme', '')} {organic_theme.get('theme_description_en', '')}"
         for set_q_dict in set_driven_questions:
             set_q_text = f"{set_q_dict.get('theme', '')} {set_q_dict.get('theme_description_en', '')}"
-            
-            # Use the existing similarity check method
-            if await self.are_questions_substantially_similar(organic_theme_text, set_q_text, threshold=0.85):
+            if await self.are_questions_substantially_similar(organic_theme_text, set_q_text, threshold=FINAL_VALIDATION_SIMILARITY_THRESHOLD):
                 return True
         return False
+        
+    async def _evaluate_and_integrate_update(self, 
+                                         candidate_qset: GeneratedQuestionSet,
+                                         candidate_theme_info: Dict, 
+                                         active_db_questions: List[ESGQuestion]):
+        most_similar_db_q = await self._find_most_similar_db_question(candidate_qset, active_db_questions)
+        
+        if not most_similar_db_q:
+            self.logger.info(f"UPDATE: Candidate '{candidate_qset.main_category_name}' is novel. Adding as new question.")
+            new_question_dict = await self._convert_gqs_to_final_dict(candidate_qset, candidate_theme_info)
+            await self.mongodb_service.store_esg_question(ESGQuestion(**new_question_dict))
+            return
+
+        self.logger.info(f"UPDATE: Candidate '{candidate_qset.main_category_name}' is similar to existing question '{most_similar_db_q.theme}'. Evaluating quality...")
+        is_better, is_same_topic = await self._is_new_theme_better(most_similar_db_q, candidate_qset)
+
+        if not is_same_topic:
+            self.logger.info(f"UPDATE: LLM judged topics are different. Adding '{candidate_qset.main_category_name}' as new question.")
+            new_question_dict = await self._convert_gqs_to_final_dict(candidate_qset, candidate_theme_info)
+            await self.mongodb_service.store_esg_question(ESGQuestion(**new_question_dict))
+        elif is_better:
+            self.logger.warning(f"UPDATE: New candidate '{candidate_qset.main_category_name}' is BETTER. Replacing old question.")
+            await self.mongodb_service.deactivate_question_set_in_db(str(most_similar_db_q.id))
+            new_question_dict = await self._convert_gqs_to_final_dict(candidate_qset, candidate_theme_info)
+            new_question_dict['version'] = most_similar_db_q.version + 1
+            await self.mongodb_service.store_esg_question(ESGQuestion(**new_question_dict))
+        else:
+            self.logger.info(f"UPDATE: Existing question '{most_similar_db_q.theme}' is better or unchanged. Discarding new candidate.")
 
     # --- NEW HELPER TO CONVERT GQS to Dict ---
 
@@ -1984,28 +1946,24 @@ class QuestionGenerationService:
             self.logger.info("No related SET questions found after re-evaluation.")
 
     async def _run_adaptive_theme_identification(self, entity_graph_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Runs theme identification with adaptive settings, using pre-fetched graph data."""
         MINIMUM_DESIRED_THEMES = 15
         
         self.logger.info("Attempt 1: Identifying themes with HIGH quality settings (4, 2)...")
         themes = await self.identify_hierarchical_themes_from_kg(
+            entity_graph_data=entity_graph_data,
             min_first_order_community_size=4, 
-            min_main_category_fo_community_count=2,
-            entity_graph_data=entity_graph_data  # <-- ส่งต่อ entity_graph_data
+            min_main_category_fo_community_count=2
         )
 
         if len(themes) < MINIMUM_DESIRED_THEMES:
             self.logger.warning(f"High-quality settings yielded only {len(themes)} themes. Retrying with MEDIUM settings (3, 2)...")
             themes = await self.identify_hierarchical_themes_from_kg(
+                entity_graph_data=entity_graph_data,
                 min_first_order_community_size=3, 
-                min_main_category_fo_community_count=2,
-                entity_graph_data=entity_graph_data  # <-- ส่งต่อ entity_graph_data
+                min_main_category_fo_community_count=2
             )
         
-        if not themes:
-            self.logger.critical("No themes could be generated from any graph-based method.")
-            return []
-            
+        if not themes: self.logger.critical("No themes could be generated from any graph-based method.")
         return themes
 
     async def _generate_qsets_from_theme_structures(self, theme_structures: List[Dict[str, Any]]) -> Tuple[List[GeneratedQuestionSet], Dict[str, Dict[str, Any]]]:
