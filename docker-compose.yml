@@ -1,6 +1,6 @@
 services:
   neo4j:
-    image: neo4j:5.20.0 # หรือเวอร์ชันอื่นๆ ที่คุณต้องการ
+    image: neo4j:5.20.0
     container_name: neo4j_db_local
     ports:
       - "7474:7474"
@@ -11,6 +11,7 @@ services:
       - ./neo4j/conf:/conf
       - ./neo4j/plugins:/plugins
     environment:
+      # --- Authentication and Plugins (Correct as is) ---
       - NEO4J_AUTH=neo4j/Nice0822976633
       - NEO4J_PLUGINS=["apoc", "graph-data-science"]
       - NEO4J_apoc_export_file_enabled=true
@@ -18,17 +19,17 @@ services:
       - NEO4J_apoc_import_file_use__neo4j__config=true
       - NEO4J_dbms_security_procedures_unrestricted=gds.*,apoc.*
 
-      # --- ใช้ Key การตั้งค่า Memory แบบใหม่สำหรับ Neo4j 5.x ---
-      - server.memory.heap.initial_size=512m
-      - server.memory.heap.max_size=512m
-      - server.memory.pagecache.size=512m
-
+      # --- CORRECTED & UPDATED MEMORY SETTINGS FOR NEO4J 5.x ---
+      # The format is NEO4J_ and dots (.) are replaced with double underscores (__).
+      - NEO4J_server_memory_heap_initial__size=1.5G 
+      - NEO4J_server_memory_heap_max__size=1.5G
+      - NEO4J_server_memory_pagecache_size=1.5G
+    
     healthcheck:
       test: ["CMD-SHELL", "wget --output-document=/dev/null --timeout=10 http://localhost:7474/ || exit 1"]
       interval: 5s
       timeout: 10s
       retries: 10
-
 
   mongo:
     image: mongo:latest
@@ -39,8 +40,4 @@ services:
       - ./database/mongo_data:/data/db
 
 volumes:
-  # neo4j_data:
-  # neo4j_logs:
-  # neo4j_import:
-  # neo4j_plugins:
   mongo_data:

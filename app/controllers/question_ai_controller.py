@@ -4,7 +4,7 @@ from typing import List, Any, Dict
 import traceback
 from datetime import datetime
 
-# --- Import Beanie Document Model ---
+# --- Import Beanie Document Model and Special Types ---
 from app.models.esg_question_model import ESGQuestion
 from beanie import PydanticObjectId
 
@@ -13,38 +13,42 @@ router = APIRouter(
     tags=["Question AI Management"]
 )
 
-def custom_serializer(data: Any) -> Any:
+def robust_json_serializer(data: Any) -> Any:
     """
-    A robust custom serializer to handle non-serializable types
-    like PydanticObjectId and datetime.
+    A robust custom serializer that recursively traverses data structures
+    to convert non-serializable types like PydanticObjectId and datetime.
     """
     if isinstance(data, list):
-        # If the data is a list, process each item in the list
-        return [custom_serializer(item) for item in data]
+        # If it's a list, apply the serializer to each item
+        return [robust_json_serializer(item) for item in data]
     
     if isinstance(data, dict):
-        # If the data is a dictionary, process each key-value pair
+        # If it's a dictionary, apply the serializer to each value
         new_dict = {}
         for key, value in data.items():
-            new_dict[key] = custom_serializer(value)
+            # Special handling for the '_id' key, which is often the source of the issue
+            if key == "_id" and isinstance(value, PydanticObjectId):
+                new_dict[key] = str(value)
+            else:
+                new_dict[key] = robust_json_serializer(value)
         return new_dict
         
     if isinstance(data, PydanticObjectId):
-        # This is the core logic: convert PydanticObjectId to string
+        # The core logic: convert any PydanticObjectId to a string
         return str(data)
         
     if isinstance(data, datetime):
-        # Also handle datetime objects, converting them to standard ISO format string
+        # Also handle datetime objects, converting them to standard ISO format
         return data.isoformat()
         
-    # For all other data types (str, int, float, bool, None), return as is
+    # For all other simple data types (str, int, float, bool, None), return them as is
     return data
 
 @router.get("/questions/active")
 async def get_active_questions():
     """
-    Retrieves all active ESG questions and uses a custom serializer
-    to guarantee a valid JSON response.
+    Retrieves all active ESG questions and uses a custom, robust serializer
+    to guarantee a valid JSON response, bypassing FastAPI's problematic auto-serialization.
     """
     try:
         # 1. Fetch data directly using the Beanie Document model
@@ -52,13 +56,13 @@ async def get_active_questions():
             ESGQuestion.is_active == True
         ).sort([("category", 1), ("theme", 1)]).to_list()
 
-        # 2. Convert each Beanie document to a dictionary
+        # 2. Convert each Beanie document to a basic dictionary
         question_dicts = [q.model_dump() for q in questions]
 
-        # 3. Use the robust custom serializer to clean the data
-        serializable_data = custom_serializer(question_dicts)
+        # 3. Use our robust custom serializer to clean the data
+        serializable_data = robust_json_serializer(question_dicts)
         
-        # 4. Return the clean, serializable list using JSONResponse
+        # 4. Return the clean, serializable list using FastAPI's JSONResponse
         return JSONResponse(content=serializable_data)
     
     except Exception as e:
