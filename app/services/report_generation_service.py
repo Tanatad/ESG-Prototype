@@ -155,58 +155,114 @@ class ReportGenerationService:
             return {"status": "insufficient", "reason": "Could not determine sufficiency due to an internal error."}
 
     # --- Agent 2: Fact Extractor ---
-    async def _extract_facts_for_sub_question(self, sub_question: str, context_chunks: List[str]) -> str:
-        if not context_chunks:
-            return "No relevant context found."
-        context_string = "\n\n---\n\n".join(context_chunks)
-        prompt = PromptTemplate.from_template(
-            """
-            You are a data extraction engine. Your task is to extract ALL facts, figures, statements, and policies from the 'Context' that are directly relevant to answering the 'Sub-Question'.
-            - List each fact as a separate bullet point.
-            - Do not synthesize, summarize, or explain. Just extract the raw information.
-            - If no relevant facts are found, respond with "No relevant facts found in the context."
-            Context:
-            ---
-            {context}
-            ---
-            Sub-Question: {sub_question}
-            Extracted Facts:
-            """
-        )
-        chain = prompt | self.llm
-        response = await chain.ainvoke({"sub_question": sub_question, "context": context_string})
-        return _extract_content_from_response(response)
+    async def _extract_facts_for_sub_question(self, sub_question: str, context: List[str]) -> List[str]:
+        """
+        ปรับปรุงใหม่: สกัดเฉพาะข้อเท็จจริงดิบๆ ที่เกี่ยวข้องกับคำถามย่อยจาก context
+        LLM ในขั้นตอนนี้จะทำหน้าที่เป็น "Data Extractor" เท่านั้น
+        """
+        
+        # --- START: PROMPT ที่ปรับปรุงใหม่ ---
+        prompt_text = f"""
+        You are a meticulous and objective data extractor. Your SOLE task is to extract raw, objective facts from the provided "Source Documents" that are DIRECTLY relevant to the following "Question".
+
+        **INSTRUCTIONS:**
+        1.  **Extract, DO NOT Analyze:** Do not interpret, analyze, or form opinions. Extract only factual statements, data points, or direct quotes.
+        2.  **Direct Relevance Only:** Only extract information that directly answers or relates to the Question. If no relevant information is found in a document, ignore it.
+        3.  **Output Format:** Present the extracted facts as a clear, bulleted list. Each bullet point should be a distinct fact.
+        4.  **No Information Found:** If you find NO relevant facts in any of the source documents, you MUST respond with the single phrase: "NO RELEVANT INFORMATION FOUND". Do not write anything else.
+
+        **Question:**
+        {sub_question}
+
+        **Source Documents:**
+        ---
+        {"---".join(context)}
+        ---
+
+        **Extracted Facts:**
+        """
+        # --- END: PROMPT ที่ปรับปรุงใหม่ ---
+
+        # --- START OF FIX: แก้ไขการเรียกใช้ LLM ให้ถูกต้อง ---
+        try:
+            # 1. สร้าง Chain ด้วย Prompt และ LLM ที่มี temperature = 0.0
+            prompt_template = PromptTemplate.from_template(prompt_text)
+            # ใช้ self.llm ที่ถูกตั้งค่าไว้สำหรับงานทั่วไป แต่เราจะ override temperature ตอนเรียกใช้
+            chain = prompt_template | self.llm
+
+            # 2. เรียกใช้ Chain ด้วย .ainvoke และส่ง context เข้าไป
+            response = await chain.ainvoke(
+                {"sub_question": sub_question, "context": context}, 
+                config={"configurable": {"temperature": 0.2}} # Override temperature เพื่อความแม่นยำ
+            )
+            content = _extract_content_from_response(response)
+
+            # 3. ประมวลผลผลลัพธ์
+            if "NO RELEVANT INFORMATION FOUND" in content:
+                return []
+                
+            return [fact.strip() for fact in content.split('\n') if fact.strip() and fact.startswith(('*', '-'))]
+        
+        except Exception as e:
+            self.logger.error(f"Fact Extractor agent failed for sub-question '{sub_question}': {e}")
+            return []
 
     # --- Agent 3: Disclosure Analyst ---
-    async def _analyze_facts_for_disclosure(self, main_question: str, fact_list: List[Dict]) -> str:
-        if not fact_list:
-            return "No analysis could be performed due to lack of data."
-        analysis_context = ""
-        for item in fact_list:
-            analysis_context += f"Facts for Sub-Question '{item['sub_question']}':\n{item['facts']}\n\n"
-        prompt = PromptTemplate.from_template(
-            """
-            You are a senior ESG analyst. You have been given a set of raw facts extracted from a company's documents related to a main ESG topic.
-            Your task is to analyze these facts and write a concise, professional summary for a disclosure statement.
-            **Instructions:**
-            1. Review all the extracted facts.
-            2. Synthesize these facts into a well-structured narrative disclosure.
-            3. Where possible, identify and summarize:
-                - Key Strengths / Good Performance.
-                - Areas for Improvement or identified gaps.
-                - Key quantitative data points (metrics, figures, targets).
-            **Main ESG Topic:**
-            {main_question}
-            **Extracted Facts:**
-            ---
-            {analysis_context}
-            ---
-            **Professional Disclosure Summary:**
-            """
-        )
-        chain = prompt | self.llm
-        response = await chain.ainvoke({"main_question": main_question, "analysis_context": analysis_context})
-        return _extract_content_from_response(response)
+    async def _analyze_facts_for_disclosure(self, main_question: str, facts_by_sub_q: List[Dict]) -> str:
+        """
+        ปรับปรุงใหม่: วิเคราะห์ชุดข้อเท็จจริงดิบที่สกัดมาได้ เพื่อสร้างเป็น Disclosure ที่สมดุล
+        """
+        
+        # จัดรูปแบบ Fact ที่ได้มาให้อ่านง่าย
+        formatted_facts = ""
+        for item in facts_by_sub_q:
+            formatted_facts += f"\n**Sub-Question:** {item['sub_question']}\n"
+            if item['facts']:
+                for fact in item['facts']:
+                    formatted_facts += f"- {fact}\n"
+            else:
+                formatted_facts += "- No specific facts were extracted for this sub-question.\n"
+
+        # --- START: PROMPT ที่ปรับปรุงใหม่ ---
+        prompt_text = f"""
+        You are an expert ESG analyst. Your task is to write a balanced, neutral, and comprehensive disclosure statement for a sustainability report.
+
+        **Primary Question to Answer:**
+        {main_question}
+
+        **Available Factual Evidence:**
+        You must base your entire analysis STRICTLY on the following "Factual Evidence" extracted from the company's documents. Do not invent information.
+        ---
+        {formatted_facts}
+        ---
+
+        **Analysis and Writing Instructions:**
+        1.  **Synthesize the Facts:** Review all the provided facts to form a holistic understanding.
+        2.  **Identify Strengths and Weaknesses:** Based *only* on the evidence, what does the company do well regarding the primary question? What information is missing or appears to be a weakness?
+        3.  **Write a Neutral Disclosure:** Draft a formal disclosure paragraph.
+            - Start with a direct answer to the primary question if possible.
+            - Present both the positive aspects (what the evidence shows they are doing) and the gaps (what the evidence does not show).
+            - Maintain a professional, objective, and non-promotional ("no-hype") tone.
+            - If the evidence is insufficient to answer the question, state that clearly. For example: "Based on the provided documents, there is insufficient information to determine the company's detailed policy on XYZ."
+
+        **Final Disclosure Statement:**
+        """
+        # --- END: PROMPT ที่ปรับปรุงใหม่ ---
+
+        # --- START OF FIX: แก้ไขการเรียกใช้ LLM ให้ถูกต้อง ---
+        try:
+            prompt_template = PromptTemplate.from_template(prompt_text)
+            chain = prompt_template | self.llm
+
+            response = await chain.ainvoke(
+                {"main_question": main_question, "formatted_facts": formatted_facts},
+                config={"configurable": {"temperature": 0.3}} # ใช้ temp ที่สูงขึ้นเล็กน้อยเพื่อการเขียนที่ลื่นไหล
+            )
+            return _extract_content_from_response(response)
+            
+        except Exception as e:
+            self.logger.error(f"Disclosure Analyst agent failed for main question '{main_question}': {e}")
+            return "Failed to generate disclosure due to an internal error."
 
     # --- Agent 4: Section Writer ---
     async def _generate_report_section(self, category_name: str, section_data: List[Dict]) -> str:
@@ -242,28 +298,38 @@ class ReportGenerationService:
         response = await chain.ainvoke({"category_name": category_name, "structured_context": structured_context})
         return _extract_content_from_response(response)
 
-    # --- Agent 5: Executive Editor ---
-    async def _finalize_report(self, company_name: str, content_g: str, content_e: str, content_s: str, insufficient_items: List[Dict]) -> str:
+    # --- Agent 5: Executive Editor (ปรับปรุงใหม่) ---
+    async def _finalize_report(self, company_name: str, g_data: List[Dict], e_data: List[Dict], s_data: List[Dict]) -> str:
         self.logger.info(f"Assembling the final report for {company_name}...")
-        appendix_section = ""
-        if insufficient_items:
-            missing_topics_list = "\n".join(f"- **{item['question_data']['theme']} ({item['question_data']['category']}):** {item.get('final_disclosure', '')}" for item in insufficient_items)
-            appendix_section = f"""
-## Appendix: Topics for Further Action
-Based on the analysis, additional information is required for the following topics to create a comprehensive report. It is recommended to gather specific data and policies related to these areas:
-{missing_topics_list}
-"""
+
+        def format_section(title: str, data: List[Dict]) -> str:
+            if not data:
+                # สร้างข้อความที่เป็นกลางเมื่อไม่มีข้อมูลสำหรับหมวดหมู่นั้นๆ
+                return f"## {title}\n\nBased on the provided documents, specific details regarding the company's {title.lower()} policies and performance were not identified. For a complete analysis, please provide relevant documentation covering this area.\n"
+            
+            content = f"## {title}\n\n"
+            # จัดกลุ่มหัวข้อที่มีธีมคล้ายกัน (ตัวอย่างการจัดกลุ่มแบบง่าย)
+            for item in data:
+                theme = item.get("question_data", {}).get("theme", "Uncategorized Topic")
+                disclosure = item.get("final_disclosure", "No specific disclosure could be generated.")
+                content += f"### {theme}\n{disclosure}\n\n"
+            return content
+
+        content_g = format_section("Governance (G)", g_data)
+        content_e = format_section("Environmental (E)", e_data)
+        content_s = format_section("Social (S)", s_data)
+
         finalizer_prompt = PromptTemplate.from_template(
             """
-            You are an automated ESG report generation engine. Your sole task is to generate a complete Markdown document based on the provided pre-written sections and data. Do not write any conversational text.
+            You are an automated ESG report generation engine. Your sole task is to assemble a complete, professional, and coherent Markdown document based on the provided pre-written sections.
 
             **Instructions:**
-            1. Use the provided company name '{company_name}'.
-            2. Write a professional 2-paragraph "Message from the CEO" summarizing the company's commitment to sustainability.
-            3. Write a brief "About This Report" section explaining the report's scope and methodology (e.g., based on GRI standards, covering the 2024 period).
-            4. Assemble the pre-written sections for Governance, Environmental, and Social exactly as provided.
-            5. Write a brief, forward-looking Conclusion.
-            6. If the Appendix section is provided, include it at the end.
+            1.  Use the provided company name '{company_name}'.
+            2.  Write a professional 2-paragraph "Message from the CEO" summarizing the company's commitment to sustainability, using the provided content as inspiration.
+            3.  Write a brief "About This Report" section explaining the report's scope and methodology.
+            4.  Assemble the pre-written sections for Governance, Environmental, and Social exactly as provided. Ensure seamless transitions between them.
+            5.  Write a brief, forward-looking Conclusion summarizing the company's future commitments.
+            6.  **DO NOT** create an Appendix or a section for missing information. The final output must be a clean, submittable report.
 
             ---
             **REPORT TEMPLATE AND CONTENT**
@@ -281,60 +347,95 @@ Based on the analysis, additional information is required for the following topi
             (Your written brief explanation goes here, mentioning the use of international standards for guidance.)
 
             ---
-
-            ## Governance (G)
             {content_g}
-
             ---
-
-            ## Environmental (E)
             {content_e}
-
             ---
-
-            ## Social (S)
             {content_s}
-
             ---
 
             ## Conclusion
             (Your written forward-looking conclusion goes here.)
-
-            {appendix_section}
             """
         )
         chain = finalizer_prompt | self.llm
-        english_report_response = await chain.ainvoke({
+        response = await chain.ainvoke({
             "company_name": company_name,
             "content_g": content_g,
             "content_e": content_e,
-            "content_s": content_s,
-            "appendix_section": appendix_section
+            "content_s": content_s
         })
-        english_report_content = _extract_content_from_response(english_report_response)
-        return await self._translate_report_to_thai(english_report_content, company_name)
+        return _extract_content_from_response(response)
 
     def _parse_sub_questions(self, sub_questions_text: str) -> List[str]:
         if not sub_questions_text: return []
         return [q.strip() for q in re.split(r'\n', sub_questions_text) if q.strip()]
 
+# --- (ใหม่) Agent 6: Suggestions Generator ---
+    async def _generate_suggestion_file(self, company_name: str, insufficient_items: List[Dict]) -> str:
+        self.logger.info(f"Generating suggestion file for {company_name}...")
+        if not insufficient_items:
+            return "# Suggestions for Report Improvement\n\nExcellent! All topics were analyzed successfully with sufficient data. No further suggestions at this time."
+
+        missing_topics_list = ""
+        for item in insufficient_items:
+            theme = item['question_data'].get('theme', 'Unknown Topic')
+            category = item['question_data'].get('category', 'N/A')
+            reason = item.get('final_disclosure', 'Reason not specified.')
+            reason_clean = reason.replace("INSUFFICIENT DATA:", "").strip()
+            missing_topics_list += f"- **Topic:** {theme} ({category})\n  - **Status:** Insufficient Data\n  - **Reason/Details:** {reason_clean}\n\n"
+
+        # --- START OF FIX: เพิ่มคำสั่งให้ AI ไม่ต้องสร้างหัวข้อหลัก ---
+        suggestion_prompt = PromptTemplate.from_template(
+            """
+            You are an expert ESG consultant. Your task is to create the BODY of a helpful and easy-to-understand suggestion document for '{company_name}'.
+
+            **Analysis Results (Topics with Insufficient Data):**
+            {missing_topics_list}
+
+            **Your Task & Formatting Rules:**
+            1.  Review the list of topics where data was insufficient.
+            2.  For each topic, write a clear and actionable recommendation for the user using full, easy-to-understand sentences.
+            3.  **IMPORTANT:** Start your response *directly* with the first recommendation section (e.g., `### Recommendations for...`). **DO NOT** add a main title (like '# Suggestions for...'), a preamble, or an introductory paragraph. The main title will be added automatically by the system.
+            4.  Structure the entire output in clean Markdown.
+
+            **Example of a Good Recommendation Structure:**
+            ### Recommendations for Sustainable Materials & Resource Management
+            * **What's Missing:** The analysis could not find a formal policy or a description of the governance structure...
+            * **What to Provide Next Time:** To fix this, please provide an official policy document...
+
+            ---
+            **Suggestion Document BODY (Markdown format):**
+            """
+        )
+        # --- END OF FIX ---
+
+        chain = suggestion_prompt | self.llm
+        response = await chain.ainvoke({
+            "company_name": company_name,
+            "missing_topics_list": missing_topics_list
+        })
+
+        # โค้ดส่วนนี้จะทำหน้าที่สร้างหัวข้อหลักเพียงที่เดียว
+        return f"# ข้อเสนอแนะสำหรับการปรับปรุงรายงาน ESG ของบริษัท {company_name}\n\n" + _extract_content_from_response(response)
+
     # --- Main Orchestrator ---
     async def generate_sustainability_report(self, files: List[IO[bytes]], file_names: List[str], company_name: str) -> Dict[str, Any]:
         session_index_name = f"user-report-{uuid.uuid4().hex[:12]}"
         self.logger.info(f"Starting report generation for {company_name}...")
-
         try:
+            # Phase 1 & 2: เหมือนเดิม
             self.logger.info("Phase 1: Ingesting, translating, and indexing documents...")
             initial_docs = await self.neo4j_service.read_PDFs_and_create_documents_azure(files, file_names)
             text_chunks = await self.neo4j_service.split_documents_into_chunks(initial_docs)
             english_chunks = await self._translate_chunks_to_english(text_chunks)
-            self.logger.info(f"Uploading {len(english_chunks)} English chunks to Pinecone...")
             self.pinecone_service.upsert_documents(session_index_name, english_chunks)
 
             self.logger.info("Phase 2: Fetching Question AI set...")
             question_ai_set = await ESGQuestion.find(ESGQuestion.is_active == True).to_list()
             if not question_ai_set: raise ValueError("Question AI set is empty.")
 
+            # Phase 3: ปรับปรุง Query และการดึงข้อมูล
             self.logger.info(f"Phase 3: Analyzing document against {len(question_ai_set)} questions...")
             raw_report_data = []
             for q_data in question_ai_set:
@@ -346,57 +447,75 @@ Based on the analysis, additional information is required for the following topi
                 if not sub_questions_list:
                     answer_status, final_disclosure, detailed_facts, top_context = "insufficient", "The standard question is missing sub-questions for analysis.", [], []
                 else:
-                    initial_context = self.pinecone_service.query(session_index_name, main_question_text, top_k=50)
-                    docs_for_rerank = [Document(page_content=text) for text in initial_context]
-                    reranked_docs = self.reranker.compress_documents(documents=docs_for_rerank, query=main_question_text)
-                    top_context = [doc.page_content for doc in reranked_docs]
+                    # **FIX: สร้าง Query ที่ละเอียดขึ้น**
+                    comprehensive_query = main_question_text + " " + " ".join(sub_questions_list)
+                    # **FIX: เพิ่ม top_k เพื่อดึงข้อมูลให้กว้างขึ้น**
+                    initial_context = self.pinecone_service.query(session_index_name, comprehensive_query, top_k=100)
                     
+                    valid_context = [text for text in initial_context if text and text.strip()]
+
+                    if not valid_context:
+                        self.logger.warning(f"No valid context found for question: '{main_question_text}'.")
+                        reranked_docs = []
+                    else:
+                        docs_for_rerank = [Document(page_content=text) for text in valid_context]
+                        reranked_docs = self.reranker.compress_documents(documents=docs_for_rerank, query=main_question_text)
+                    
+                    top_context = [doc.page_content for doc in reranked_docs]
+                    # ... (ส่วนที่เหลือของ Loop เหมือนเดิม) ...
                     validation_result = await self._strictly_validate_context(sub_questions_list, top_context)
                     answer_status = validation_result.get("status", "insufficient")
                     
                     final_disclosure, detailed_facts = "", []
                     if answer_status == "sufficient":
                         for sub_q in sub_questions_list:
-                            sub_q_context = self.pinecone_service.query(session_index_name, sub_q, top_k=5)
-                            extracted_facts = await self._extract_facts_for_sub_question(sub_q, sub_q_context)
-                            detailed_facts.append({"sub_question": sub_q, "facts": extracted_facts})
+                            # เราจะใช้ top_context ที่ rerank แล้ว มาสกัด fact เพื่อความแม่นยำและประหยัดค่าใช้จ่าย
+                            # ไม่ต้อง query pinecone ซ้ำสำหรับทุก sub-question
+                            extracted_facts = await self._extract_facts_for_sub_question(sub_q, top_context)
+                            if extracted_facts: # เพิ่มเงื่อนไข เช็คว่าสกัด fact ได้จริง
+                                detailed_facts.append({"sub_question": sub_q, "facts": extracted_facts})
                         
-                        final_disclosure = await self._analyze_facts_for_disclosure(main_question_text, detailed_facts)
+                        # --- START: เพิ่มเงื่อนไขตรวจสอบ ---
+                        # ถ้าตอนแรกบอกว่าข้อมูลพอ แต่สกัด fact ไม่ได้เลย ให้เปลี่ยนสถานะ
+                        if not detailed_facts:
+                            answer_status = "insufficient"
+                            final_disclosure = "INSUFFICIENT DATA: Context was thematically relevant, but no specific facts could be extracted to answer the sub-questions."
+                        else:
+                            final_disclosure = await self._analyze_facts_for_disclosure(main_question_text, detailed_facts)
+                        # --- END: เพิ่มเงื่อนไขตรวจสอบ ---
+
                     else:
                         final_disclosure = f"INSUFFICIENT DATA: {validation_result.get('reason')}"
 
                 raw_report_data.append({
                     "question_data": q_data.model_dump(by_alias=True),
-                    "status": answer_status,
+                    "status": answer_status, # <--- สถานะจะถูกอัปเดตตรงนี้
                     "final_disclosure": final_disclosure,
                     "detailed_facts": detailed_facts,
                     "retrieved_context": top_context
                 })
             
-            self.logger.info("Phase 4: Generating detailed English report sections...")
+            # Phase 4 & 5 (ปรับปรุงใหม่): สร้างรายงานและไฟล์คำแนะนำแยกกัน
+            self.logger.info("Phase 4: Generating detailed reports and suggestions...")
             successful_items = [item for item in raw_report_data if item.get("status") == "sufficient"]
+            insufficient_items = [item for item in raw_report_data if item.get("status") == "insufficient"]
+
             g_data = [item for item in successful_items if item['question_data']['category'] == 'G']
             e_data = [item for item in successful_items if item['question_data']['category'] == 'E']
             s_data = [item for item in successful_items if item['question_data']['category'] == 'S']
 
-            governance_section_text = await self._generate_report_section("Governance", g_data)
-            environmental_section_text = await self._generate_report_section("Environmental", e_data)
-            social_section_text = await self._generate_report_section("Social", s_data)
+            # สร้างรายงานหลัก (ไม่มี Appendix)
+            final_markdown_report_en = await self._finalize_report(company_name, g_data, e_data, s_data)
+            final_markdown_report_th = await self._translate_report_to_thai(final_markdown_report_en, company_name)
             
-            self.logger.info("Phase 5: Assembling and translating final report...")
-            insufficient_items = [item for item in raw_report_data if item.get("status") == "insufficient"]
-            
-            final_markdown_report_th = await self._finalize_report(
-                company_name=company_name,
-                content_g=governance_section_text,
-                content_e=environmental_section_text,
-                content_s=social_section_text,
-                insufficient_items=insufficient_items
-            )
+            # สร้างไฟล์คำแนะนำ
+            suggestion_file_en = await self._generate_suggestion_file(company_name, insufficient_items)
+            suggestion_file_th = await self._translate_report_to_thai(suggestion_file_en, company_name)
 
             return {
                 "raw_data": raw_report_data,
-                "markdown_report": final_markdown_report_th
+                "markdown_report": final_markdown_report_th,
+                "suggestion_report": suggestion_file_th  # <-- ผลลัพธ์ใหม่
             }
         finally:
             self.logger.info(f"Cleaning up temporary index: {session_index_name}")
