@@ -183,9 +183,13 @@ if active_tab == tabs[0]:
         
         raw_data = report_data.get("raw_data", [])
         sufficient_count = sum(1 for item in raw_data if item.get("status") == "sufficient")
-        
-        st.metric("หัวข้อที่ข้อมูลเพียงพอ (Sufficient)", f"{sufficient_count} / {len(raw_data)}")
-        
+        processed_files = report_data.get("processed_file_count", 0)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("หัวข้อที่ข้อมูลเพียงพอ (Sufficient)", f"{sufficient_count} / {len(raw_data)}")
+        with col2:
+            st.metric("จำนวนไฟล์ที่ประมวลผล", f"{processed_files} ไฟล์")
+            
         st.subheader("ร่างรายงานความยั่งยืน (Sustain Report Draft)")
         
         report_html = render_markdown_as_styled_html(markdown_report, "report-container")

@@ -10,11 +10,14 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain_cohere import CohereRerank
 from langchain_core.messages.base import BaseMessage
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+import tempfile
 
+# --- แก้ไข Imports ---
 from app.models.esg_question_model import ESGQuestion
-from app.services.pinecone_service import PineconeService
+from app.services.vector_store_service import VectorStoreService
 from app.services.persistence.mongodb import MongoDBSaver
-from app.services.neo4j_service import Neo4jService
 
 def _extract_content_from_response(response: Any) -> str:
     """
@@ -23,13 +26,10 @@ def _extract_content_from_response(response: Any) -> str:
     """
     message_to_process = None
     if isinstance(response, list) and response:
-        # If the response is a list, get the first element.
         message_to_process = response[0]
     elif isinstance(response, BaseMessage):
-        # If it's already a single message object, use it directly.
         message_to_process = response
     
-    # If we have a valid message object, extract its content. Otherwise, return empty string.
     if message_to_process:
         return getattr(message_to_process, 'content', "").strip()
     return ""
@@ -37,24 +37,45 @@ def _extract_content_from_response(response: Any) -> str:
 class ReportGenerationService:
     def __init__(self,
                  mongodb_service: MongoDBSaver,
-                 pinecone_service: PineconeService,
-                 neo4j_service: Neo4jService,
+                 vector_store_service: VectorStoreService, # <-- ใช้ Service ใหม่
                  llm: ChatGoogleGenerativeAI):
         self.logger = logging.getLogger(__name__)
         self.mongodb_service = mongodb_service
-        self.pinecone_service = pinecone_service
-        self.neo4j_service = neo4j_service
-        self.llm = llm # For English content generation
+        self.vector_store_service = vector_store_service # <-- ใช้ Service ใหม่
+        self.llm = llm
         self.reranker = CohereRerank(
             cohere_api_key=os.getenv("COHERE_API_KEY"),
             model="rerank-english-v3.0",
-            top_n=20
+            top_n=25
         )
         self.translation_llm = ChatGoogleGenerativeAI(
-            model=os.getenv("TRANSLATION_MODEL", "gemini-2.5-flash-preview-05-20"),
+            model=os.getenv("TRANSLATION_MODEL", "gemini-1.5-flash-preview-0514"),
             temperature=0.7
         )
-        self.logger.info("ReportGenerationService initialized with Advanced Multi-Agent Architecture.")
+        self.logger.info("ReportGenerationService initialized with VectorStoreService.")
+
+    # --- Document Processing Helper ---
+    async def _read_and_split_documents(self, files: List[IO[bytes]], file_names: List[str]) -> List[Document]:
+        all_chunks = []
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        for i, file_stream in enumerate(files):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file_stream.read())
+                tmp_path = tmp.name
+            try:
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load_and_split(text_splitter=text_splitter)
+                for doc in docs:
+                    if doc.page_content and doc.page_content.strip():
+                        doc.metadata["source_file_name"] = file_names[i]
+                        all_chunks.append(doc)
+                self.logger.info(f"Successfully processed and chunked {file_names[i]}")
+            except Exception as e:
+                self.logger.error(f"Failed to process file {file_names[i]}: {e}")
+            finally:
+                os.remove(tmp_path)
+        self.logger.info(f"Total valid (non-empty) chunks created: {len(all_chunks)}")
+        return all_chunks
 
     # --- Translation Helpers ---
     async def _translate_chunks_to_english(self, documents: List[Document]) -> List[Document]:
@@ -73,7 +94,6 @@ class ReportGenerationService:
             if contains_thai(doc.page_content):
                 tasks.append(chain.ainvoke({"text": doc.page_content}))
             else:
-                # If it's already English, just wrap it in a completed future
                 future = asyncio.Future()
                 future.set_result(type('obj', (object,), {'content': doc.page_content})())
                 tasks.append(future)
@@ -89,20 +109,14 @@ class ReportGenerationService:
                 content = _extract_content_from_response(response)
                 translated_doc = Document(page_content=content, metadata=documents[i].metadata)
                 translated_docs.append(translated_doc)
-                
         return translated_docs
 
     async def _translate_report_to_thai(self, english_report: str, company_name: str) -> str:
         if not english_report or not isinstance(english_report, str): return ""
         self.logger.info(f"Translating the final report for {company_name} to Thai...")
-
         prompt = PromptTemplate.from_template(
             """
-            You are an expert technical translator specializing in translating structured Markdown documents from English to Thai for corporate sustainability reports.
-            **Critical Instruction:**
-            Your task is to translate the English text content into professional, high-quality Thai.
-            You MUST preserve the original Markdown formatting EXACTLY. This includes all headings (e.g., #, ##, ###), horizontal rules (---), bullet points (* or -), bold text (**text**), tables, and all newlines.
-            DO NOT alter the structure of the document. DO NOT add any conversational text or explanations. Your entire output must be only the translated Markdown document.
+            You are an expert technical translator specializing in structured Markdown. Translate the English text to professional Thai, PRESERVING ALL MARKDOWN FORMATTING EXACTLY (headings, lists, bold, tables, etc.). Your entire output must be only the translated Markdown.
 
             **English Markdown Document to Translate:**
             ---
@@ -128,20 +142,18 @@ class ReportGenerationService:
         sub_questions_string = "\n".join(f"- {sq}" for sq in sub_questions)
         validator_prompt = PromptTemplate.from_template(
             """
-            You are a meticulous ESG Auditor. Your task is to determine if the provided 'Context' contains enough specific information to answer the **majority** of the 'Sub-Questions' listed below.
+            You are a meticulous ESG Auditor. Your task is to determine if the provided 'Context' contains enough specific, factual information (like numbers, names, specific policy details) to answer the **majority** of the 'Sub-Questions'. General, high-level statements are NOT sufficient.
+
             **Context from Company Documents:**
-            ---
             {context}
-            ---
+
             **Sub-Questions to be Answered:**
-            ---
             {sub_questions}
-            ---
+
             **Your Assessment:**
-            Review the context and the sub-questions carefully. Can you find explicit facts, figures, or policy details in the context to answer at least 80% of the sub-questions?
-            Respond with ONLY a single, valid JSON object with two keys:
-            1. "status": Must be either "sufficient" or "insufficient".
-            2. "reason": A brief, one-sentence explanation. If insufficient, specify which type of information is missing (e.g., "The context lacks quantitative data," or "No policy details were found.").
+            Review the context and sub-questions carefully. Respond with ONLY a single, valid JSON object with two keys:
+            1. "status": Must be "sufficient" or "insufficient".
+            2. "reason": A brief, one-sentence explanation for your decision.
             """
         )
         validator_chain = validator_prompt | self.llm
@@ -156,58 +168,38 @@ class ReportGenerationService:
 
     # --- Agent 2: Fact Extractor ---
     async def _extract_facts_for_sub_question(self, sub_question: str, context: List[str]) -> List[str]:
-        """
-        ปรับปรุงใหม่: สกัดเฉพาะข้อเท็จจริงดิบๆ ที่เกี่ยวข้องกับคำถามย่อยจาก context
-        LLM ในขั้นตอนนี้จะทำหน้าที่เป็น "Data Extractor" เท่านั้น
-        """
-        
-        # --- START: PROMPT ที่ปรับปรุงใหม่ ---
-        prompt_text = f"""
-        You are a meticulous and objective data extractor. Your SOLE task is to extract raw, objective facts from the provided "Source Documents" that are DIRECTLY relevant to the following "Question".
+        prompt_template = PromptTemplate.from_template(
+            """
+            You are a meticulous data extractor. Your task is to extract raw, objective facts from the "Source Documents" that DIRECTLY answer the "Question".
 
-        **INSTRUCTIONS:**
-        1.  **Extract, DO NOT Analyze:** Do not interpret, analyze, or form opinions. Extract only factual statements, data points, or direct quotes.
-        2.  **Direct Relevance Only:** Only extract information that directly answers or relates to the Question. If no relevant information is found in a document, ignore it.
-        3.  **Output Format:** Present the extracted facts as a clear, bulleted list. Each bullet point should be a distinct fact.
-        4.  **No Information Found:** If you find NO relevant facts in any of the source documents, you MUST respond with the single phrase: "NO RELEVANT INFORMATION FOUND". Do not write anything else.
+            **INSTRUCTIONS:**
+            1. **Extract, DO NOT Analyze:** Do not interpret or form opinions. Extract only factual statements, data points, or direct quotes.
+            2. **Direct Relevance Only:** Only extract information that directly answers the Question.
+            3. **Output Format:** Present the extracted facts as a clear, bulleted list.
+            4. **No Information Found:** If you find NO relevant facts, respond with the single phrase: "NO RELEVANT INFORMATION FOUND".
 
-        **Question:**
-        {sub_question}
+            **Question:**
+            {sub_question}
 
-        **Source Documents:**
-        ---
-        {"---".join(context)}
-        ---
+            **Source Documents:**
+            ---
+            {context_str}
+            ---
 
-        **Extracted Facts:**
-        """
-        # --- END: PROMPT ที่ปรับปรุงใหม่ ---
-
-        # --- START OF FIX: แก้ไขการเรียกใช้ LLM ให้ถูกต้อง ---
+            **Extracted Facts:**
+            """
+        )
+        chain = prompt_template | self.llm
         try:
-            # 1. สร้าง Chain ด้วย Prompt และ LLM ที่มี temperature = 0.0
-            prompt_template = PromptTemplate.from_template(prompt_text)
-            # ใช้ self.llm ที่ถูกตั้งค่าไว้สำหรับงานทั่วไป แต่เราจะ override temperature ตอนเรียกใช้
-            chain = prompt_template | self.llm
-
-            # 2. เรียกใช้ Chain ด้วย .ainvoke และส่ง context เข้าไป
-            response = await chain.ainvoke(
-                {"sub_question": sub_question, "context": context}, 
-                config={"configurable": {"temperature": 0.2}} # Override temperature เพื่อความแม่นยำ
-            )
+            context_str = "\n---\n".join(context)
+            response = await chain.ainvoke({"sub_question": sub_question, "context_str": context_str}, config={"configurable": {"temperature": 0.0}})
             content = _extract_content_from_response(response)
-
-            # 3. ประมวลผลผลลัพธ์
-            if "NO RELEVANT INFORMATION FOUND" in content:
-                return []
-                
+            if "NO RELEVANT INFORMATION FOUND" in content: return []
             return [fact.strip() for fact in content.split('\n') if fact.strip() and fact.startswith(('*', '-'))]
-        
         except Exception as e:
             self.logger.error(f"Fact Extractor agent failed for sub-question '{sub_question}': {e}")
             return []
 
-    # --- Agent 3: Disclosure Analyst ---
     async def _analyze_facts_for_disclosure(self, main_question: str, facts_by_sub_q: List[Dict]) -> str:
         """
         ปรับปรุงใหม่: วิเคราะห์ชุดข้อเท็จจริงดิบที่สกัดมาได้ เพื่อสร้างเป็น Disclosure ที่สมดุล
@@ -264,7 +256,6 @@ class ReportGenerationService:
             self.logger.error(f"Disclosure Analyst agent failed for main question '{main_question}': {e}")
             return "Failed to generate disclosure due to an internal error."
 
-    # --- Agent 4: Section Writer ---
     async def _generate_report_section(self, category_name: str, section_data: List[Dict]) -> str:
         self.logger.info(f"Generating detailed report section for: {category_name}")
         if not section_data:
@@ -298,7 +289,6 @@ class ReportGenerationService:
         response = await chain.ainvoke({"category_name": category_name, "structured_context": structured_context})
         return _extract_content_from_response(response)
 
-    # --- Agent 5: Executive Editor (ปรับปรุงใหม่) ---
     async def _finalize_report(self, company_name: str, g_data: List[Dict], e_data: List[Dict], s_data: List[Dict]) -> str:
         self.logger.info(f"Assembling the final report for {company_name}...")
 
@@ -422,20 +412,20 @@ class ReportGenerationService:
     # --- Main Orchestrator ---
     async def generate_sustainability_report(self, files: List[IO[bytes]], file_names: List[str], company_name: str) -> Dict[str, Any]:
         session_index_name = f"user-report-{uuid.uuid4().hex[:12]}"
-        self.logger.info(f"Starting report generation for {company_name}...")
+        self.logger.info(f"Starting report generation for {company_name} with {len(file_names)} documents.")
         try:
-            # Phase 1 & 2: เหมือนเดิม
-            self.logger.info("Phase 1: Ingesting, translating, and indexing documents...")
-            initial_docs = await self.neo4j_service.read_PDFs_and_create_documents_azure(files, file_names)
-            text_chunks = await self.neo4j_service.split_documents_into_chunks(initial_docs)
+            self.logger.info("Phase 1: Reading, splitting, and ingesting documents...")
+            text_chunks = await self._read_and_split_documents(files, file_names)
+            if not text_chunks:
+                raise ValueError("No content could be extracted from the provided files.")
+            
             english_chunks = await self._translate_chunks_to_english(text_chunks)
-            self.pinecone_service.upsert_documents(session_index_name, english_chunks)
+            self.vector_store_service.initialize_vector_index(session_index_name, english_chunks)
 
             self.logger.info("Phase 2: Fetching Question AI set...")
             question_ai_set = await ESGQuestion.find(ESGQuestion.is_active == True).to_list()
             if not question_ai_set: raise ValueError("Question AI set is empty.")
 
-            # Phase 3: ปรับปรุง Query และการดึงข้อมูล
             self.logger.info(f"Phase 3: Analyzing document against {len(question_ai_set)} questions...")
             raw_report_data = []
             for q_data in question_ai_set:
@@ -445,78 +435,63 @@ class ReportGenerationService:
                 sub_questions_list = self._parse_sub_questions(q_data.sub_questions_sets[0].sub_question_text_en) if q_data.sub_questions_sets else []
 
                 if not sub_questions_list:
-                    answer_status, final_disclosure, detailed_facts, top_context = "insufficient", "The standard question is missing sub-questions for analysis.", [], []
+                    answer_status, final_disclosure, detailed_facts, top_context = "insufficient", "The standard question is missing sub-questions.", [], []
                 else:
-                    # **FIX: สร้าง Query ที่ละเอียดขึ้น**
                     comprehensive_query = main_question_text + " " + " ".join(sub_questions_list)
-                    # **FIX: เพิ่ม top_k เพื่อดึงข้อมูลให้กว้างขึ้น**
-                    initial_context = self.pinecone_service.query(session_index_name, comprehensive_query, top_k=100)
+                    retrieved_content = self.vector_store_service.vector_search(session_index_name, comprehensive_query, top_k=100)
                     
-                    valid_context = [text for text in initial_context if text and text.strip()]
+                    valid_content_for_rerank = [text for text in retrieved_content if text and text.strip()]
 
-                    if not valid_context:
-                        self.logger.warning(f"No valid context found for question: '{main_question_text}'.")
-                        reranked_docs = []
+                    if not valid_content_for_rerank:
+                        self.logger.warning(f"No valid (non-empty) context found for question: '{main_question_text[:50]}...'")
+                        top_context = []
                     else:
-                        docs_for_rerank = [Document(page_content=text) for text in valid_context]
+                        docs_for_rerank = [Document(page_content=text) for text in valid_content_for_rerank]
                         reranked_docs = self.reranker.compress_documents(documents=docs_for_rerank, query=main_question_text)
-                    
-                    top_context = [doc.page_content for doc in reranked_docs]
-                    # ... (ส่วนที่เหลือของ Loop เหมือนเดิม) ...
-                    validation_result = await self._strictly_validate_context(sub_questions_list, top_context)
-                    answer_status = validation_result.get("status", "insufficient")
-                    
-                    final_disclosure, detailed_facts = "", []
-                    if answer_status == "sufficient":
+                        top_context = [doc.page_content for doc in reranked_docs]
+                
+                    detailed_facts = []
+                    # Logic การตัดสินใจ
+                    if top_context:
                         for sub_q in sub_questions_list:
-                            # เราจะใช้ top_context ที่ rerank แล้ว มาสกัด fact เพื่อความแม่นยำและประหยัดค่าใช้จ่าย
-                            # ไม่ต้อง query pinecone ซ้ำสำหรับทุก sub-question
                             extracted_facts = await self._extract_facts_for_sub_question(sub_q, top_context)
-                            if extracted_facts: # เพิ่มเงื่อนไข เช็คว่าสกัด fact ได้จริง
+                            if extracted_facts:
                                 detailed_facts.append({"sub_question": sub_q, "facts": extracted_facts})
-                        
-                        # --- START: เพิ่มเงื่อนไขตรวจสอบ ---
-                        # ถ้าตอนแรกบอกว่าข้อมูลพอ แต่สกัด fact ไม่ได้เลย ให้เปลี่ยนสถานะ
-                        if not detailed_facts:
-                            answer_status = "insufficient"
-                            final_disclosure = "INSUFFICIENT DATA: Context was thematically relevant, but no specific facts could be extracted to answer the sub-questions."
-                        else:
-                            final_disclosure = await self._analyze_facts_for_disclosure(main_question_text, detailed_facts)
-                        # --- END: เพิ่มเงื่อนไขตรวจสอบ ---
-
+                    
+                    if detailed_facts:
+                        answer_status = "sufficient"
+                        final_disclosure = await self._analyze_facts_for_disclosure(main_question_text, detailed_facts)
                     else:
-                        final_disclosure = f"INSUFFICIENT DATA: {validation_result.get('reason')}"
+                        answer_status = "insufficient"
+                        final_disclosure = "INSUFFICIENT DATA: Although some relevant context was found, no specific, verifiable facts could be extracted to directly answer the questions."
 
                 raw_report_data.append({
                     "question_data": q_data.model_dump(by_alias=True),
-                    "status": answer_status, # <--- สถานะจะถูกอัปเดตตรงนี้
+                    "status": answer_status,
                     "final_disclosure": final_disclosure,
                     "detailed_facts": detailed_facts,
-                    "retrieved_context": top_context
+                    "retrieved_context": top_context[:5]
                 })
-            
-            # Phase 4 & 5 (ปรับปรุงใหม่): สร้างรายงานและไฟล์คำแนะนำแยกกัน
-            self.logger.info("Phase 4: Generating detailed reports and suggestions...")
+
+            self.logger.info("Phase 4 & 5: Generating final reports and suggestions...")
             successful_items = [item for item in raw_report_data if item.get("status") == "sufficient"]
             insufficient_items = [item for item in raw_report_data if item.get("status") == "insufficient"]
-
             g_data = [item for item in successful_items if item['question_data']['category'] == 'G']
             e_data = [item for item in successful_items if item['question_data']['category'] == 'E']
             s_data = [item for item in successful_items if item['question_data']['category'] == 'S']
-
-            # สร้างรายงานหลัก (ไม่มี Appendix)
+            
             final_markdown_report_en = await self._finalize_report(company_name, g_data, e_data, s_data)
             final_markdown_report_th = await self._translate_report_to_thai(final_markdown_report_en, company_name)
             
-            # สร้างไฟล์คำแนะนำ
             suggestion_file_en = await self._generate_suggestion_file(company_name, insufficient_items)
             suggestion_file_th = await self._translate_report_to_thai(suggestion_file_en, company_name)
 
             return {
                 "raw_data": raw_report_data,
                 "markdown_report": final_markdown_report_th,
-                "suggestion_report": suggestion_file_th  # <-- ผลลัพธ์ใหม่
+                "suggestion_report": suggestion_file_th,
+                "processed_file_count": len(file_names)
             }
         finally:
-            self.logger.info(f"Cleaning up temporary index: {session_index_name}")
-            self.pinecone_service.delete_index(session_index_name)
+            self.logger.info(f"Cleaning up vector data for index: {session_index_name}")
+            self.vector_store_service.delete_index(session_index_name)

@@ -11,6 +11,7 @@ from app.services.persistence.mongodb import MongoDBSaver
 from app.services.pinecone_service import PineconeService
 from app.services.report_generation_service import ReportGenerationService
 from app.services.rate_limit import RateLimiter
+from app.services.vector_store_service import VectorStoreService
 
 # --- Import Initializer Classes ---
 from langchain_cohere import CohereEmbeddings
@@ -23,7 +24,7 @@ neo4j_service_instance: Optional[Neo4jService] = None
 mongodb_service_instance: Optional[MongoDBSaver] = None
 qg_service_instance: Optional[QuestionGenerationService] = None
 chat_service_instance: Optional[ChatService] = None
-pinecone_service_instance: Optional[PineconeService] = None
+vector_store_service_instance: Optional[VectorStoreService] = None
 report_service_instance: Optional[ReportGenerationService] = None
 
 
@@ -32,7 +33,7 @@ async def initialize_global_services():
     """
     Initializes all shared services when the FastAPI app starts.
     """
-    global neo4j_service_instance, mongodb_service_instance, qg_service_instance, chat_service_instance, pinecone_service_instance, report_service_instance
+    global neo4j_service_instance, mongodb_service_instance, qg_service_instance, chat_service_instance, vector_store_service_instance, report_service_instance
     
     if neo4j_service_instance is not None:
         print("[FastAPI DI] Services already initialized. Skipping.")
@@ -64,7 +65,7 @@ async def initialize_global_services():
         embedding_model=embedding_model # Use the shared instance
     )
     
-    pinecone_service_instance = PineconeService(embedding_model=embedding_model) # Use the shared instance
+    vector_store_service_instance = VectorStoreService() 
     
     qg_service_instance = QuestionGenerationService(
         llm=llm_instance,
@@ -76,8 +77,7 @@ async def initialize_global_services():
     
     report_service_instance = ReportGenerationService(
         mongodb_service=mongodb_service_instance,
-        pinecone_service=pinecone_service_instance,
-        neo4j_service=neo4j_service_instance,
+        vector_store_service=vector_store_service_instance, # <-- ส่ง Service ที่ถูกต้อง
         llm=llm_instance
     )
     
@@ -99,10 +99,10 @@ def get_mongodb_service() -> MongoDBSaver:
         raise RuntimeError("MongoDBSaver has not been initialized.")
     return mongodb_service_instance
 
-def get_pinecone_service() -> PineconeService:
-    if pinecone_service_instance is None:
-        raise RuntimeError("PineconeService has not been initialized.")
-    return pinecone_service_instance
+def get_vector_store_service() -> VectorStoreService:
+    if vector_store_service_instance is None:
+        raise RuntimeError("VectorStoreService has not been initialized.")
+    return vector_store_service_instance
 
 def get_question_generation_service() -> QuestionGenerationService:
     if qg_service_instance is None:

@@ -1,43 +1,69 @@
 services:
-  neo4j:
+  # --- Neo4j Instance for Question Development (Dev Demo) ---
+  neo4j_for_questions:
     image: neo4j:5.20.0
-    container_name: neo4j_db_local
+    container_name: neo4j_questions_db
     ports:
       - "7474:7474"
-      - "7687:7687" 
+      - "7687:7687"
     volumes:
-      - ./neo4j/data:/data
-      - ./neo4j/logs:/logs
-      - ./neo4j/conf:/conf
-      - ./neo4j/plugins:/plugins
+      - ./neo4j/questions/data:/data
+      - ./neo4j/questions/logs:/logs
+      - ./neo4j/questions/conf:/conf
+      - ./neo4j/questions/plugins:/plugins
     environment:
-      # --- Authentication and Plugins (Correct as is) ---
-      - NEO4J_AUTH=neo4j/Nice0822976633
+      - NEO4J_AUTH=neo4j/password123
       - NEO4J_PLUGINS=["apoc", "graph-data-science"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_apoc_import_file_use__neo4j__config=true
       - NEO4J_dbms_security_procedures_unrestricted=gds.*,apoc.*
-
-      # --- CORRECTED & UPDATED MEMORY SETTINGS FOR NEO4J 5.x ---
-      # The format is NEO4J_ and dots (.) are replaced with double underscores (__).
       - NEO4J_server_memory_heap_initial__size=2G 
       - NEO4J_server_memory_heap_max__size=2G
       - NEO4J_server_memory_pagecache_size=2G
-    
     healthcheck:
       test: ["CMD-SHELL", "wget --output-document=/dev/null --timeout=10 http://localhost:7474/ || exit 1"]
       interval: 5s
       timeout: 10s
       retries: 10
 
+  # --- (ใหม่) Neo4j Instance for User Report Generation ---
+  neo4j_for_reports:
+    image: neo4j:5.20.0
+    container_name: neo4j_reports_db
+    ports:
+      - "7475:7474"
+      - "7688:7687"
+    volumes:
+      - ./neo4j/reports/data:/data
+      - ./neo4j/reports/logs:/logs
+      - ./neo4j/reports/conf:/conf
+      - ./neo4j/reports/plugins:/plugins
+    environment:
+      - NEO4J_AUTH=neo4j/another_password456
+      # สำหรับส่วนรายงานของผู้ใช้ อาจไม่จำเป็นต้องใช้ Plugin ทั้งหมด แต่ใส่ไว้ก่อนได้
+      - NEO4J_PLUGINS=["apoc"] 
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_server_memory_heap_initial__size=2G 
+      - NEO4J_server_memory_heap_max__size=2G
+      - NEO4J_server_memory_pagecache_size=2G
+    healthcheck:
+      test: ["CMD-SHELL", "wget --output-document=/dev/null --timeout=10 http://localhost:7475/ || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  # --- MongoDB (เหมือนเดิม) ---
   mongo:
     image: mongo:latest
     container_name: esg-llm-mongo
     ports:
       - "27017:27017"
     volumes:
-      - ./database/mongo_data:/data/db
+      - mongo_data:/data/db
 
 volumes:
   mongo_data:
