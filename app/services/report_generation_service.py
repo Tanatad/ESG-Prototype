@@ -13,7 +13,9 @@ from langchain_core.messages.base import BaseMessage
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 import tempfile
-
+from langchain_community.document_loaders import AzureAIDocumentIntelligenceLoader
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
 # --- แก้ไข Imports ---
 from app.models.esg_question_model import ESGQuestion
 from app.services.vector_store_service import VectorStoreService
@@ -45,37 +47,76 @@ class ReportGenerationService:
         self.llm = llm
         self.reranker = CohereRerank(
             cohere_api_key=os.getenv("COHERE_API_KEY"),
-            model="rerank-english-v3.0",
+            model="rerank-v4.0",
             top_n=25
         )
         self.translation_llm = ChatGoogleGenerativeAI(
-            model=os.getenv("TRANSLATION_MODEL", "gemini-1.5-flash-preview-0514"),
+            model=os.getenv("TRANSLATION_MODEL", "gemini-2.5-flash-preview-05-20"),
             temperature=0.7
         )
         self.logger.info("ReportGenerationService initialized with VectorStoreService.")
+        self.azure_di_endpoint = os.getenv("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT") # ใช้ชื่อ ENV ที่ตรงกับของคุณ
+        self.azure_di_key = os.getenv("AZURE_DOCUMENTINTELLIGENCE_KEY") # ใช้ชื่อ ENV ที่ตรงกับของคุณ
 
-    # --- Document Processing Helper ---
-    async def _read_and_split_documents(self, files: List[IO[bytes]], file_names: List[str]) -> List[Document]:
-        all_chunks = []
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        for i, file_stream in enumerate(files):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(file_stream.read())
-                tmp_path = tmp.name
+        if not all([self.azure_di_endpoint, self.azure_di_key]):
+            self.document_intelligence_client = None
+            self.logger.warning("Azure Document Intelligence credentials not set. PDF processing will fail.")
+        else:
             try:
-                loader = PyPDFLoader(tmp_path)
-                docs = loader.load_and_split(text_splitter=text_splitter)
-                for doc in docs:
-                    if doc.page_content and doc.page_content.strip():
-                        doc.metadata["source_file_name"] = file_names[i]
-                        all_chunks.append(doc)
-                self.logger.info(f"Successfully processed and chunked {file_names[i]}")
+                self.document_intelligence_client = DocumentIntelligenceClient(
+                    endpoint=self.azure_di_endpoint,
+                    credential=AzureKeyCredential(self.azure_di_key)
+                )
+                self.logger.info("Azure Document Intelligence client initialized successfully.")
             except Exception as e:
-                self.logger.error(f"Failed to process file {file_names[i]}: {e}")
-            finally:
-                os.remove(tmp_path)
-        self.logger.info(f"Total valid (non-empty) chunks created: {len(all_chunks)}")
-        return all_chunks
+                self.document_intelligence_client = None
+                self.logger.error(f"Failed to initialize Azure Document Intelligence client: {e}")
+    # --- Document Processing Helper ---
+    async def _read_pages_with_azure(self, files: List[IO[bytes]], file_names: List[str]) -> List[Document]:
+        """
+        อ่าน PDF แต่ละหน้าด้วย Azure DI และสร้าง Document object สำหรับแต่ละหน้า
+        """
+        if not self.document_intelligence_client:
+            self.logger.error("Azure DI client not initialized. Cannot read PDFs.")
+            return []
+
+        all_page_documents: List[Document] = []
+        loop = asyncio.get_running_loop()
+
+        for i, file_stream in enumerate(files):
+            file_name = file_names[i]
+            self.logger.info(f"Processing '{file_name}' with Azure Document Intelligence...")
+            
+            try:
+                file_stream.seek(0)
+                file_bytes = file_stream.read()
+
+                poller = self.document_intelligence_client.begin_analyze_document(
+                    model_id="prebuilt-layout",
+                    analyze_request=file_bytes,
+                    content_type="application/octet-stream"
+                )
+                
+                # เรียกแบบ blocking ใน thread แยก เพื่อไม่ให้กระทบ event loop หลัก
+                result = await loop.run_in_executor(None, poller.result)
+
+                if result and result.pages:
+                    for page in result.pages:
+                        page_text = "\n".join([line.content for line in page.lines if line.content])
+                        if page_text.strip():
+                            metadata = {
+                                "source_file_name": file_name,
+                                "page_number": page.page_number
+                            }
+                            all_page_documents.append(Document(page_content=page_text, metadata=metadata))
+                    self.logger.info(f"Successfully extracted {len(result.pages)} pages from '{file_name}'.")
+                else:
+                    self.logger.warning(f"Azure DI processed '{file_name}' but found no pages.")
+
+            except Exception as e:
+                self.logger.error(f"Error processing '{file_name}' with Azure DI: {e}", exc_info=True)
+
+        return all_page_documents
 
     # --- Translation Helpers ---
     async def _translate_chunks_to_english(self, documents: List[Document]) -> List[Document]:
@@ -415,9 +456,17 @@ class ReportGenerationService:
         self.logger.info(f"Starting report generation for {company_name} with {len(file_names)} documents.")
         try:
             self.logger.info("Phase 1: Reading, splitting, and ingesting documents...")
-            text_chunks = await self._read_and_split_documents(files, file_names)
+            # --- START OF FIX: ปรับขั้นตอนการทำงาน ---
+            # 1. อ่าน PDF ทุกหน้าด้วย Azure ก่อน
+            documents_from_pages = await self._read_pages_with_azure(files, file_names)
+            if not documents_from_pages:
+                raise ValueError("No content could be extracted from the provided files using Azure DI.")
+            
+            # 2. นำหน้าที่อ่านได้มาตัดเป็น Chunks เล็กๆ
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            text_chunks = text_splitter.split_documents(documents_from_pages)
             if not text_chunks:
-                raise ValueError("No content could be extracted from the provided files.")
+                raise ValueError("No chunks were created after splitting the document pages.")
             
             english_chunks = await self._translate_chunks_to_english(text_chunks)
             self.vector_store_service.initialize_vector_index(session_index_name, english_chunks)
